@@ -102,3 +102,43 @@ def test_compute_boundaries_reads_days_from_cfg_not_dcfg_is_date_false():
     t_max = tx["t"].max()
     assert test_start == t_max - 3
     assert val_start == test_start - 5
+
+
+def _synthetic_tx(pd, np):
+    """유저 6명, 아이템 5개, 20건 거래. val/test 분리가 제대로 되는지 확인 가능한 최소 규모."""
+    rng = np.random.default_rng(0)
+    n = 40
+    dates = pd.date_range("2020-01-01", periods=30, freq="D")
+    return pd.DataFrame({
+        "u_raw": rng.integers(0, 6, n),
+        "i_raw": rng.integers(0, 5, n).astype(str),
+        "t": rng.choice(dates, n),
+        "v": rng.uniform(10, 100, n).round(2),
+        "cat_raw": rng.integers(0, 3, n),
+    })
+
+
+def test_prepare_data_returns_consistent_shapes(tmp_path):
+    ns = _load_module_upto_cfg()
+    pd, np = ns["pd"], ns["np"]
+    tx = _synthetic_tx(pd, np)
+    tx_path = tmp_path / "tx.csv"
+    # cat_raw는 merge_category()가 item_meta 쪽에서 만드는 이름과 충돌하므로(스킴상
+    # tx 원본에는 카테고리 컬럼이 없어야 정상) CSV에는 쓰지 않는다.
+    tx.drop(columns="cat_raw").rename(columns={"u_raw": "customer_id", "i_raw": "article_id",
+                                                "t": "t_dat", "v": "price"}).to_csv(tx_path, index=False)
+    meta_path = tmp_path / "articles.csv"
+    pd.DataFrame({"article_id": tx["i_raw"].unique(),
+                  "product_group_name": ["catA"] * tx["i_raw"].nunique()}).to_csv(meta_path, index=False)
+
+    cfg = dict(ns["CFG"]); cfg["WINDOW_DAYS"] = None; cfg["VAL_DAYS"] = 3; cfg["TEST_DAYS"] = 3
+    dcfg = dict(ns["DCFG"]); dcfg["tx_path"] = str(tx_path); dcfg["item_meta_path"] = str(meta_path)
+
+    data = ns["prepare_data"](cfg, dcfg)
+    for key in ["train", "val_gt", "val_rev", "test_gt", "test_rev", "adj", "pos_key",
+                "tr_u", "tr_i", "csr_ptr", "csr_items", "user_pos", "item_cat_arr",
+                "cat_items", "n_users", "n_items", "n_cat"]:
+        assert key in data, f"prepare_data 반환값에 {key}가 있어야 함"
+    assert data["n_users"] > 0 and data["n_items"] > 0
+    assert data["csr_ptr"].shape[0] == data["n_users"] + 1
+    assert len(data["train"]) > 0

@@ -261,6 +261,39 @@ def build_graph(train, n_users, n_items):
     return adj, edge_key, tu, ti, csr_ptr, csr_items
 
 
+def prepare_data(cfg, dcfg):
+    """M1 학습(main())과 Dual-Space 실험(run_dualspace()) 양쪽이 필요로 하는 데이터 준비
+    전체를 한 곳에서 수행한다. 이전에는 두 함수가 이 파이프라인을 거의 그대로 복붙해서
+    각자 호출했음 — 하나라도 스텝이 바뀌면(예: 필터 조건 수정) 두 군데를 따로 고쳐야
+    했던 중복을 여기서 없앤다.
+
+    순서: 원본 로드 → 최근 WINDOW_DAYS만 사용 → 카테고리 merge → val/test 경계 계산 →
+    MIN_USER/ITEM_INTER 필터링+인덱싱 → train/val/test 분리 → 그래프(adj) 구축 →
+    negative 샘플링에 필요한 부가 인덱스(user_pos, item_cat_arr, cat_items) 생성.
+
+    반환하는 dict는 main()에서는 M1 학습에, run_dualspace()에서는 그대로 value tower
+    학습 및 그리드 탐색의 입력으로 재사용된다 — 두 진입점이 정확히 같은 train/val/test
+    분리를 보고 있음을 보장하는 것이 이 함수의 핵심 역할이다."""
+    tx = load_transactions(dcfg)
+    tx = window_filter(tx, cfg, dcfg)
+    tx = merge_category(tx, dcfg)
+    val_start, test_start = compute_boundaries(tx, cfg, dcfg)
+    tx, n_users, n_items, n_cat = filter_and_index(tx, dcfg, cfg, val_start)
+    train, val_gt, val_rev, test_gt, test_rev = split_data(tx, val_start, test_start, n_items)
+    adj, pos_key, tr_u, tr_i, csr_ptr, csr_items = build_graph(train, n_users, n_items)
+    user_pos = train.groupby("u_idx")["i_idx"].apply(lambda s: np.unique(s.values)).to_dict()
+
+    _cm = train.drop_duplicates("i_idx").set_index("i_idx")["cat_idx"]
+    item_cat_arr = np.full(n_items, -1, dtype=np.int64)
+    item_cat_arr[_cm.index.values] = _cm.values
+    cat_items = train.drop_duplicates("i_idx").groupby("cat_idx")["i_idx"].apply(lambda s: s.to_numpy()).to_dict()
+
+    return dict(train=train, val_gt=val_gt, val_rev=val_rev, test_gt=test_gt, test_rev=test_rev,
+                adj=adj, pos_key=pos_key, tr_u=tr_u, tr_i=tr_i, csr_ptr=csr_ptr, csr_items=csr_items,
+                user_pos=user_pos, item_cat_arr=item_cat_arr, cat_items=cat_items,
+                n_users=n_users, n_items=n_items, n_cat=n_cat)
+
+
 def _user_pct_stats(train, cfg, is_date):
     """유저별 F(구매횟수)/T(활동기간)/R(최근성)/AOV/Prem 원시값 + 백분위 순위.
     build_user_features()와 compute_clv_vhat()가 거의 동일한 계산을 각자 중복 수행하던 걸
@@ -568,27 +601,15 @@ def train_loop(model, opt, tr_u, tr_i, n_items, pos_key, user_pos, item_cat_arr,
 def main():
     """M1을 학습/재개. 이미 체크포인트가 있으면 즉시 복원되고 끝남."""
     set_seed(CFG["SEED"])
-    print(f"MODEL=M1 | DATASET={CFG['DATASET']} | DEVICE={DEVICE} | RUN_TAG={CFG['RUN_TAG']}")
+    print(f"DATASET={CFG['DATASET']} | DEVICE={DEVICE} | RUN_TAG={CFG['RUN_TAG']}")
 
-    tx = load_transactions(DCFG)
-    tx = window_filter(tx, CFG, DCFG)
-    tx = merge_category(tx, DCFG)
-    val_start, test_start = compute_boundaries(tx, CFG, DCFG)
-    tx, n_users, n_items, n_cat = filter_and_index(tx, DCFG, CFG, val_start)
-    train, val_gt, val_rev, test_gt, test_rev = split_data(tx, val_start, test_start, n_items)
-    adj, pos_key, tr_u, tr_i, csr_ptr, csr_items = build_graph(train, n_users, n_items)
-    user_pos = train.groupby("u_idx")["i_idx"].apply(lambda s: np.unique(s.values)).to_dict()
-
-    _cm = train.drop_duplicates("i_idx").set_index("i_idx")["cat_idx"]
-    item_cat_arr = np.full(n_items, -1, dtype=np.int64)
-    item_cat_arr[_cm.index.values] = _cm.values
-    cat_items = train.drop_duplicates("i_idx").groupby("cat_idx")["i_idx"].apply(lambda s: s.to_numpy()).to_dict()
-
-    model = LightGCNCLV(n_users, n_items, CFG, adj).to(DEVICE)
+    d = prepare_data(CFG, DCFG)
+    model = LightGCNCLV(d["n_users"], d["n_items"], CFG, d["adj"]).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=CFG["LR"])
     history, best_state, best_ep, best_score = train_loop(
-        model, opt, tr_u, tr_i, n_items, pos_key, user_pos, item_cat_arr, cat_items,
-        val_gt, val_rev, csr_ptr, csr_items, CFG)
+        model, opt, d["tr_u"], d["tr_i"], d["n_items"], d["pos_key"], d["user_pos"],
+        d["item_cat_arr"], d["cat_items"], d["val_gt"], d["val_rev"],
+        d["csr_ptr"], d["csr_items"], CFG)
     model.load_state_dict(best_state)
     print(f"완료 — best epoch {best_ep}, val {CFG['SELECT_METRIC']} {best_score:.5f}")
     return model
@@ -1161,15 +1182,12 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
 
 
 def run_dualspace():
-    tx = load_transactions(DCFG); tx = window_filter(tx, CFG, DCFG); tx = merge_category(tx, DCFG)
-    val_start, test_start = compute_boundaries(tx, CFG, DCFG)
-    tx, n_users, n_items, n_cat = filter_and_index(tx, DCFG, CFG, val_start)
-    train, val_gt, val_rev, test_gt, test_rev = split_data(tx, val_start, test_start, n_items)
-    adj, pos_key, tr_u, tr_i, csr_ptr, csr_items = build_graph(train, n_users, n_items)
-    user_pos = train.groupby("u_idx")["i_idx"].apply(lambda s: np.unique(s.values)).to_dict()
-    _cm = train.drop_duplicates("i_idx").set_index("i_idx")["cat_idx"]
-    item_cat_arr = np.full(n_items, -1, np.int64); item_cat_arr[_cm.index.values] = _cm.values
-    cat_items = train.drop_duplicates("i_idx").groupby("cat_idx")["i_idx"].apply(lambda s: s.to_numpy()).to_dict()
+    d = prepare_data(CFG, DCFG)
+    train, val_gt, val_rev, test_gt, test_rev = d["train"], d["val_gt"], d["val_rev"], d["test_gt"], d["test_rev"]
+    n_users, n_items, n_cat = d["n_users"], d["n_items"], d["n_cat"]
+    tr_u, tr_i, pos_key = d["tr_u"], d["tr_i"], d["pos_key"]
+    user_pos, item_cat_arr, cat_items = d["user_pos"], d["item_cat_arr"], d["cat_items"]
+    csr_ptr, csr_items, adj = d["csr_ptr"], d["csr_items"], d["adj"]
 
     global csr_ptr_global, csr_items_global
     csr_ptr_global, csr_items_global = csr_ptr, csr_items
