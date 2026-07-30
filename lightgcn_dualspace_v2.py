@@ -174,15 +174,9 @@ def filter_and_index(tx, dcfg, cfg, val_start):
     uc, ic = train_counts(tx)
     keep_u = set(uc[uc >= cfg["MIN_USER_INTER"]].index)
     keep_i = set(ic[ic >= cfg["MIN_ITEM_INTER"]].index)
-
-    if cfg["ITER_FILTER"]:
-        while True:
-            sub = tx[tx["u_raw"].isin(keep_u) & tx["i_raw"].isin(keep_i)]
-            uc, ic = train_counts(sub)
-            nu, ni = set(uc[uc >= cfg["MIN_USER_INTER"]].index), set(ic[ic >= cfg["MIN_ITEM_INTER"]].index)
-            if nu == keep_u and ni == keep_i:
-                break
-            keep_u, keep_i = nu, ni
+    # ponytail: CFG["ITER_FILTER"]는 항상 False라 반복 재필터링 분기(구 while 루프)를 제거함.
+    # 키 자체는 체크포인트 지문(cfg_fingerprint/vt_fingerprint)에 여전히 들어가므로 CFG에 남겨둠
+    # — 여기서 지우면 기존 M1 체크포인트 파일명(해시)이 바뀌어 assert m1_path.exists()가 깨짐.
 
     tx = tx[tx["u_raw"].isin(keep_u) & tx["i_raw"].isin(keep_i)].copy()
     print(f"필터(train 구간 기준, MIN_USER_INTER={cfg['MIN_USER_INTER']}, "
@@ -242,20 +236,23 @@ def build_graph(train, n_users, n_items):
     csr_items = ei[order].astype(np.int32)
     csr_ptr = np.zeros(n_users + 1, dtype=np.int64)
     np.cumsum(np.bincount(eu, minlength=n_users), out=csr_ptr[1:])
-    cold_item = np.bincount(ei, minlength=n_items) == 0
-    return adj, edge_key, tu, ti, csr_ptr, csr_items, cold_item
+    return adj, edge_key, tu, ti, csr_ptr, csr_items
 
 
-def build_user_features(train, n_users, n_cat, cfg, is_date):
+def _user_pct_stats(train, cfg, is_date):
+    """유저별 F(구매횟수)/T(활동기간)/R(최근성)/AOV/Prem 원시값 + 백분위 순위.
+    build_user_features()와 compute_clv_vhat()가 거의 동일한 계산을 각자 중복 수행하던 걸
+    공용 헬퍼로 통합함(ponytail-review 지적) — 수식은 원래 코드와 완전히 동일, 계산 위치만 합침."""
     win_end = train["t"].max()
     span = win_end - train["t"].min()
     win_days = max((span.days if is_date else span), 1)
-    train = train.assign(_prem=(train["v"].rank(pct=True) > cfg["PREMIUM_THR"]).astype("int8"))
+    prem_flag = (train["v"].rank(pct=True) > cfg["PREMIUM_THR"]).astype("int8")
     k = cfg["SHRINKAGE_K"]
 
-    g = train.groupby("u_idx").agg(F=("v", "count"), first=("t", "min"), last=("t", "max"),
-                                    AOV_raw=("v", "mean"), prem=("_prem", "sum"))
-    glob_aov = train["v"].mean(); glob_prem = train["_prem"].mean()
+    g = train.assign(_prem=prem_flag).groupby("u_idx").agg(
+        F=("v", "count"), first=("t", "min"), last=("t", "max"),
+        AOV_raw=("v", "mean"), prem=("_prem", "sum"))
+    glob_aov = train["v"].mean(); glob_prem = prem_flag.mean()
 
     if is_date:
         T = (g["last"] - g["first"]).dt.days
@@ -264,13 +261,19 @@ def build_user_features(train, n_users, n_cat, cfg, is_date):
         T = g["last"] - g["first"]
         R = 1 - ((win_end - g["last"]) / win_days)
 
-    F_p, T_p, R_p = g["F"].rank(pct=True), T.rank(pct=True), R.rank(pct=True)
+    g["F_p"], g["T_p"], g["R_p"] = g["F"].rank(pct=True), T.rank(pct=True), R.rank(pct=True)
     AOV = (g.F * g.AOV_raw + k * glob_aov) / (g.F + k)
     Prem = (g.prem + k * glob_prem) / (g.F + k)
-    AOV_p, Prem_p = AOV.rank(pct=True), Prem.rank(pct=True)
+    g["AOV_p"], g["Prem_p"] = AOV.rank(pct=True), Prem.rank(pct=True)
+    return g
+
+
+def build_user_features(train, n_users, n_cat, cfg, is_date):
+    g = _user_pct_stats(train, cfg, is_date)
+    k = cfg["SHRINKAGE_K"]
 
     x_rep = np.full((n_users, 3), 0.5, np.float32)
-    x_rep[g.index.values] = np.stack([F_p.values, T_p.values, R_p.values], axis=1)
+    x_rep[g.index.values] = np.stack([g["F_p"].values, g["T_p"].values, g["R_p"].values], axis=1)
 
     Spend_u = train.groupby("u_idx")["v"].sum()
     cat_spend = (train.groupby(["u_idx", "cat_idx"])["v"].sum()
@@ -283,8 +286,8 @@ def build_user_features(train, n_users, n_cat, cfg, is_date):
     cat_full[catshare.index.values] = catshare.values.astype(np.float32)
 
     aov_full = np.full(n_users, 0.5, np.float32); prem_full = np.full(n_users, 0.5, np.float32)
-    aov_full[AOV_p.index.values] = AOV_p.values.astype(np.float32)
-    prem_full[Prem_p.index.values] = Prem_p.values.astype(np.float32)
+    aov_full[g.index.values] = g["AOV_p"].values.astype(np.float32)
+    prem_full[g.index.values] = g["Prem_p"].values.astype(np.float32)
 
     x_val = np.concatenate([aov_full[:, None], prem_full[:, None], cat_full], axis=1)
     F_u_full = np.zeros(n_users, dtype=np.int64)
@@ -326,26 +329,12 @@ def build_item_meta(train, n_items):
 
 def compute_clv_vhat(train, n_users, cfg, is_date):
     """평가/세그먼트 전용 CLV — 모델 입력(CatShare 등)과 독립적으로, 원시 행동변수로만 산출."""
-    win_end = train["t"].max(); span = win_end - train["t"].min()
-    win_days = max((span.days if is_date else span), 1)
-    train = train.assign(_prem=(train["v"].rank(pct=True) > cfg["PREMIUM_THR"]).astype("int8"))
-    k = cfg["SHRINKAGE_K"]
-    g = train.groupby("u_idx").agg(F=("v", "count"), first=("t", "min"), last=("t", "max"),
-                                    AOV_raw=("v", "mean"), prem=("_prem", "sum"))
-    glob_aov = train["v"].mean(); glob_prem = train["_prem"].mean()
-    if is_date:
-        T = (g["last"] - g["first"]).dt.days; R = 1 - ((win_end - g["last"]).dt.days / win_days)
-    else:
-        T = g["last"] - g["first"]; R = 1 - ((win_end - g["last"]) / win_days)
-    F_p, T_p, R_p = g["F"].rank(pct=True), T.rank(pct=True), R.rank(pct=True)
-    AOV = (g.F * g.AOV_raw + k * glob_aov) / (g.F + k)
-    Prem = (g.prem + k * glob_prem) / (g.F + k)
-    AOV_p, Prem_p = AOV.rank(pct=True), Prem.rank(pct=True)
-    n_hat = pd.concat([F_p, T_p, R_p], axis=1).mean(axis=1)
-    v_hat = pd.concat([AOV_p, Prem_p], axis=1).mean(axis=1)
+    g = _user_pct_stats(train, cfg, is_date)
+    n_hat = g[["F_p", "T_p", "R_p"]].mean(axis=1)
+    v_hat = g[["AOV_p", "Prem_p"]].mean(axis=1)
     clv_full = np.full(n_users, np.nan); vhat_full = np.full(n_users, 0.5, np.float32)
-    clv_full[n_hat.index.values] = (n_hat * v_hat).values
-    vhat_full[v_hat.index.values] = v_hat.values.astype(np.float32)
+    clv_full[g.index.values] = (n_hat * v_hat).values
+    vhat_full[g.index.values] = v_hat.values.astype(np.float32)
     return clv_full, vhat_full
 
 
@@ -361,57 +350,39 @@ class SideMLP(nn.Module):
 
 
 class LightGCNCLV(nn.Module):
-    def __init__(self, n_users, n_items, cfg, adj, x_rep=None, x_val_u=None, x_val_i=None):
+    # ponytail: 이전에는 cfg["MODEL"] != "M1"일 때 유저/아이템 side 정보(CLV 파생 변수)를
+    # layer-0 임베딩에 가산 주입하는 분기(use_side, x_rep/x_val_u/x_val_i, mlp_rep/val_u/val_i,
+    # gamma_rep/val_u/val_i)가 있었음(구 M2 원본 가산주입 방식). 이 스크립트는 MODEL이 항상
+    # "M1"으로 고정돼 있어(z^pref는 이 클래스가 아니라 별도 ValueTower가 Dual-Space로 담당)
+    # 그 분기가 한 번도 실행되지 않는 죽은 코드였음 — 삭제. 원본 구현은
+    # lightgcn_clv_exp_colab_emb2.ipynb(emb2)에 그대로 보존되어 있음.
+    def __init__(self, n_users, n_items, cfg, adj):
         super().__init__()
         self.n_users, self.n_items = n_users, n_items
         self.n_layers = cfg["N_LAYERS"]
         self.adj = adj
-        self.use_side = cfg["MODEL"] != "M1"
         D = cfg["DIM"]
 
         self.user_emb = nn.Embedding(n_users, D); self.item_emb = nn.Embedding(n_items, D)
         nn.init.normal_(self.user_emb.weight, std=0.1); nn.init.normal_(self.item_emb.weight, std=0.1)
-
-        self.side_keys = []
-        if self.use_side:
-            self.register_buffer("x_rep", torch.from_numpy(x_rep))
-            self.register_buffer("x_val_u", torch.from_numpy(x_val_u))
-            self.register_buffer("x_val_i", torch.from_numpy(x_val_i))
-            self.mlp_rep = SideMLP(x_rep.shape[1], cfg["MLP_HIDDEN"], D)
-            self.mlp_val_u = SideMLP(x_val_u.shape[1], cfg["MLP_HIDDEN"], D)
-            self.mlp_val_i = SideMLP(x_val_i.shape[1], cfg["MLP_HIDDEN"], D)
-            self.gamma_rep = nn.Parameter(torch.tensor(float(cfg["GAMMA_INIT"])))
-            self.gamma_val_u = nn.Parameter(torch.tensor(float(cfg["GAMMA_INIT"])))
-            self.gamma_val_i = nn.Parameter(torch.tensor(float(cfg["GAMMA_INIT"])))
-            self.side_keys = ["rep", "val_u", "val_i"]
-
-    def layer0(self):
-        eu, ei = self.user_emb.weight, self.item_emb.weight
-        if self.use_side:
-            rep = F.normalize(self.mlp_rep(self.x_rep), dim=1)
-            val_u = F.normalize(self.mlp_val_u(self.x_val_u), dim=1)
-            val_i = F.normalize(self.mlp_val_i(self.x_val_i), dim=1)
-            eu = eu + self.gamma_rep * rep + self.gamma_val_u * val_u
-            ei = ei + self.gamma_val_i * val_i
-        return eu, ei
+        self.side_keys = []  # train_loop()의 로그 출력이 참조 — 항상 빈 리스트(side 주입 없음)
 
     def propagate(self):
-        eu, ei = self.layer0()
+        eu, ei = self.user_emb.weight, self.item_emb.weight
         x = torch.cat([eu, ei], dim=0); out = x
         for _ in range(self.n_layers):
             x = torch.sparse.mm(self.adj, x); out = out + x
         out = out / (self.n_layers + 1)
         return out[:self.n_users], out[self.n_users:], eu, ei
 
-    def bpr_loss(self, u, pos, neg, wd, reg_target="effective"):
+    def bpr_loss(self, u, pos, neg, wd):
+        # ponytail: REG_TARGET="effective"/"id" 분기 제거 — side 주입이 없어(위 참고) eu0/ei0가
+        # 항상 user_emb.weight/item_emb.weight와 같은 값이라 두 옵션이 동일했음. CFG["REG_TARGET"]
+        # 키 자체는 체크포인트 지문(cfg_fingerprint) 안정성 때문에 CFG에는 그대로 남겨둠(값 미사용).
         U, I, eu0, ei0 = self.propagate()
         eu, ep, en = U[u], I[pos], I[neg]
         bpr = -F.logsigmoid((eu * ep).sum(1) - (eu * en).sum(1)).mean()
-        if reg_target == "effective":
-            ru, rp, rn = eu0[u], ei0[pos], ei0[neg]
-        else:
-            ru, rp, rn = self.user_emb.weight[u], self.item_emb.weight[pos], self.item_emb.weight[neg]
-        reg = (ru.norm(2).pow(2) + rp.norm(2).pow(2) + rn.norm(2).pow(2)) / len(u)
+        reg = (eu0[u].norm(2).pow(2) + ei0[pos].norm(2).pow(2) + ei0[neg].norm(2).pow(2)) / len(u)
         return bpr + wd * reg
 
 
@@ -541,7 +512,7 @@ def train_loop(model, opt, tr_u, tr_i, n_items, pos_key, user_pos, item_cat_arr,
                                hard_ratio=cfg["HARD_NEG_RATIO"])
             loss = model.bpr_loss(torch.from_numpy(bu.astype(np.int64)).to(DEVICE),
                                    torch.from_numpy(bi.astype(np.int64)).to(DEVICE),
-                                   torch.from_numpy(bn).to(DEVICE), cfg["WD"], cfg["REG_TARGET"])
+                                   torch.from_numpy(bn).to(DEVICE), cfg["WD"])
             opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item()
         avg_loss = tot / n_batch
         rec = {"epoch": ep, "loss": avg_loss, "sec": time.time() - t0}
@@ -583,7 +554,7 @@ def main():
     val_start, test_start = compute_boundaries(tx, DCFG)
     tx, n_users, n_items, n_cat = filter_and_index(tx, DCFG, CFG, val_start)
     train, val_gt, val_rev, test_gt, test_rev = split_data(tx, val_start, test_start, n_items)
-    adj, pos_key, tr_u, tr_i, csr_ptr, csr_items, cold_item = build_graph(train, n_users, n_items)
+    adj, pos_key, tr_u, tr_i, csr_ptr, csr_items = build_graph(train, n_users, n_items)
     user_pos = train.groupby("u_idx")["i_idx"].apply(lambda s: np.unique(s.values)).to_dict()
 
     _cm = train.drop_duplicates("i_idx").set_index("i_idx")["cat_idx"]
@@ -1174,7 +1145,7 @@ def run_dualspace():
     val_start, test_start = compute_boundaries(tx, DCFG)
     tx, n_users, n_items, n_cat = filter_and_index(tx, DCFG, CFG, val_start)
     train, val_gt, val_rev, test_gt, test_rev = split_data(tx, val_start, test_start, n_items)
-    adj, pos_key, tr_u, tr_i, csr_ptr, csr_items, cold_item = build_graph(train, n_users, n_items)
+    adj, pos_key, tr_u, tr_i, csr_ptr, csr_items = build_graph(train, n_users, n_items)
     user_pos = train.groupby("u_idx")["i_idx"].apply(lambda s: np.unique(s.values)).to_dict()
     _cm = train.drop_duplicates("i_idx").set_index("i_idx")["cat_idx"]
     item_cat_arr = np.full(n_items, -1, np.int64); item_cat_arr[_cm.index.values] = _cm.values
