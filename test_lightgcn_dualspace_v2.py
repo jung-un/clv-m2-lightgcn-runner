@@ -1,5 +1,3 @@
-import importlib.util
-import sys
 from pathlib import Path
 
 SCRIPT_PATH = Path(__file__).parent / "lightgcn_dualspace_v2.py"
@@ -54,6 +52,42 @@ def test_compute_boundaries_reads_days_from_cfg_not_dcfg_is_date_true():
     t_max = tx["t"].max()
     assert test_start == t_max - pd.Timedelta(days=3)
     assert val_start == test_start - pd.Timedelta(days=5)
+
+
+def test_window_filter_reads_window_days_from_cfg_is_date_true():
+    """dcfg에 window_months가 없어도(=이제 DCFG의 실제 모습) cfg["WINDOW_DAYS"] 기준으로 필터링해야 함."""
+    ns = _load_module_upto_cfg()
+    pd = ns["pd"]
+    window_filter = ns["window_filter"]
+    tx = pd.DataFrame({"t": pd.to_datetime(["2024-01-01", "2024-01-20", "2024-01-31"])})
+    cfg = {"WINDOW_DAYS": 10}
+    dcfg = {"is_date": True}  # window_months 키 없음 — 있으면 옛 코드로 되돌아간 것
+    out = window_filter(tx, cfg, dcfg)
+    assert list(out["t"]) == [pd.Timestamp("2024-01-31")]  # t_max(01-31) - 10일 = 01-21 이후만 생존
+
+
+def test_window_filter_reads_window_days_from_cfg_is_date_false():
+    """dunnhumby처럼 t가 정수 day-index인 경우(is_date=False)도 동일하게 cfg 기준으로 필터링해야 함."""
+    ns = _load_module_upto_cfg()
+    pd = ns["pd"]
+    window_filter = ns["window_filter"]
+    tx = pd.DataFrame({"t": [1, 50, 100]})
+    cfg = {"WINDOW_DAYS": 10}
+    dcfg = {"is_date": False}
+    out = window_filter(tx, cfg, dcfg)
+    assert list(out["t"]) == [100]  # t_max(100) - 10 = 90 이후만 생존
+
+
+def test_window_filter_none_keeps_all_rows():
+    """WINDOW_DAYS=None이면 전체기간 사용(필터링 없음)."""
+    ns = _load_module_upto_cfg()
+    pd = ns["pd"]
+    window_filter = ns["window_filter"]
+    tx = pd.DataFrame({"t": [1, 50, 100]})
+    cfg = {"WINDOW_DAYS": None}
+    dcfg = {"is_date": False}
+    out = window_filter(tx, cfg, dcfg)
+    assert list(out["t"]) == [1, 50, 100]
 
 
 def test_compute_boundaries_reads_days_from_cfg_not_dcfg_is_date_false():
