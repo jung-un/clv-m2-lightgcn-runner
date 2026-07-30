@@ -214,3 +214,51 @@ def test_score_topk_matches_reference_loop():
         for m in ["recall", "precision", "hr", "ndcg", "map", "revenue", "arp", "novelty", "diversity"]:
             np.testing.assert_allclose(out[k][m], ref[k][m], rtol=1e-6, atol=1e-8,
                                         err_msg=f"k={k} metric={m} 불일치")
+
+
+def test_score_topk_zero_ground_truth_user_no_divzero():
+    """정답(gt)이 0개인 유저(P=0)가 섞여 있을 때 recall/precision/hr/map/ndcg가
+    NaN/inf 없이 정확히 0.0이어야 한다 (분모가 P인 recall/map, k인 precision 등에서
+    0-division이 조용히 NaN을 만들어내지 않는지 확인)."""
+    ns = _load_module_upto_cfg()
+    np = ns["np"]
+    rng = np.random.default_rng(2)
+    n_items, n_users_eval, max_k = 30, 4, 10
+    ks = [5, 10]
+    bu = np.arange(n_users_eval)
+    topk = np.stack([rng.permutation(n_items)[:max_k] for _ in range(n_users_eval)])
+    # user 0: P=0 (빈 gt). 나머지는 평소처럼 1~3개.
+    gt = {0: np.array([], dtype=np.int32)}
+    gt.update({u: rng.choice(n_items, size=rng.integers(1, 4), replace=False).astype(np.int32)
+               for u in bu[1:]})
+    rev = {u: rng.uniform(10, 50, size=len(gt[u])).astype(np.float32) for u in bu}
+    price_pct = rng.uniform(0, 1, n_items).astype(np.float32)
+    item_nov = rng.uniform(0, 5, n_items).astype(np.float32)
+    cat = rng.integers(0, 4, n_items).astype(np.int64)
+
+    pos_key_list, pos_rev_list = [], []
+    for u in bu:
+        for i, r in zip(gt[u], rev[u]):
+            pos_key_list.append(int(u) * n_items + int(i)); pos_rev_list.append(float(r))
+    order = np.argsort(pos_key_list)
+    pos_key_sorted = np.array(pos_key_list)[order]
+    pos_rev_sorted = np.array(pos_rev_list)[order]
+    P_arr = np.array([len(gt[u]) for u in bu])
+
+    ideal_rev_cumsum = {}
+    for u in bu:
+        sorted_rev = np.sort(rev[u])[::-1]
+        disc = 1.0 / np.log2(np.arange(2, len(sorted_rev) + 2))
+        ideal_rev_cumsum[u] = np.cumsum(sorted_rev * disc)
+
+    out = ns["score_topk"](topk, bu, ks, pos_key_sorted, pos_rev_sorted, n_items,
+                            P_arr, price_pct, item_nov, cat, ideal_rev_cumsum)
+
+    for k in ks:
+        for m in ["recall", "precision", "hr", "ndcg", "map", "revenue", "vndcg",
+                   "arp", "novelty", "diversity"]:
+            arr = out[k][m]
+            assert np.isfinite(arr).all(), f"k={k} metric={m}에 NaN/inf 있음: {arr}"
+        # P=0인 유저 0은 맞출 정답 자체가 없으므로 recall/precision/hr/map/ndcg가 0.0이어야 함
+        for m in ["recall", "precision", "hr", "map", "ndcg"]:
+            assert out[k][m][0] == 0.0, f"k={k} metric={m}: P=0 유저는 0.0이어야 하는데 {out[k][m][0]}"
