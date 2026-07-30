@@ -1660,6 +1660,10 @@ def run_dualspace():
     return all_results
 
 
-# M1이 이미 학습되어 있으면(체크포인트 존재) 아래 main()은 즉시 복원되고 끝납니다.
-# main()  # 필요시 주석 해제 (M1을 처음부터 학습해야 하는 경우)
+# M1 체크포인트(RUN_TAG 지문 기준)가 없으면 자동으로 먼저 학습한다 — CFG를 바꿔서
+# RUN_TAG(지문)가 달라지면(예: WINDOW_DAYS 변경) 이 체크가 자동으로 재학습을 트리거한다.
+# 이미 존재하면 main() 자체가 즉시 복원만 하고 끝나므로 항상 호출해도 안전하다.
+if not (Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['RUN_TAG']}.pt").exists():
+    print(f"[runner] M1 체크포인트 없음(RUN_TAG={CFG['RUN_TAG']}) — main()으로 먼저 학습")
+    main()
 results = run_dualspace()
