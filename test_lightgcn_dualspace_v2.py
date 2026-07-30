@@ -570,3 +570,61 @@ def test_load_or_run_seed_roundtrips_coverage_and_gini_integer_keys(tmp_path):
     r2 = ns["load_or_run_seed"](8, tmp_path, "M2", "hm", fake)
     assert 10 in r2[0]["test_base"]["coverage"], "coverage 키는 int 10이어야 함(str '10' 아님)"
     assert 10 in r2[0]["test_base"]["gini"], "gini 키는 int 10이어야 함(str '10' 아님)"
+
+
+def test_end_to_end_smoke_cpu(tmp_path):
+    """전체 파이프라인이 CPU + 아주 작은 synthetic 데이터로 에러 없이 한 바퀴
+    도는지 확인: prepare_data() -> LightGCNCLV -> train_loop() 1 epoch.
+    이전 태스크들 각자는 단위테스트로 통과했지만, 아무도 이 세 함수를 실제로
+    이어서 호출해본 적은 없다 — signature 어긋남(인자 순서/누락)이 있다면
+    여기서만 걸린다. 실제 성능 검증은 여전히 Colab 몫.
+
+    _synthetic_tx()(유저 6/아이템 5)는 여기서는 일부러 쓰지 않는다 — 그 정도
+    밀도면 한 유저가 train 구간에서 아이템 5개를 전부 구매해버려 sample_batch()의
+    negative 후보가 바닥나는 (n_items 대비 유저당 구매가 지나치게 많은) 퇴화
+    케이스에 걸린다. 이는 sample_batch()의 실제 결함이 아니라 그 함수가 애초에
+    전제하는 "이 유저가 안 산 아이템이 최소 하나는 남아있다"는 가정을 fixture가
+    깨버린 것이므로, 유저/아이템 개수만 넉넉히 늘려 이 통합테스트 목적(signature
+    호환성 확인)에 맞는 밀도로 조정한다."""
+    ns = _load_module_upto_cfg()
+    pd, np, torch = ns["pd"], ns["np"], ns["torch"]
+
+    rng = np.random.default_rng(0)
+    n = 80
+    dates = pd.date_range("2020-01-01", periods=30, freq="D")
+    tx = pd.DataFrame({
+        "u_raw": rng.integers(0, 8, n),
+        "i_raw": rng.integers(0, 10, n).astype(str),
+        "t": rng.choice(dates, n),
+        "v": rng.uniform(10, 100, n).round(2),
+    })
+    tx_path = tmp_path / "tx.csv"
+    meta_path = tmp_path / "articles.csv"
+    tx.rename(columns={"u_raw": "customer_id", "i_raw": "article_id",
+                        "t": "t_dat", "v": "price"}).to_csv(tx_path, index=False)
+    pd.DataFrame({"article_id": tx["i_raw"].unique(),
+                  "product_group_name": ["catA"] * tx["i_raw"].nunique()}).to_csv(meta_path, index=False)
+
+    cfg = dict(ns["CFG"])
+    cfg.update(WINDOW_DAYS=None, VAL_DAYS=3, TEST_DAYS=3, EPOCHS=1, EARLY_STOP=100,
+               BATCH_SIZE=8, EVAL_BATCH=8, HARD_NEG_RATIO=0.0, DIM=4, N_LAYERS=1,
+               VT_MAX_EPOCHS=1, VT_PATIENCE=100, MLP_HIDDEN=4, D_VALUE=2,
+               VT_TOPK_CKPTS=1, LAMBDA_GRID=[0, 0.5], CLV_DAMPEN_GRID=[1.0],
+               HIGH_CLV_DAMPEN_GRID=[1.0], HIGH_CLV_EPSILON_GRID=[0.05],
+               OUT_DIR=str(tmp_path / "out"), N_BOOT=10, K_LIST=[5], SELECT_METRIC="Recall@5")
+    dcfg = dict(ns["DCFG"])
+    dcfg["tx_path"] = str(tx_path); dcfg["item_meta_path"] = str(meta_path)
+    cfg["RUN_TAG"] = f"M1_{cfg['DATASET']}_s{cfg['SEED']}_{ns['cfg_fingerprint'](cfg, dcfg)}"
+
+    d = ns["prepare_data"](cfg, dcfg)
+    model = ns["LightGCNCLV"](d["n_users"], d["n_items"], cfg, d["adj"])
+    opt = torch.optim.Adam(model.parameters(), lr=cfg["LR"])
+    history, best_state, best_ep, best_score = ns["train_loop"](
+        model, opt, d["tr_u"], d["tr_i"], d["n_items"], d["pos_key"], d["user_pos"],
+        d["item_cat_arr"], d["cat_items"], d["val_gt"], d["val_rev"],
+        d["csr_ptr"], d["csr_items"], cfg)
+
+    assert best_state is not None, "1 epoch만 돌아도 best_state가 채워져야 함"
+    assert best_ep == 1
+    assert len(history) == 1
+    assert "user_emb.weight" in best_state and best_state["user_emb.weight"].shape == (d["n_users"], cfg["DIM"])
