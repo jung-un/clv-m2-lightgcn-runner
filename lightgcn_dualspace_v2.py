@@ -744,6 +744,19 @@ class ValueTower(nn.Module):
         return -F.logsigmoid(pos_score - neg_score).mean()
 
 
+VT_SNAPSHOT_EXCLUDED_KEYS = {"x_val_u", "x_val_i"}  # static input buffers, never saved per-epoch
+
+
+def load_vt_state(model, state):
+    """value tower 저장 스냅샷에는 x_val_u/x_val_i(static 입력 버퍼)가 의도적으로 빠져있으므로
+    strict=False로 로드한다. 하지만 그 외 키가 빠지거나 낯선 키가 섞여 있으면(예: 나중에
+    ValueTower에 파라미터가 추가됐는데 저장 로직이 안 따라간 경우) 그건 진짜 버그이므로
+    조용히 무작위 초기값으로 남기지 않고 바로 에러를 낸다."""
+    result = model.load_state_dict(state, strict=False)
+    assert set(result.missing_keys) <= VT_SNAPSHOT_EXCLUDED_KEYS and not result.unexpected_keys, \
+        f"VT state_dict mismatch: missing={result.missing_keys} unexpected={result.unexpected_keys}"
+
+
 @torch.no_grad()
 def evaluate_value_only(model, gt, csr_ptr, csr_items, k=10, batch=1024):
     """value tower 자체의 Recall — 조기종료 판단용 (z^pref와 무관)."""
@@ -819,10 +832,10 @@ def train_value_tower(x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
         val_score = evaluate_value_only(model, val_gt, csr_ptr, csr_items, k=10)
         # x_val_u/x_val_i are static input-feature buffers (never trained, identical across
         # every epoch) — excluding them keeps each all_epochs snapshot small. They're already
-        # present on `model` at construction time, so load_state_dict(..., strict=False) below
-        # is exactly correct, not a workaround.
+        # present on `model` at construction time, so load_vt_state() (strict except for these
+        # two known keys) below is exactly correct, not a workaround.
         state_snapshot = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-                          if k not in ("x_val_u", "x_val_i")}
+                          if k not in VT_SNAPSHOT_EXCLUDED_KEYS}
         star = ""
         if val_score > best_score:
             best_score, best_ep, bad = val_score, ep, 0
@@ -846,7 +859,7 @@ def train_value_tower(x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
         if cfg["VT_PATIENCE"] and bad >= cfg["VT_PATIENCE"]:
             print("  early stop"); break
 
-    model.load_state_dict(best_state, strict=False)  # best_state has no x_val_u/x_val_i (see above); already correct on model
+    load_vt_state(model, best_state)  # best_state has no x_val_u/x_val_i (see above); already correct on model
     if ckpt_path:
         print(f"  저장 → {ckpt_path} (VT 단독최고 epoch={best_ep}, 총 {len(all_epochs)}개 epoch 보관)")
     return model, best_ep, best_score, all_epochs
@@ -1153,7 +1166,7 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
     screen_lam = CFG["EPOCH_SCREEN_LAMBDA"]
     screen_rows = []
     for ck in vt_all_epochs:
-        value_model.load_state_dict(ck["state"], strict=False)  # x_val_u/x_val_i excluded from snapshot, already correct on value_model
+        load_vt_state(value_model, ck["state"])  # x_val_u/x_val_i excluded from snapshot, already correct on value_model
         with torch.no_grad():
             Uv_s, Iv_s = value_model.encode()
         res_s = _eval(gate_f, screen_lam, val_gt, val_rev, Uv_s, Iv_s)
@@ -1179,7 +1192,7 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
     grid_results = {}
     for ck in vt_topk:
         ep_id = ck["epoch"]
-        value_model.load_state_dict(ck["state"], strict=False)  # same as above
+        load_vt_state(value_model, ck["state"])  # same as above
         with torch.no_grad():
             Uv_c, Iv_c = value_model.encode()
         for dampen_low in CFG["CLV_DAMPEN_GRID"]:
@@ -1226,7 +1239,7 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
             candidates, key=lambda k: grid_results[k]["overall"][10]["revenue"])
         gate_arr = gate_f * np.where(is_low_clv, best_dampen_low, np.where(is_high_clv, best_dampen_high, 1.0))
         selected_state = next(ck["state"] for ck in vt_topk if ck["epoch"] == best_ep)
-        value_model.load_state_dict(selected_state, strict=False)  # same as above
+        load_vt_state(value_model, selected_state)  # same as above
         with torch.no_grad():
             Uv, Iv = value_model.encode()
 

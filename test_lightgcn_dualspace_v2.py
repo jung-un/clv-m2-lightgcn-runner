@@ -393,3 +393,35 @@ def test_train_value_tower_resumes_from_checkpoint(tmp_path):
 
     _assert_bookkeeping_consistent(saved)
     _assert_bookkeeping_consistent(saved2)
+
+
+def test_load_vt_state_tolerates_only_the_two_known_excluded_buffers():
+    ns = _load_module_upto_cfg()
+    np, torch = ns["np"], ns["torch"]
+    model = ns["ValueTower"](
+        np.random.default_rng(0).uniform(size=(5, 3)).astype(np.float32),
+        np.random.default_rng(1).uniform(size=(4, 2)).astype(np.float32),
+        hidden=4, d_value=2)
+    full_state = model.state_dict()
+
+    # 정상 경로: x_val_u/x_val_i만 빠진 스냅샷은 조용히 통과해야 한다
+    trimmed = {k: v for k, v in full_state.items() if k not in ("x_val_u", "x_val_i")}
+    ns["load_vt_state"](model, trimmed)  # raises nothing
+
+    # 회귀 감지 경로: 학습 가능한 파라미터가 빠지면(버퍼가 아닌 진짜 버그) 조용히 넘어가지
+    # 않고 바로 에러가 나야 한다 — 안 그러면 그 파라미터가 무작위 초기값에 그대로 남는다
+    real_param_key = next(k for k in full_state if k not in ("x_val_u", "x_val_i"))
+    broken = {k: v for k, v in full_state.items() if k != real_param_key}
+    try:
+        ns["load_vt_state"](model, broken)
+        assert False, "load_vt_state should have raised on a missing non-buffer key"
+    except AssertionError as e:
+        assert real_param_key in str(e)
+
+    # 회귀 감지 경로: 낯선 키가 섞여 있어도 에러가 나야 한다
+    unexpected = dict(trimmed); unexpected["surprise_key"] = torch.zeros(1)
+    try:
+        ns["load_vt_state"](model, unexpected)
+        assert False, "load_vt_state should have raised on an unexpected key"
+    except AssertionError as e:
+        assert "surprise_key" in str(e)
