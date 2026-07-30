@@ -780,7 +780,12 @@ def train_value_tower(x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
     MLP라 저장 비용이 낮으므로, "VT 단독 Recall 상위 K개"가 아니라 조기종료 전까지
     학습된 모든 epoch의 state를 보관해서 반환한다 — 어떤 epoch를 결합 그리드에 넣을지는
     호출부(run_dualspace_one_seed)가 실제 결합 PWGain으로 다시 스크리닝한다.
-    z^pref와 파라미터 전혀 공유 안 함."""
+    z^pref와 파라미터 전혀 공유 안 함.
+
+    M1 train_loop()과 동일한 저장/재개 패턴: ckpt_path에 매 epoch 끝날 때마다
+    현재까지 진행상황(epoch 번호, 모델/옵티마이저 state, best 기록, all_epochs 스냅샷)을
+    저장하고, 시작할 때 그 파일이 있으면 이어서 학습한다. Colab 세션이 VT_MAX_EPOCHS(최대
+    60)를 다 돌기 전에 끊겨도 처음부터 다시 돌 필요가 없다."""
     set_seed(seed)
     model = ValueTower(x_val_u, x_val_i, cfg["MLP_HIDDEN"], cfg["D_VALUE"]).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=cfg["LR"])
@@ -789,8 +794,18 @@ def train_value_tower(x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
     best_score, best_ep, best_state, bad = -1.0, -1, None, 0
     all_epochs = []  # [{"epoch":ep, "val_recall10":val_score, "state":state_dict}] — 전 epoch 보관
     history = []
+    start_ep = 1
 
-    for ep in range(1, cfg["VT_MAX_EPOCHS"] + 1):
+    if ckpt_path and Path(ckpt_path).exists():
+        st = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(st["model_state"]); opt.load_state_dict(st["opt_state"])
+        start_ep = st["last_epoch"] + 1
+        best_score, best_ep, bad = st["best_val_score"], st["best_epoch"], st["bad"]
+        all_epochs = st["all_epochs"]; history = st["history"]
+        best_state = st["best_state"]
+        print(f"[VT RESUME seed{seed}] epoch {st['last_epoch']}까지 복원, epoch {start_ep}부터 재개")
+
+    for ep in range(start_ep, cfg["VT_MAX_EPOCHS"] + 1):
         perm = rng.permutation(n_train); tot = 0.0
         for b in range(n_batch):
             idx = perm[b*cfg["BATCH_SIZE"]:(b+1)*cfg["BATCH_SIZE"]]
@@ -813,17 +828,21 @@ def train_value_tower(x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
         all_epochs.append({"epoch": ep, "val_recall10": val_score, "state": state_snapshot})
         history.append({"epoch": ep, "loss": tot/n_batch, "val_recall@10": val_score})
         print(f"[value tower seed{seed}] ep {ep:3d} loss {tot/n_batch:.4f} val_R@10 {val_score:.5f}{star}")
+
+        if ckpt_path:
+            Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"model_state": model.state_dict(), "opt_state": opt.state_dict(),
+                        "last_epoch": ep, "best_epoch": best_ep, "best_val_score": best_score,
+                        "bad": bad, "best_state": best_state, "all_epochs": all_epochs,
+                        "history": history, "seed": seed, "d_value": cfg["D_VALUE"],
+                        "mlp_hidden": cfg["MLP_HIDDEN"], "hard_neg_ratio": cfg["HARD_NEG_RATIO"]},
+                       ckpt_path)
+
         if cfg["VT_PATIENCE"] and bad >= cfg["VT_PATIENCE"]:
             print("  early stop"); break
 
     model.load_state_dict(best_state)
     if ckpt_path:
-        Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"best_state": best_state, "best_epoch": best_ep, "best_val_score": best_score,
-                    "all_epochs": [e["epoch"] for e in all_epochs],
-                    "all_val_scores": [e["val_recall10"] for e in all_epochs],
-                    "seed": seed, "d_value": cfg["D_VALUE"], "mlp_hidden": cfg["MLP_HIDDEN"],
-                    "hard_neg_ratio": cfg["HARD_NEG_RATIO"], "history": history}, ckpt_path)
         print(f"  저장 → {ckpt_path} (VT 단독최고 epoch={best_ep}, 총 {len(all_epochs)}개 epoch 보관)")
     return model, best_ep, best_score, all_epochs
 

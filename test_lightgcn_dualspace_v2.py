@@ -323,3 +323,40 @@ def test_evaluate_combined_cache_matches_internal_computation():
                                         rtol=1e-9, atol=1e-12,
                                         err_msg=f"k={k} metric={m}: cached path diverged from internal-compute path")
     assert r_internal["value_alignment_spearman"] == r_cached["value_alignment_spearman"]
+
+
+def test_train_value_tower_resumes_from_checkpoint(tmp_path):
+    ns = _load_module_upto_cfg()
+    np, torch = ns["np"], ns["torch"]
+    n_users, n_items = 20, 15
+    x_val_u = np.random.default_rng(0).uniform(size=(n_users, 4)).astype(np.float32)
+    x_val_i = np.random.default_rng(1).uniform(size=(n_items, 3)).astype(np.float32)
+    tr_u = np.random.default_rng(2).integers(0, n_users, 200).astype(np.int64)
+    tr_i = np.random.default_rng(3).integers(0, n_items, 200).astype(np.int64)
+    pos_key = np.unique(tr_u.astype(np.int64) * n_items + tr_i)
+    user_pos = {}
+    item_cat_arr = np.random.default_rng(4).integers(0, 3, n_items).astype(np.int64)
+    cat_items = {c: np.where(item_cat_arr == c)[0] for c in range(3)}
+    val_gt = {u: np.array([int(u % n_items)], dtype=np.int32) for u in range(n_users)}
+    csr_ptr = np.zeros(n_users + 1, dtype=np.int64)
+    csr_items = np.array([], dtype=np.int32)
+
+    cfg = dict(ns["CFG"]); cfg["VT_MAX_EPOCHS"] = 4; cfg["VT_PATIENCE"] = 100
+    cfg["BATCH_SIZE"] = 64; cfg["HARD_NEG_RATIO"] = 0.0; cfg["MLP_HIDDEN"] = 8; cfg["D_VALUE"] = 4
+    ckpt = tmp_path / "vt_test.pt"
+
+    # 1차: 2 epoch만
+    cfg1 = dict(cfg); cfg1["VT_MAX_EPOCHS"] = 2
+    ns["train_value_tower"](x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
+                            item_cat_arr, cat_items, val_gt, csr_ptr, csr_items, cfg1, seed=0,
+                            ckpt_path=ckpt)
+    saved = torch.load(ckpt, weights_only=False)
+    assert saved["last_epoch"] == 2
+
+    # 2차: 같은 ckpt_path로 이어서 최대 4 epoch까지
+    ns["train_value_tower"](x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
+                            item_cat_arr, cat_items, val_gt, csr_ptr, csr_items, cfg, seed=0,
+                            ckpt_path=ckpt)
+    saved2 = torch.load(ckpt, weights_only=False)
+    assert saved2["last_epoch"] == 4
+    assert len(saved2["all_epochs"]) == 4  # 처음 2개 + 이어서 2개
