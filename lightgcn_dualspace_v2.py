@@ -20,71 +20,92 @@ from scipy.stats import spearmanr
 from sklearn.metrics import roc_auc_score
 
 
-DATASET = "hm"          # "hm" | "dunnhumby"
-MODEL   = "M1"          # z^pref를 어떤 구조로 불러올지 (항상 "M1" — 순수 협업)
-MODEL_LABEL = "M2"      # 논문 표기용 — 이 dual-space 실험 자체의 이름 (M1과 구분)
-SEED    = 42
-SEED_LIST = [42, 43, 44]  # value tower 다중시드 재현성 확인용
-
+# ═══════════════════════════════════════════════════════════════════
+# DCFG: 데이터셋 "고정 사실"만 — 경로/컬럼명/날짜형여부/카테고리컬럼.
+# 실험할 때마다 바뀌는 값(윈도우 크기, split 일수 등)은 여기 두지 않고 CFG로 내림.
+# ═══════════════════════════════════════════════════════════════════
 SCHEMA = {
     "hm": {
         "tx_path": ("/content/drive/MyDrive/논문/data/raw/hm/transactions_train.parquet" if IN_COLAB
-                    else "/Users/jungun/Workspace/논문준비/data/baseline/transactions_train.parquet"),
+                    else "/Users/jungun/Workspace/논문준비/data/hm/transactions_train.csv"),
         "item_meta_path": ("/content/drive/MyDrive/논문/data/raw/hm/articles.csv" if IN_COLAB
-                    else "/Users/jungun/Workspace/논문준비/data/articles.csv"),
+                    else "/Users/jungun/Workspace/논문준비/data/hm/articles.csv"),
         "user_col": "customer_id", "item_col": "article_id",
         "time_col": "t_dat", "value_col": "price",
         "item_key_col": "article_id", "category_col": "product_group_name",
-        "is_date": True, "window_months": 2, "val_days": 7, "test_days": 7,
+        "is_date": True,
     },
     "dunnhumby": {
         "tx_path": ("/content/drive/MyDrive/논문/data/raw/dunnhumby/transaction_data.csv" if IN_COLAB
-                    else "/Users/jungun/Workspace/논문준비/data/dunnhumby/transaction_data.csv"),
+                    else "/Users/jungun/Workspace/논문준비/data/dunnhumby/dunnhumby_The-Complete-Journey CSV/transaction_data.csv"),
         "item_meta_path": ("/content/drive/MyDrive/논문/data/raw/dunnhumby/product.csv" if IN_COLAB
-                    else "/Users/jungun/Workspace/논문준비/data/dunnhumby/product.csv"),
+                    else "/Users/jungun/Workspace/논문준비/data/dunnhumby/dunnhumby_The-Complete-Journey CSV/product.csv"),
         "user_col": "household_key", "item_col": "PRODUCT_ID",
         "time_col": "DAY", "value_col": "SALES_VALUE",
         "item_key_col": "PRODUCT_ID", "category_col": "COMMODITY_DESC",
-        "is_date": False, "window_months": None, "val_days": 7, "test_days": 7,
+        "is_date": False,
     },
 }
-DCFG = SCHEMA[DATASET]
 
+# ═══════════════════════════════════════════════════════════════════
+# CFG: 실험/모델 하이퍼파라미터 전부 — 이 파일에서 바꿀 값은 전부 여기 있어야 한다.
+# ═══════════════════════════════════════════════════════════════════
 CFG = {
-    "OUT_DIR": (f"/content/drive/MyDrive/논문/data/results_{DATASET}" if IN_COLAB
-                else f"/Users/jungun/Workspace/논문준비/data/results_{DATASET}"),
+    # ── 실행 대상 ──
+    "DATASET": "hm",          # "hm" | "dunnhumby"
+    "MODEL_LABEL": "M2",      # 논문 표기용 이름 (M1과 구분되는 이 dual-space 실험 자체의 이름)
+    "SEED": 42,
+    "SEED_LIST": [42, 43, 44],  # value tower 다중시드 재현성 확인용
+
+    # ── 데이터 필터링/기간 ──
+    "OUT_DIR": None,          # 아래에서 DATASET 확정 후 채움
+    "WINDOW_DAYS": 60,        # 최근 N일만 사용 (None=전체기간). 60≈2개월 "기준 세팅". 2년 승격 시 None.
+    "VAL_DAYS": 7, "TEST_DAYS": 7,
+    "MIN_USER_INTER": 1, "MIN_ITEM_INTER": 1,
+
+    # ── 모델 구조 (z^pref, M1 backbone) ──
     "DIM": 64, "N_LAYERS": 2,
-    "BATCH_SIZE": 8192,
-    "LR": 5e-4, "WD": 1e-3, "REG_TARGET": "effective",
+
+    # ── 학습 ──
+    "BATCH_SIZE": 8192, "LR": 5e-4, "WD": 1e-3,
     "EPOCHS": 100, "EARLY_STOP": 20, "EVAL_EVERY": 1, "EVAL_BATCH": 1024,
-    "MLP_HIDDEN": 32, "GAMMA_INIT": 0.2,
-    "SHRINKAGE_K": 5.0, "PREMIUM_THR": 0.8,
-    "MIN_USER_INTER": 1, "MIN_ITEM_INTER": 1, "ITER_FILTER": False,
     "HARD_NEG_RATIO": 0.5,
-    "D_VALUE": 16,
+    "RESUME": True,
+
+    # ── value tower(z^value) ──
+    "MLP_HIDDEN": 32, "D_VALUE": 16,
+    "VT_MAX_EPOCHS": 60, "VT_PATIENCE": 8,
+    "VT_TOPK_CKPTS": 5,        # 결합 PWGain 스크리닝 상위 K개 epoch만 4D 그리드에 포함
+    "EPOCH_SCREEN_LAMBDA": 1.0,  # epoch 스크리닝용 대표 λ (그 자체가 최적값은 아님, 순위 매기기용)
+
+    # ── CLV 파생 변수 ──
+    "SHRINKAGE_K": 5.0, "PREMIUM_THR": 0.8,
+    "F_BUCKET_EDGES": [1, 2, 5, 10],     # right=True: (-inf,1],(1,2],(2,5],(5,10],(10,inf)
+    "F_BUCKET_LABELS": ["1회", "2회", "3-5회", "6-10회", "11회+"],
+    "GATE_N_NEG": 16,          # F_u 게이트 AUC용 negative 샘플 수
+
+    # ── 평가 ──
     "K_LIST": [10, 20, 50], "SELECT_METRIC": "Recall@10",
-    "SEED": SEED, "MODEL": MODEL, "RESUME": True,
-    "VT_MAX_EPOCHS": 60, "VT_PATIENCE": 8,          # value tower 조기종료
-    "LAMBDA_GRID": [0, 0.01, 0.03, 0.05, 0.1, 0.2, 0.5, 0.7, 1.0, 1.5, 2.0],
-    "ACCURACY_EPSILON": 0.0,   # val Recall이 baseline보다 이만큼까지는 허용 (0=손실 불허)
     "N_BOOT": 2000,
-    "LOW_CLV_PCTL": 0.2,           # 세그먼트 평가와 동일한 하위 20% 기준
-    "CLV_DAMPEN_GRID": [0.0, 0.3, 0.6, 1.0],  # 저CLV 유저에 대한 λ 감쇠 배수 (0=완전 차단, 1=감쇠 없음)
-    "LOW_CLV_EPSILON": 0.0,        # 저CLV Recall/Revenue가 baseline보다 이만큼까지는 허용 (0=손실 불허)
-    "HIGH_CLV_DAMPEN_GRID": [0.0, 0.3, 0.6, 1.0],  # 고CLV 유저에 대한 λ 감쇠 배수 (3단 세그먼트 개입정책용)
-    "HIGH_CLV_EPSILON_GRID": [0.0, 0.01, 0.02, 0.05],  # 고CLV Recall 보호수준 스윕(0%/1%/2%/5% 손실 허용) — 비교분석용
-    # 버그 수정(2026-07-29): 아래 3개를 0.0(완전 무손실)으로 두면, 이미 알려진 대로
-    # Diversity@10은 λ>0에서 거의 항상 하락하므로 λ>0인 조합이 전부 탈락해 λ=0만 남는다
-    # (모든 seed·모든 ε_high에서 개입=off로 수렴했던 원인). Codex 리뷰가 제안한 대로
-    # 실질적 비열등 한계(1~3%)를 기본값으로 둔다. 0%를 원하면 실행 전 이 값들만 0.0으로 바꾸면 된다.
-    "RECALL50_EPSILON": 0.01,       # Recall@50이 baseline 대비 1%까지 손실 허용 — 긴 리스트 정확도 가드레일
-    "HR_EPSILON": 0.01,             # HitRate@10이 baseline 대비 1%까지 손실 허용
-    "DIVERSITY_EPSILON": 0.03,      # Diversity@10이 baseline 대비 3%까지 손실 허용 (λ>0의 알려진 트레이드오프 반영)
-    "EPS_TOL": 1e-9,               # 손실 불허(ε=0) 제약을 부동소수점 오차로 억울하게 탈락시키지 않기 위한 절대 허용치
-    "GATE_N_NEG": 16,              # F_u 게이트 AUC용 negative 샘플 수 (기존 4 → 16, seed 흔들림 완화)
-    "VT_TOPK_CKPTS": 5,            # 결합 PWGain 스크리닝 상위 K개 epoch만 4D 그리드에 포함(전체 epoch 저장 + 2단계 선별)
-    "EPOCH_SCREEN_LAMBDA": 1.0,    # epoch 스크리닝용 대표 λ(dampen 없이 전 유저 동일 적용) — 그 자체가 최적값은 아님, 순위 매기기용
+
+    # ── 그리드 탐색 ──
+    "LAMBDA_GRID": [0, 0.01, 0.03, 0.05, 0.1, 0.2, 0.5, 0.7, 1.0, 1.5, 2.0],
+    "LOW_CLV_PCTL": 0.2,
+    "CLV_DAMPEN_GRID": [0.0, 0.3, 0.6, 1.0],
+    "HIGH_CLV_DAMPEN_GRID": [0.0, 0.3, 0.6, 1.0],
+    "HIGH_CLV_EPSILON_GRID": [0.0, 0.01, 0.02, 0.05],
+
+    # ── 가드레일 (0.0으로 되돌리지 말 것 — CLAUDE.md §4, λ>0 전체 탈락 버그 재현됨) ──
+    "ACCURACY_EPSILON": 0.0,
+    "LOW_CLV_EPSILON": 0.0,
+    "RECALL50_EPSILON": 0.01,
+    "HR_EPSILON": 0.01,
+    "DIVERSITY_EPSILON": 0.03,
+    "EPS_TOL": 1e-9,
 }
+CFG["OUT_DIR"] = (f"/content/drive/MyDrive/논문/data/results_{CFG['DATASET']}" if IN_COLAB
+                  else f"/Users/jungun/Workspace/논문준비/data/results_{CFG['DATASET']}")
+DCFG = SCHEMA[CFG["DATASET"]]
 
 _SUPPORTED_SELECT = {f"{m}@{k}" for m in ["Recall", "Precision", "NDCG", "HitRate", "Revenue"] for k in CFG["K_LIST"]}
 assert CFG["SELECT_METRIC"] in _SUPPORTED_SELECT, (
@@ -102,30 +123,30 @@ def set_seed(seed):
 
 
 def cfg_fingerprint(cfg, dcfg):
-    """실험 설정이 하나라도 바뀌면 체크포인트 파일명 자체가 달라지게 하는 해시."""
-    keys = ["MODEL", "DIM", "N_LAYERS", "MIN_USER_INTER", "MIN_ITEM_INTER", "ITER_FILTER",
-            "SHRINKAGE_K", "PREMIUM_THR", "EPOCHS", "BATCH_SIZE", "LR", "WD", "REG_TARGET",
-            "MLP_HIDDEN", "GAMMA_INIT", "SEED", "HARD_NEG_RATIO"]
+    """실험 설정이 하나라도 바뀌면 체크포인트 파일명 자체가 달라지게 하는 해시.
+    M1(z^pref) 학습 결과에 실제로 영향을 주는 키만 포함한다 — 무관한 키(그리드 탐색용
+    LAMBDA_GRID 등)까지 넣으면 그 값만 바꿔도 M1을 헛되이 재학습하게 되므로 일부러 뺀다."""
+    keys = ["DIM", "N_LAYERS", "MIN_USER_INTER", "MIN_ITEM_INTER",
+            "SHRINKAGE_K", "PREMIUM_THR", "EPOCHS", "BATCH_SIZE", "LR", "WD",
+            "SEED", "HARD_NEG_RATIO", "WINDOW_DAYS", "VAL_DAYS", "TEST_DAYS"]
     payload = {k: cfg[k] for k in keys}
-    payload.update(window_months=dcfg["window_months"], val_days=dcfg["val_days"],
-                    test_days=dcfg["test_days"], category_col=dcfg["category_col"])
+    payload.update(category_col=dcfg["category_col"])
     s = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.md5(s.encode()).hexdigest()[:8]
 
 
 def vt_fingerprint(cfg, dcfg, seed):
     """value tower 전용 설정 지문 (D_VALUE 등 포함, SEED는 인자로 개별 지정)."""
-    keys = ["MIN_USER_INTER", "MIN_ITEM_INTER", "ITER_FILTER", "SHRINKAGE_K", "PREMIUM_THR",
+    keys = ["MIN_USER_INTER", "MIN_ITEM_INTER", "SHRINKAGE_K", "PREMIUM_THR",
             "BATCH_SIZE", "LR", "HARD_NEG_RATIO", "D_VALUE", "MLP_HIDDEN",
-            "VT_MAX_EPOCHS", "VT_PATIENCE"]
+            "VT_MAX_EPOCHS", "VT_PATIENCE", "WINDOW_DAYS", "VAL_DAYS", "TEST_DAYS"]
     payload = {k: cfg[k] for k in keys}
-    payload.update(window_months=dcfg["window_months"], val_days=dcfg["val_days"],
-                    test_days=dcfg["test_days"], category_col=dcfg["category_col"], seed=seed)
+    payload.update(category_col=dcfg["category_col"], seed=seed)
     s = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.md5(s.encode()).hexdigest()[:8]
 
 
-CFG["RUN_TAG"] = f"{MODEL}_{DATASET}_s{SEED}_{cfg_fingerprint(CFG, DCFG)}"
+CFG["RUN_TAG"] = f"M1_{CFG['DATASET']}_s{CFG['SEED']}_{cfg_fingerprint(CFG, DCFG)}"
 
 
 def load_transactions(dcfg):
@@ -497,7 +518,7 @@ def train_loop(model, opt, tr_u, tr_i, n_items, pos_key, user_pos, item_cat_arr,
 
     if cfg["RESUME"] and ckpt.exists():
         st = torch.load(ckpt, map_location=DEVICE, weights_only=False)
-        if st["n_users"] == model.n_users and st["n_items"] == model.n_items and st["model"] == cfg["MODEL"]:
+        if st["n_users"] == model.n_users and st["n_items"] == model.n_items:
             model.load_state_dict(st["last_state"]); opt.load_state_dict(st["opt"])
             start_ep = st["epoch"] + 1; best_score, best_ep = st["best_score"], st["best_epoch"]
             best_state, history = st["best_state"], st["history"]
@@ -535,8 +556,8 @@ def train_loop(model, opt, tr_u, tr_i, n_items, pos_key, user_pos, item_cat_arr,
             rec.update({f"val_{k}": v for k, v in vm.items()})
             torch.save({"last_state": model.state_dict(), "opt": opt.state_dict(), "epoch": ep,
                         "best_state": best_state, "best_epoch": best_ep, "best_score": best_score,
-                        "history": history + [rec], "n_users": model.n_users, "n_items": model.n_items,
-                        "model": cfg["MODEL"]}, ckpt)
+                        "history": history + [rec], "n_users": model.n_users, "n_items": model.n_items},
+                       ckpt)
             if cfg["EARLY_STOP"] and bad >= cfg["EARLY_STOP"]:
                 history.append(rec); print("early stop"); break
         history.append(rec)
@@ -546,7 +567,7 @@ def train_loop(model, opt, tr_u, tr_i, n_items, pos_key, user_pos, item_cat_arr,
 def main():
     """M1을 학습/재개. 이미 체크포인트가 있으면 즉시 복원되고 끝남."""
     set_seed(CFG["SEED"])
-    print(f"MODEL={CFG['MODEL']} | DATASET={DATASET} | DEVICE={DEVICE} | RUN_TAG={CFG['RUN_TAG']}")
+    print(f"MODEL=M1 | DATASET={CFG['DATASET']} | DEVICE={DEVICE} | RUN_TAG={CFG['RUN_TAG']}")
 
     tx = load_transactions(DCFG)
     tx = window_filter(tx, DCFG)
@@ -925,7 +946,7 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
     x_rep, x_val_u, F_u = build_user_features(train, n_users, n_cat, CFG, DCFG["is_date"])
     x_val_i = build_item_features(train, n_items, n_cat)
 
-    vt_ckpt = Path(CFG["OUT_DIR"]) / f"ckpt_{MODEL_LABEL}_vt_{DATASET}_s{seed}_{vt_fingerprint(CFG, DCFG, seed)}.pt"
+    vt_ckpt = Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['MODEL_LABEL']}_vt_{CFG['DATASET']}_s{seed}_{vt_fingerprint(CFG, DCFG, seed)}.pt"
     value_model, vt_best_ep, vt_best_val, vt_all_epochs = train_value_tower(
         x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos, item_cat_arr, cat_items,
         val_gt, csr_ptr, csr_items, CFG, seed, ckpt_path=vt_ckpt)
@@ -1154,13 +1175,13 @@ def run_dualspace():
     global csr_ptr_global, csr_items_global
     csr_ptr_global, csr_items_global = csr_ptr, csr_items
 
-    # ── 수정 #5: M1을 지문 기반 정확한 경로로 로드 (와일드카드 제거) ──
-    m1_cfg = {**CFG, "MODEL": "M1"}
-    m1_run_tag = f"M1_{DATASET}_s{CFG['SEED']}_{cfg_fingerprint(m1_cfg, DCFG)}"
-    m1_path = Path(CFG["OUT_DIR"]) / f"ckpt_{m1_run_tag}.pt"
+    # ── M1은 항상 CFG["RUN_TAG"] 하나의 체크포인트만 가리킨다 (MODEL 키가 없어졌으므로
+    #    이전처럼 m1_cfg = {**CFG, "MODEL":"M1"}로 별도 dict를 만들 필요가 없음 —
+    #    CFG 자체가 이미 M1 전용 설정이다) ──
+    m1_path = Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['RUN_TAG']}.pt"
     assert m1_path.exists(), f"M1 체크포인트 없음: {m1_path}\n먼저 main()으로 M1을 학습하세요."
     m1_state = torch.load(m1_path, map_location=DEVICE, weights_only=False)["best_state"]
-    pref_model = LightGCNCLV(n_users, n_items, m1_cfg, adj).to(DEVICE)
+    pref_model = LightGCNCLV(n_users, n_items, CFG, adj).to(DEVICE)
     pref_model.load_state_dict(m1_state)
     for p in pref_model.parameters(): p.requires_grad_(False)
     with torch.no_grad():
@@ -1180,15 +1201,15 @@ def run_dualspace():
     # 미실행).
     eps_grid = CFG["HIGH_CLV_EPSILON_GRID"]
     all_results = []  # all_results[seed_idx][eps_idx] = 결과 dict (seed × ε_high)
-    for seed in SEED_LIST:
+    for seed in CFG["SEED_LIST"]:
         res = run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
                                       n_users, n_items, n_cat, tr_u, tr_i, pos_key, user_pos,
                                       item_cat_arr, cat_items, item_meta, user_meta, U_pref, I_pref)
         all_results.append(res)
 
     print(f"\n{'='*100}")
-    print(f"Value Tower {len(SEED_LIST)}-seed robustness test conditional on fixed M1(seed={CFG['SEED']})")
-    print(f"({MODEL_LABEL}, 세그먼트별 차등 개입정책(dampen_low/dampen_high) 적용 — "
+    print(f"Value Tower {len(CFG['SEED_LIST'])}-seed robustness test conditional on fixed M1(seed={CFG['SEED']})")
+    print(f"({CFG['MODEL_LABEL']}, 세그먼트별 차등 개입정책(dampen_low/dampen_high) 적용 — "
           f"dampen=0은 '개선'이 아니라 해당 세그먼트에 가치 개입을 아예 하지 않았다는 뜻)")
     print(f"{'='*100}")
     for ei, eps_high in enumerate(eps_grid):
@@ -1230,7 +1251,7 @@ def run_dualspace():
           "본 결과는 개발/탐색 결과로 규정하고, 최종 확증은 지금 확정한 설정(λ grid·제약·gate 정의)을 "
           "그대로 고정해 Dunnhumby에서 재검증하는 것을 권장한다.")
 
-    out_path = Path(CFG["OUT_DIR"]) / f"result_{MODEL_LABEL}_{DATASET}_multiseed.json"
+    out_path = Path(CFG["OUT_DIR"]) / f"result_{CFG['MODEL_LABEL']}_{CFG['DATASET']}_multiseed.json"
     payload = []
     for seed_res in all_results:
         for r in seed_res:
@@ -1259,9 +1280,9 @@ def run_dualspace():
                 },
             })
     meta = {
-        "model_label": MODEL_LABEL,
+        "model_label": CFG["MODEL_LABEL"],
         "m1_seed_fixed": CFG["SEED"],
-        "value_tower_seeds": SEED_LIST,
+        "value_tower_seeds": CFG["SEED_LIST"],
         "high_clv_epsilon_grid": eps_grid,
         "pwgain_formula": "PWGain@K = mean_u sum_{i in TopK(u)} 1[i in GT_u] * price_i (평가 사용자당 적중상품 price 합의 평균)",
         "note_multiseed": "M1(z^pref)은 고정 seed 체크포인트 하나. 시드는 value tower(초기화+negative sampling)에만 적용됨 — 전체 모델 다중 시드 아님.",
