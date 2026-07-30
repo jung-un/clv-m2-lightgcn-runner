@@ -1089,6 +1089,53 @@ def bootstrap_spearman_diff_ci(vhat_arr, arp_a, arp_b, n_boot=2000, seed=0):
 csr_ptr_global = None
 csr_items_global = None
 
+
+def run_stage_b_grid(vt_topk, cfg, grid_path, is_low_clv, is_high_clv, gate_f, base_val_res, _eval,
+                      value_model=None, val_gt=None, val_rev=None):
+    """(epoch × dampen_low × dampen_high × λ) 그리드를 계산한다. epoch(vt_topk의 원소)
+    하나를 끝낼 때마다 지금까지의 grid_results를 grid_path에 저장하고, 시작할 때 이미
+    저장된 파일이 있으면 그 안의 키들은 건너뛴다 — Stage B는 실험 전체에서 가장 오래
+    걸리는 구간(880개 조합)이라, 컴퓨터를 끄거나 Colab이 끊겨도 이미 끝낸 epoch 블록은
+    다시 계산하지 않는다.
+
+    value_model/val_gt/val_rev가 주어지면(run_dualspace_one_seed의 실제 호출 경로) 매
+    epoch 블록마다 value_model에 해당 epoch의 state를 로드해서 Uv_c/Iv_c를 만들고
+    _eval에 넘긴다. 테스트에서는 이 셋을 생략하고 _eval을 직접 스텁으로 대체해
+    그리드/재개 로직만 검증한다."""
+    grid_results = {}
+    done_epochs = set()
+    if Path(grid_path).exists():
+        saved = torch.load(grid_path, weights_only=False)
+        grid_results = saved["grid_results"]; done_epochs = saved["done_epochs"]
+        print(f"  [Stage B RESUME] epoch {sorted(done_epochs)}는 이미 계산됨, 이어서 진행")
+
+    for ck in vt_topk:
+        ep_id = ck["epoch"]
+        if ep_id in done_epochs:
+            continue
+        if value_model is not None:
+            load_vt_state(value_model, ck["state"])
+            with torch.no_grad():
+                Uv_c, Iv_c = value_model.encode()
+        else:
+            Uv_c, Iv_c = None, None
+        for dampen_low in cfg["CLV_DAMPEN_GRID"]:
+            for dampen_high in cfg["HIGH_CLV_DAMPEN_GRID"]:
+                gate_seg = np.where(is_low_clv, dampen_low, np.where(is_high_clv, dampen_high, 1.0))
+                gate_d = gate_f * gate_seg
+                for lam in cfg["LAMBDA_GRID"]:
+                    key = (ep_id, lam, dampen_low, dampen_high)
+                    if lam == 0:
+                        grid_results[key] = base_val_res  # λ=0은 epoch/dampen 무관, 재사용
+                        continue
+                    grid_results[key] = _eval(gate_d, lam, val_gt, val_rev, Uv_c, Iv_c)
+        done_epochs.add(ep_id)
+        Path(grid_path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"grid_results": grid_results, "done_epochs": done_epochs}, grid_path)
+        print(f"  [Stage B] epoch {ep_id} 블록 완료 및 저장 ({len(done_epochs)}/{len(vt_topk)} epoch)")
+    return grid_results
+
+
 def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
                             n_users, n_items, n_cat, tr_u, tr_i, pos_key, user_pos,
                             item_cat_arr, cat_items, item_meta, user_meta,
@@ -1189,22 +1236,9 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
     eps_div = CFG["DIVERSITY_EPSILON"]
     tol = CFG["EPS_TOL"]
 
-    grid_results = {}
-    for ck in vt_topk:
-        ep_id = ck["epoch"]
-        load_vt_state(value_model, ck["state"])  # same as above
-        with torch.no_grad():
-            Uv_c, Iv_c = value_model.encode()
-        for dampen_low in CFG["CLV_DAMPEN_GRID"]:
-            for dampen_high in CFG["HIGH_CLV_DAMPEN_GRID"]:
-                gate_seg = np.where(is_low_clv, dampen_low, np.where(is_high_clv, dampen_high, 1.0))
-                gate_d = gate_f * gate_seg
-                for lam in CFG["LAMBDA_GRID"]:
-                    key = (ep_id, lam, dampen_low, dampen_high)
-                    if lam == 0:
-                        grid_results[key] = base_val_res  # λ=0은 epoch/dampen 무관, 재사용
-                        continue
-                    grid_results[key] = _eval(gate_d, lam, val_gt, val_rev, Uv_c, Iv_c)
+    grid_path = Path(CFG["OUT_DIR"]) / f"grid_partial_{CFG['MODEL_LABEL']}_{CFG['DATASET']}_s{seed}_{vt_fingerprint(CFG, DCFG, seed)}.pt"
+    grid_results = run_stage_b_grid(vt_topk, CFG, grid_path, is_low_clv, is_high_clv, gate_f, base_val_res,
+                                     _eval, value_model=value_model, val_gt=val_gt, val_rev=val_rev)
 
     def _passes(res, eps_high_):
         r = res["overall"][10]["recall"]

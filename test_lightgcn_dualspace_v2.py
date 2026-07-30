@@ -425,3 +425,34 @@ def test_load_vt_state_tolerates_only_the_two_known_excluded_buffers():
         assert False, "load_vt_state should have raised on an unexpected key"
     except AssertionError as e:
         assert "surprise_key" in str(e)
+
+
+def test_stage_b_grid_resumes_partial_progress(tmp_path):
+    ns = _load_module_upto_cfg()
+
+    call_log = []
+
+    def fake_eval(gate, lam, gt_, rev_, Uv_, Iv_):
+        call_log.append((lam,))
+        return {"overall": {10: {"recall": 0.1, "revenue": lam}}}
+
+    grid_path = tmp_path / "grid_partial.pt"
+    vt_topk = [{"epoch": 1, "state": {}}, {"epoch": 2, "state": {}}]
+    cfg = dict(ns["CFG"])
+    cfg["CLV_DAMPEN_GRID"] = [1.0]; cfg["HIGH_CLV_DAMPEN_GRID"] = [1.0]; cfg["LAMBDA_GRID"] = [0, 1]
+
+    # 1차: epoch 1만 계산되도록 vt_topk를 1개짜리로 잘라서 실행
+    grid1 = ns["run_stage_b_grid"](vt_topk[:1], cfg, grid_path,
+                                    is_low_clv=ns["np"].array([False]), is_high_clv=ns["np"].array([False]),
+                                    gate_f=ns["np"].array([1.0]), base_val_res={"overall": {10: {"recall": 0.1, "revenue": 0}}},
+                                    _eval=fake_eval)
+    n_calls_after_first = len(call_log)
+    assert n_calls_after_first > 0
+
+    # 2차: epoch 1+2 전체로 재실행 — epoch 1은 캐시에서 로드되어 fake_eval이 다시 안 불려야 함
+    grid2 = ns["run_stage_b_grid"](vt_topk, cfg, grid_path,
+                                    is_low_clv=ns["np"].array([False]), is_high_clv=ns["np"].array([False]),
+                                    gate_f=ns["np"].array([1.0]), base_val_res={"overall": {10: {"recall": 0.1, "revenue": 0}}},
+                                    _eval=fake_eval)
+    assert len(call_log) > n_calls_after_first  # epoch2분은 새로 호출됨
+    assert (1, 0, 1.0, 1.0) in grid2 and (2, 0, 1.0, 1.0) in grid2
