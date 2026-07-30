@@ -1032,9 +1032,7 @@ def evaluate_combined(U_pref, I_pref, Uv, Iv, gate_arr, lam_base,
 def evaluate_combined_peruser(U_pref, I_pref, Uv, Iv, gate_arr, lam_base,
                                gt, rev, item_meta, user_meta, csr_ptr, csr_items, k=10, batch=1024,
                                pos_lookup=None, ideal_rev_cumsum=None):
-    """유저별 Recall/NDCG/Revenue/ARP 배열 (bootstrap CI 용). users 순서 고정 보장.
-    csr_ptr/csr_items를 인자로 명시 전달 — 모듈 전역(csr_ptr_global 등)에 암묵적으로
-    의존하면 재현성·독립 실행이 깨지기 쉬우므로 함수 시그니처에 드러낸다."""
+    """유저별 Recall/NDCG/Revenue/ARP 배열 (bootstrap CI 용). users 순서 고정 보장."""
     users = np.array(sorted(gt.keys()))
     n = len(users)
     price_pct = item_meta["price_pct"]; item_nov = -np.log2(item_meta["pop_prob"] + 1e-12)
@@ -1099,10 +1097,6 @@ def bootstrap_spearman_diff_ci(vhat_arr, arp_a, arp_b, n_boot=2000, seed=0):
     return float(observed), float(lo), float(hi)
 
 
-csr_ptr_global = None
-csr_items_global = None
-
-
 def run_stage_b_grid(vt_topk, cfg, grid_path, is_low_clv, is_high_clv, gate_f, base_val_res, _eval,
                       value_model=None, val_gt=None, val_rev=None):
     """(epoch × dampen_low × dampen_high × λ) 그리드를 계산한다. epoch(vt_topk의 원소)
@@ -1152,14 +1146,12 @@ def run_stage_b_grid(vt_topk, cfg, grid_path, is_low_clv, is_high_clv, gate_f, b
 def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
                             n_users, n_items, n_cat, tr_u, tr_i, pos_key, user_pos,
                             item_cat_arr, cat_items, item_meta, user_meta,
-                            U_pref, I_pref):
+                            U_pref, I_pref, csr_ptr, csr_items):
     """이 함수는 seed 하나에 대해 고CLV Recall 보호수준(ε_high) 스윕 전체를 실행하고,
     ε_high별 결과를 리스트로 반환한다(단일 dict가 아님 — 호출부가 스윕 비교표를 만든다).
     탐색 비용이 큰 (epoch×λ×dampen_low×dampen_high) 그리드는 ε_high와 무관하므로 딱 한 번만
     계산하고, ε_high별로는 그 결과를 재필터링만 한다(추가 재학습·재평가 없음)."""
-    global csr_ptr_global, csr_items_global
     set_seed(seed)  # ── 수정 #1: 재현성 확보 ──
-    csr_ptr, csr_items = csr_ptr_global, csr_items_global  # 이하 명시적으로만 사용(전역 직접참조 지양)
 
     x_rep, x_val_u, F_u = build_user_features(train, n_users, n_cat, CFG, DCFG["is_date"])
     x_val_i = build_item_features(train, n_items, n_cat)
@@ -1378,6 +1370,32 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
     return eps_rows
 
 
+def load_or_run_seed(seed, out_dir, model_label, dataset, run_one_seed_fn, *args, **kwargs):
+    """시드 하나의 최종 결과(eps_rows)를 개별 파일로 저장/로드한다. 이미 이 시드가
+    끝나있으면(파일 존재) run_one_seed_fn을 다시 부르지 않는다 — SEED_LIST 3개를
+    순서대로 도는데 세 번째 시드 도중 세션이 끊기면, 이전에는 첫 두 시드까지
+    포함해서 처음부터 다시 돌아야 했다."""
+    path = Path(out_dir) / f"result_{model_label}_{dataset}_s{seed}.json"
+    if path.exists():
+        print(f"[시드 RESUME] seed {seed}는 이미 완료됨 ({path}) — 재계산 없이 로드")
+        with open(path) as f:
+            eps_rows = json.load(f)["eps_rows"]
+        for row in eps_rows:
+            for section in ("test_base", "test_best"):
+                if section in row:
+                    for outer_key in ("overall", "seg"):
+                        if outer_key in row[section]:
+                            row[section][outer_key] = {int(k): v for k, v in row[section][outer_key].items()}
+            if "ci" in row:  # JSON은 (mean, lo, hi) 튜플도 리스트로 바꾸므로 원래 타입으로 복원
+                row["ci"] = {k: tuple(v) for k, v in row["ci"].items()}
+        return eps_rows
+    eps_rows = run_one_seed_fn(seed, *args, **kwargs)
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"seed": seed, "eps_rows": eps_rows}, f, default=float, ensure_ascii=False)
+    return eps_rows
+
+
 def run_dualspace():
     d = prepare_data(CFG, DCFG)
     train, val_gt, val_rev, test_gt, test_rev = d["train"], d["val_gt"], d["val_rev"], d["test_gt"], d["test_rev"]
@@ -1385,9 +1403,6 @@ def run_dualspace():
     tr_u, tr_i, pos_key = d["tr_u"], d["tr_i"], d["pos_key"]
     user_pos, item_cat_arr, cat_items = d["user_pos"], d["item_cat_arr"], d["cat_items"]
     csr_ptr, csr_items, adj = d["csr_ptr"], d["csr_items"], d["adj"]
-
-    global csr_ptr_global, csr_items_global
-    csr_ptr_global, csr_items_global = csr_ptr, csr_items
 
     # ── M1은 항상 CFG["RUN_TAG"] 하나의 체크포인트만 가리킨다 (MODEL 키가 없어졌으므로
     #    이전처럼 m1_cfg = {**CFG, "MODEL":"M1"}로 별도 dict를 만들 필요가 없음 —
@@ -1416,9 +1431,11 @@ def run_dualspace():
     eps_grid = CFG["HIGH_CLV_EPSILON_GRID"]
     all_results = []  # all_results[seed_idx][eps_idx] = 결과 dict (seed × ε_high)
     for seed in CFG["SEED_LIST"]:
-        res = run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
-                                      n_users, n_items, n_cat, tr_u, tr_i, pos_key, user_pos,
-                                      item_cat_arr, cat_items, item_meta, user_meta, U_pref, I_pref)
+        res = load_or_run_seed(seed, CFG["OUT_DIR"], CFG["MODEL_LABEL"], CFG["DATASET"],
+                                run_dualspace_one_seed, train, val_gt, val_rev, test_gt, test_rev,
+                                n_users, n_items, n_cat, tr_u, tr_i, pos_key, user_pos,
+                                item_cat_arr, cat_items, item_meta, user_meta, U_pref, I_pref,
+                                csr_ptr, csr_items)
         all_results.append(res)
 
     print(f"\n{'='*100}")

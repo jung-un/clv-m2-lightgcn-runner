@@ -520,3 +520,41 @@ def test_grid_fingerprint_changes_when_any_of_the_three_grids_change():
     # 캐시가 딱 이 세 값의 함수여야지, 다른 키 변화로 불필요하게 무효화되면 안 된다
     unrelated_change = dict(base); unrelated_change["SEED"] = base["SEED"] + 999
     assert ns["grid_fingerprint"](unrelated_change) == base_fp
+
+
+def test_run_dualspace_skips_completed_seeds(tmp_path):
+    ns = _load_module_upto_cfg()
+    json = ns["json"]
+
+    calls = []
+    def fake_run_one_seed(seed, *a, **kw):
+        calls.append(seed)
+        return [{"seed": seed, "high_clv_epsilon": 0.0, "best_ep": 1, "best_lam": 0.1,
+                 "best_dampen_low": 1.0, "best_dampen_high": 1.0,
+                 "intervention_policy": {}, "vt_best_epoch": 1, "vt_best_val_recall": 0.1,
+                 "test_base": {"overall": {10: {"recall": 0.1, "revenue": 0.1}},
+                               "seg": {10: {"저CLV": {"recall": 0.1, "revenue": 0.1, "arp": 0.1},
+                                            "고CLV": {"recall": 0.1, "revenue": 0.1, "arp": 0.1}}},
+                               "value_alignment_spearman": 0.1},
+                 "test_best": {"overall": {10: {"recall": 0.2, "revenue": 0.2}},
+                               "seg": {10: {"저CLV": {"recall": 0.2, "revenue": 0.2, "arp": 0.2},
+                                            "고CLV": {"recall": 0.2, "revenue": 0.2, "arp": 0.2}}},
+                               "value_alignment_spearman": 0.2},
+                 "ci": {"Recall": (0.1, 0, 0.2), "NDCG": (0.1, 0, 0.2), "PWGain": (0.1, 0, 0.2),
+                        "ValueAlignment": (0.1, 0, 0.2)}}]
+
+    out_dir = tmp_path
+    result1 = ns["load_or_run_seed"](42, out_dir, "M2", "hm", fake_run_one_seed)
+    assert calls == [42]
+    result2 = ns["load_or_run_seed"](42, out_dir, "M2", "hm", fake_run_one_seed)
+    assert calls == [42]  # 두 번째는 파일에서 로드, fake_run_one_seed 재호출 안 됨
+    assert result1 == result2
+
+
+def test_load_or_run_seed_roundtrips_integer_keys(tmp_path):
+    ns = _load_module_upto_cfg()
+    def fake(seed, *a, **kw):
+        return [{"seed": seed, "test_base": {"overall": {10: {"recall": 0.1}}}}]
+    r1 = ns["load_or_run_seed"](7, tmp_path, "M2", "hm", fake)
+    r2 = ns["load_or_run_seed"](7, tmp_path, "M2", "hm", fake)
+    assert 10 in r2[0]["test_base"]["overall"], "재로드 후에도 K값 키는 int 10이어야 함(str '10' 아님)"
