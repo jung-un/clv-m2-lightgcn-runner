@@ -161,11 +161,12 @@ def load_transactions(dcfg):
     return tx
 
 
-def window_filter(tx, dcfg):
-    if dcfg["window_months"]:
+def window_filter(tx, cfg, dcfg):
+    if cfg["WINDOW_DAYS"]:
         t_max = tx["t"].max()
-        tx = tx[tx["t"] >= t_max - pd.DateOffset(months=dcfg["window_months"])].copy()
-        print(f"최근 {dcfg['window_months']}개월 사용: {len(tx):,}건")
+        delta = pd.Timedelta(days=cfg["WINDOW_DAYS"]) if dcfg["is_date"] else cfg["WINDOW_DAYS"]
+        tx = tx[tx["t"] >= t_max - delta].copy()
+        print(f"최근 {cfg['WINDOW_DAYS']}일 사용: {len(tx):,}건")
     return tx
 
 
@@ -177,11 +178,11 @@ def merge_category(tx, dcfg):
     return tx
 
 
-def compute_boundaries(tx, dcfg):
+def compute_boundaries(tx, cfg, dcfg):
     t_max = tx["t"].max()
     day = lambda n: (pd.Timedelta(days=n) if dcfg["is_date"] else n)
-    test_start = t_max - day(dcfg["test_days"])
-    val_start = test_start - day(dcfg["val_days"])
+    test_start = t_max - day(cfg["TEST_DAYS"])
+    val_start = test_start - day(cfg["VAL_DAYS"])
     return val_start, test_start
 
 
@@ -570,9 +571,9 @@ def main():
     print(f"MODEL=M1 | DATASET={CFG['DATASET']} | DEVICE={DEVICE} | RUN_TAG={CFG['RUN_TAG']}")
 
     tx = load_transactions(DCFG)
-    tx = window_filter(tx, DCFG)
+    tx = window_filter(tx, CFG, DCFG)
     tx = merge_category(tx, DCFG)
-    val_start, test_start = compute_boundaries(tx, DCFG)
+    val_start, test_start = compute_boundaries(tx, CFG, DCFG)
     tx, n_users, n_items, n_cat = filter_and_index(tx, DCFG, CFG, val_start)
     train, val_gt, val_rev, test_gt, test_rev = split_data(tx, val_start, test_start, n_items)
     adj, pos_key, tr_u, tr_i, csr_ptr, csr_items = build_graph(train, n_users, n_items)
@@ -703,9 +704,6 @@ def train_value_tower(x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
     return model, best_ep, best_score, all_epochs
 
 
-F_BUCKET_EDGES = [1, 2, 5, 10]     # right=True: (-inf,1],(1,2],(2,5],(5,10],(10,inf)
-F_BUCKET_LABELS = ["1회", "2회", "3-5회", "6-10회", "11회+"]
-
 def compute_fbucket_gate(train, val_gt, x_val_u, item_cat_arr_train, F_u, user_pos, n_neg=16, seed=0):
     """CatShare vs 단순 HasBought의 AUC gap을 train→val에서 즉석 산출 (하드코딩 제거).
     off-by-one 없이 right=True로 구간화.
@@ -748,13 +746,14 @@ def compute_fbucket_gate(train, val_gt, x_val_u, item_cat_arr_train, F_u, user_p
                 n_drawn += 1
 
     rows_u = np.array(rows_u); rows_c = np.array(rows_c); rows_label = np.array(rows_label)
-    bucket_idx = np.digitize(F_u[rows_u], F_BUCKET_EDGES, right=True)  # off-by-one 수정
-    gaps = np.zeros(len(F_BUCKET_LABELS))
+    bucket_idx = np.digitize(F_u[rows_u], CFG["F_BUCKET_EDGES"], right=True)  # off-by-one 수정
+    labels = CFG["F_BUCKET_LABELS"]
+    gaps = np.zeros(len(labels))
     print("  F_u 구간별 실측 gap (train→val 즉석 산출):")
-    for b in range(len(F_BUCKET_LABELS)):
+    for b in range(len(labels)):
         mask = bucket_idx == b
         if mask.sum() < 50 or rows_label[mask].sum() == 0:
-            print(f"    {F_BUCKET_LABELS[b]:6s}: 표본 부족, gap=0")
+            print(f"    {labels[b]:6s}: 표본 부족, gap=0")
             continue
         sn = hasbought[rows_u[mask], rows_c[mask]]
         ss = catshare[rows_u[mask], rows_c[mask]]
@@ -762,14 +761,14 @@ def compute_fbucket_gate(train, val_gt, x_val_u, item_cat_arr_train, F_u, user_p
             an = roc_auc_score(rows_label[mask], sn)
             asr = roc_auc_score(rows_label[mask], ss)
             gaps[b] = max(asr - an, 0.0)
-            print(f"    {F_BUCKET_LABELS[b]:6s}: n={mask.sum():,} AUC_naive={an:.4f} AUC_catshare={asr:.4f} gap={gaps[b]:+.4f}")
+            print(f"    {labels[b]:6s}: n={mask.sum():,} AUC_naive={an:.4f} AUC_catshare={asr:.4f} gap={gaps[b]:+.4f}")
         except ValueError:
-            print(f"    {F_BUCKET_LABELS[b]:6s}: AUC 계산 불가(단일 클래스), gap=0")
+            print(f"    {labels[b]:6s}: AUC 계산 불가(단일 클래스), gap=0")
     return gaps / max(gaps.max(), 1e-8)
 
 
 def compute_gate(F_u_arr, gate_lookup):
-    idx = np.digitize(F_u_arr, F_BUCKET_EDGES, right=True)  # off-by-one 수정
+    idx = np.digitize(F_u_arr, CFG["F_BUCKET_EDGES"], right=True)  # off-by-one 수정
     return gate_lookup[idx].astype(np.float32)
 
 
@@ -1162,8 +1161,8 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
 
 
 def run_dualspace():
-    tx = load_transactions(DCFG); tx = window_filter(tx, DCFG); tx = merge_category(tx, DCFG)
-    val_start, test_start = compute_boundaries(tx, DCFG)
+    tx = load_transactions(DCFG); tx = window_filter(tx, CFG, DCFG); tx = merge_category(tx, DCFG)
+    val_start, test_start = compute_boundaries(tx, CFG, DCFG)
     tx, n_users, n_items, n_cat = filter_and_index(tx, DCFG, CFG, val_start)
     train, val_gt, val_rev, test_gt, test_rev = split_data(tx, val_start, test_start, n_items)
     adj, pos_key, tr_u, tr_i, csr_ptr, csr_items = build_graph(train, n_users, n_items)

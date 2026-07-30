@@ -40,3 +40,31 @@ def test_hm_local_paths_point_to_existing_files():
     dcfg = ns["SCHEMA"]["hm"]
     assert Path(dcfg["tx_path"]).exists(), f"존재하지 않는 경로: {dcfg['tx_path']}"
     assert Path(dcfg["item_meta_path"]).exists(), f"존재하지 않는 경로: {dcfg['item_meta_path']}"
+
+
+def test_compute_boundaries_reads_days_from_cfg_not_dcfg_is_date_true():
+    """dcfg에 val_days/test_days가 아예 없어도(=이제 DCFG의 실제 모습) cfg만으로 동작해야 함."""
+    ns = _load_module_upto_cfg()
+    pd = ns["pd"]
+    compute_boundaries = ns["compute_boundaries"]
+    tx = pd.DataFrame({"t": pd.to_datetime(["2024-01-01", "2024-01-10", "2024-01-31"])})
+    cfg = {"VAL_DAYS": 5, "TEST_DAYS": 3}
+    dcfg = {"is_date": True}  # val_days/test_days 키 없음 — 있으면 옛 코드로 되돌아간 것
+    val_start, test_start = compute_boundaries(tx, cfg, dcfg)
+    t_max = tx["t"].max()
+    assert test_start == t_max - pd.Timedelta(days=3)
+    assert val_start == test_start - pd.Timedelta(days=5)
+
+
+def test_compute_boundaries_reads_days_from_cfg_not_dcfg_is_date_false():
+    """dunnhumby처럼 t가 정수 day인 경우(is_date=False)도 동일하게 cfg 기준으로 동작해야 함."""
+    ns = _load_module_upto_cfg()
+    pd = ns["pd"]
+    compute_boundaries = ns["compute_boundaries"]
+    tx = pd.DataFrame({"t": [1, 50, 100]})
+    cfg = {"VAL_DAYS": 5, "TEST_DAYS": 3}
+    dcfg = {"is_date": False}
+    val_start, test_start = compute_boundaries(tx, cfg, dcfg)
+    t_max = tx["t"].max()
+    assert test_start == t_max - 3
+    assert val_start == test_start - 5
