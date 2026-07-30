@@ -167,13 +167,16 @@ def seed_result_fingerprint(cfg, dcfg, seed):
     — vt_fingerprint(학습 자체에 영향)·grid_fingerprint(Stage B 그리드 정의)가 이미 파일명에
     들어가지만, 그 둘 다 학습/그리드-정의에 영향을 주는 키만 다뤄서(cfg_fingerprint와 같은
     이유로 무관한 키는 일부러 뺐음) run_dualspace_one_seed()가 최종 선택·평가 단계에서만
-    쓰는 나머지 노브(가드레일 epsilon들, VT_TOPK_CKPTS, EPOCH_SCREEN_LAMBDA, K_LIST, N_BOOT)는
-    지문에 안 들어간다. 그 노브들이 바뀌면 예전에 저장된 eps_rows는 새 설정을 반영 못하는
-    stale 결과인데도 이 파일이 존재한다는 이유만으로 그대로 재사용돼버리므로, 여기서 따로
-    지문화해 vt_fingerprint/grid_fingerprint와 함께 파일명에 접어 넣는다."""
+    쓰는 나머지 노브(가드레일 epsilon들, VT_TOPK_CKPTS, EPOCH_SCREEN_LAMBDA, K_LIST, N_BOOT,
+    LOW_CLV_PCTL, GATE_N_NEG, F_BUCKET_EDGES/LABELS)는 지문에 안 들어간다. 그 노브들이 바뀌면
+    예전에 저장된 eps_rows는 새 설정을 반영 못하는 stale 결과인데도 이 파일이 존재한다는
+    이유만으로 그대로 재사용돼버리므로, 여기서 따로 지문화해 vt_fingerprint/grid_fingerprint와
+    함께 파일명에 접어 넣는다. LOW_CLV_PCTL(저/고CLV 세그먼트 경계)·GATE_N_NEG(F_u 게이트 AUC
+    추정 negative 샘플 수)·F_BUCKET_EDGES/LABELS(F_u 구간 경계)도 개입 게이트(gate_f)와
+    세그먼트별 리포트 수치에 직접 영향을 주므로 같은 이유로 포함한다."""
     keys = ["HIGH_CLV_EPSILON_GRID", "ACCURACY_EPSILON", "LOW_CLV_EPSILON", "RECALL50_EPSILON",
             "HR_EPSILON", "DIVERSITY_EPSILON", "EPS_TOL", "VT_TOPK_CKPTS", "EPOCH_SCREEN_LAMBDA",
-            "K_LIST", "N_BOOT"]
+            "K_LIST", "N_BOOT", "LOW_CLV_PCTL", "GATE_N_NEG", "F_BUCKET_EDGES", "F_BUCKET_LABELS"]
     payload = {k: cfg[k] for k in keys}
     own = hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:8]
     combined = f"{vt_fingerprint(cfg, dcfg, seed)}_{grid_fingerprint(cfg)}_{own}"

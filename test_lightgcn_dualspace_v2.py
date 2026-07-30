@@ -629,10 +629,11 @@ def test_grid_fingerprint_changes_when_any_of_the_three_grids_change():
 
 def test_seed_result_fingerprint_changes_when_selection_knobs_change():
     """load_or_run_seed()의 result_*.json 캐시 파일명은 vt_fingerprint/grid_fingerprint뿐
-    아니라, 학습에는 영향 없이 선택/평가 단계에서만 쓰이는 나머지 노브(가드레일 epsilon들,
-    VT_TOPK_CKPTS, EPOCH_SCREEN_LAMBDA, K_LIST, N_BOOT)에도 의존해야 한다 — 안 그러면
-    HIGH_CLV_EPSILON_GRID 같은 걸 바꿔도 grid_fingerprint의 캐시 무효화가 이 바깥쪽(가장
-    먼저 확인되는) 캐시에서 완전히 우회당해 예전 result_*.json이 그대로 재사용돼버린다."""
+    아니라, 학습에는 영향 없이 선택/평가 단계(및 개입 게이트 산출)에서만 쓰이는 나머지 노브
+    (가드레일 epsilon들, VT_TOPK_CKPTS, EPOCH_SCREEN_LAMBDA, K_LIST, N_BOOT, LOW_CLV_PCTL,
+    GATE_N_NEG, F_BUCKET_EDGES/LABELS)에도 의존해야 한다 — 안 그러면 HIGH_CLV_EPSILON_GRID
+    같은 걸 바꿔도 grid_fingerprint의 캐시 무효화가 이 바깥쪽(가장 먼저 확인되는) 캐시에서
+    완전히 우회당해 예전 result_*.json이 그대로 재사용돼버린다."""
     ns = _load_module_upto_cfg()
     base = dict(ns["CFG"]); dcfg = dict(ns["DCFG"])
     base_fp = ns["seed_result_fingerprint"](base, dcfg, 42)
@@ -648,6 +649,20 @@ def test_seed_result_fingerprint_changes_when_selection_knobs_change():
 
     changed_n_boot = dict(base); changed_n_boot["N_BOOT"] = base["N_BOOT"] + 1
     assert ns["seed_result_fingerprint"](changed_n_boot, dcfg, 42) != base_fp
+
+    # 세그먼트 경계(clv_lo_th/clv_hi_th)를 바꾸는 LOW_CLV_PCTL — 저/고CLV 세그먼트 정의 자체가
+    # 달라지므로 지문도 달라져야 한다.
+    changed_low_pctl = dict(base); changed_low_pctl["LOW_CLV_PCTL"] = base["LOW_CLV_PCTL"] + 0.05
+    assert ns["seed_result_fingerprint"](changed_low_pctl, dcfg, 42) != base_fp
+
+    # compute_fbucket_gate()의 AUC-gap 추정에 쓰이는 negative 샘플 수 — 개입 게이트(gate_f)
+    # 자체가 바뀌므로 지문도 달라져야 한다.
+    changed_gate_n_neg = dict(base); changed_gate_n_neg["GATE_N_NEG"] = base["GATE_N_NEG"] + 1
+    assert ns["seed_result_fingerprint"](changed_gate_n_neg, dcfg, 42) != base_fp
+
+    # F_u 구간 경계 — 역시 게이트 계산에 직접 쓰인다.
+    changed_f_edges = dict(base); changed_f_edges["F_BUCKET_EDGES"] = [1, 2, 5, 10, 20]
+    assert ns["seed_result_fingerprint"](changed_f_edges, dcfg, 42) != base_fp
 
     # vt_fingerprint가 이 지문 안에 접혀 들어가므로, 학습에 영향을 주는 키(WINDOW_DAYS)가
     # 바뀌어도 지문이 달라져야 한다.
