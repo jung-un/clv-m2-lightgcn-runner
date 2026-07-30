@@ -110,6 +110,7 @@ DCFG = SCHEMA[CFG["DATASET"]]
 _SUPPORTED_SELECT = {f"{m}@{k}" for m in ["Recall", "Precision", "NDCG", "HitRate", "Revenue"] for k in CFG["K_LIST"]}
 assert CFG["SELECT_METRIC"] in _SUPPORTED_SELECT, (
     f"SELECT_METRIC은 학습중 evaluate()가 지원하는 값만 가능합니다: {sorted(_SUPPORTED_SELECT)}")
+assert {10, 50} <= set(CFG["K_LIST"]), "K_LIST must include 10 and 50 for the @10/@50 guardrails"
 
 if not torch.cuda.is_available():
     print("[경고] GPU 미검출 — propagate()가 배치마다 재계산되는 구조라 CPU에서는 매우 느립니다. "
@@ -157,6 +158,26 @@ def grid_fingerprint(cfg):
     payload = {k: cfg[k] for k in keys}
     s = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.md5(s.encode()).hexdigest()[:8]
+
+
+def seed_result_fingerprint(cfg, dcfg, seed):
+    """load_or_run_seed()의 최종 결과 캐시(result_{model_label}_{dataset}_s{seed}_*.json)
+    지문. 이 캐시는 이 파일이 존재하기만 하면 run_one_seed_fn(=run_dualspace_one_seed)을
+    다시 부르지 않고 그대로 반환하는, 재개 체인에서 가장 바깥쪽(=가장 먼저 확인되는) 캐시다
+    — vt_fingerprint(학습 자체에 영향)·grid_fingerprint(Stage B 그리드 정의)가 이미 파일명에
+    들어가지만, 그 둘 다 학습/그리드-정의에 영향을 주는 키만 다뤄서(cfg_fingerprint와 같은
+    이유로 무관한 키는 일부러 뺐음) run_dualspace_one_seed()가 최종 선택·평가 단계에서만
+    쓰는 나머지 노브(가드레일 epsilon들, VT_TOPK_CKPTS, EPOCH_SCREEN_LAMBDA, K_LIST, N_BOOT)는
+    지문에 안 들어간다. 그 노브들이 바뀌면 예전에 저장된 eps_rows는 새 설정을 반영 못하는
+    stale 결과인데도 이 파일이 존재한다는 이유만으로 그대로 재사용돼버리므로, 여기서 따로
+    지문화해 vt_fingerprint/grid_fingerprint와 함께 파일명에 접어 넣는다."""
+    keys = ["HIGH_CLV_EPSILON_GRID", "ACCURACY_EPSILON", "LOW_CLV_EPSILON", "RECALL50_EPSILON",
+            "HR_EPSILON", "DIVERSITY_EPSILON", "EPS_TOL", "VT_TOPK_CKPTS", "EPOCH_SCREEN_LAMBDA",
+            "K_LIST", "N_BOOT"]
+    payload = {k: cfg[k] for k in keys}
+    own = hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:8]
+    combined = f"{vt_fingerprint(cfg, dcfg, seed)}_{grid_fingerprint(cfg)}_{own}"
+    return hashlib.md5(combined.encode()).hexdigest()[:8]
 
 
 CFG["RUN_TAG"] = f"M1_{CFG['DATASET']}_s{CFG['SEED']}_{cfg_fingerprint(CFG, DCFG)}"
@@ -209,9 +230,8 @@ def filter_and_index(tx, dcfg, cfg, val_start):
     uc, ic = train_counts(tx)
     keep_u = set(uc[uc >= cfg["MIN_USER_INTER"]].index)
     keep_i = set(ic[ic >= cfg["MIN_ITEM_INTER"]].index)
-    # ponytail: CFG["ITER_FILTER"]는 항상 False라 반복 재필터링 분기(구 while 루프)를 제거함.
-    # 키 자체는 체크포인트 지문(cfg_fingerprint/vt_fingerprint)에 여전히 들어가므로 CFG에 남겨둠
-    # — 여기서 지우면 기존 M1 체크포인트 파일명(해시)이 바뀌어 assert m1_path.exists()가 깨짐.
+    # ponytail: 예전에 CFG["ITER_FILTER"]가 항상 False라 반복 재필터링 분기(구 while 루프)를
+    # 제거함 — 그 키 자체도 이미 CFG/cfg_fingerprint에서 삭제됨(죽은 코드 삭제 흔적일 뿐).
 
     tx = tx[tx["u_raw"].isin(keep_u) & tx["i_raw"].isin(keep_i)].copy()
     print(f"필터(train 구간 기준, MIN_USER_INTER={cfg['MIN_USER_INTER']}, "
@@ -460,8 +480,8 @@ class LightGCNCLV(nn.Module):
 
     def bpr_loss(self, u, pos, neg, wd):
         # ponytail: REG_TARGET="effective"/"id" 분기 제거 — side 주입이 없어(위 참고) eu0/ei0가
-        # 항상 user_emb.weight/item_emb.weight와 같은 값이라 두 옵션이 동일했음. CFG["REG_TARGET"]
-        # 키 자체는 체크포인트 지문(cfg_fingerprint) 안정성 때문에 CFG에는 그대로 남겨둠(값 미사용).
+        # 항상 user_emb.weight/item_emb.weight와 같은 값이라 두 옵션이 동일했음(CFG["REG_TARGET"]
+        # 키 자체도 이미 CFG/cfg_fingerprint에서 삭제됨).
         U, I, eu0, ei0 = self.propagate()
         eu, ep, en = U[u], I[pos], I[neg]
         bpr = -F.logsigmoid((eu * ep).sum(1) - (eu * en).sum(1)).mean()
@@ -687,6 +707,8 @@ def train_loop(model, opt, tr_u, tr_i, n_items, pos_key, user_pos, item_cat_arr,
             model.load_state_dict(st["last_state"]); opt.load_state_dict(st["opt"])
             start_ep = st["epoch"] + 1; best_score, best_ep = st["best_score"], st["best_epoch"]
             best_state, history = st["best_state"], st["history"]
+            if "rng_state" in st:  # 재개 시에도 배치순서/negative sampling이 이어지도록 rng 상태 복원
+                rng.bit_generator.state = st["rng_state"]
             print(f"[RESUME] epoch {st['epoch']}까지 복원 (RUN_TAG={cfg['RUN_TAG']}이 설정 지문까지 일치)")
 
     for ep in range(start_ep, cfg["EPOCHS"] + 1):
@@ -721,7 +743,8 @@ def train_loop(model, opt, tr_u, tr_i, n_items, pos_key, user_pos, item_cat_arr,
             rec.update({f"val_{k}": v for k, v in vm.items()})
             torch.save({"last_state": model.state_dict(), "opt": opt.state_dict(), "epoch": ep,
                         "best_state": best_state, "best_epoch": best_ep, "best_score": best_score,
-                        "history": history + [rec], "n_users": model.n_users, "n_items": model.n_items},
+                        "history": history + [rec], "n_users": model.n_users, "n_items": model.n_items,
+                        "rng_state": rng.bit_generator.state},
                        ckpt)
             if cfg["EARLY_STOP"] and bad >= cfg["EARLY_STOP"]:
                 history.append(rec); print("early stop"); break
@@ -863,7 +886,14 @@ def train_value_tower(x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
         best_score, best_ep, bad = st["best_val_score"], st["best_epoch"], st["bad"]
         all_epochs = st["all_epochs"]; history = st["history"]
         best_state = st["best_state"]
+        if "rng_state" in st:  # 재개 시에도 배치순서/negative sampling이 이어지도록 rng 상태 복원
+            rng.bit_generator.state = st["rng_state"]
         print(f"[VT RESUME seed{seed}] epoch {st['last_epoch']}까지 복원, epoch {start_ep}부터 재개")
+        if cfg["VT_PATIENCE"] and bad >= cfg["VT_PATIENCE"]:
+            print(f"  [VT RESUME seed{seed}] 이미 early stop 조건 충족(bad={bad}>=PATIENCE={cfg['VT_PATIENCE']}) "
+                  f"— epoch 재실행 없이 기존 best_state(epoch={best_ep})로 즉시 종료 (총 {len(all_epochs)}개 epoch 보관됨)")
+            load_vt_state(model, best_state)
+            return model, best_ep, best_score, all_epochs
 
     for ep in range(start_ep, cfg["VT_MAX_EPOCHS"] + 1):
         perm = rng.permutation(n_train); tot = 0.0
@@ -900,7 +930,8 @@ def train_value_tower(x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
                         "last_epoch": ep, "best_epoch": best_ep, "best_val_score": best_score,
                         "bad": bad, "best_state": best_state, "all_epochs": all_epochs,
                         "history": history, "seed": seed, "d_value": cfg["D_VALUE"],
-                        "mlp_hidden": cfg["MLP_HIDDEN"], "hard_neg_ratio": cfg["HARD_NEG_RATIO"]},
+                        "mlp_hidden": cfg["MLP_HIDDEN"], "hard_neg_ratio": cfg["HARD_NEG_RATIO"],
+                        "rng_state": rng.bit_generator.state},
                        ckpt_path)
 
         if cfg["VT_PATIENCE"] and bad >= cfg["VT_PATIENCE"]:
@@ -1066,7 +1097,7 @@ def evaluate_combined(U_pref, I_pref, Uv, Iv, gate_arr, lam_base,
 def evaluate_combined_peruser(U_pref, I_pref, Uv, Iv, gate_arr, lam_base,
                                gt, rev, item_meta, user_meta, csr_ptr, csr_items, k=10, batch=1024,
                                pos_lookup=None, ideal_rev_cumsum=None):
-    """유저별 Recall/NDCG/Revenue/ARP 배열 (bootstrap CI 용). users 순서 고정 보장."""
+    """유저별 Recall/NDCG/PWGain/ARP 배열 (bootstrap CI 용). users 순서 고정 보장."""
     users = np.array(sorted(gt.keys()))
     n = len(users)
     price_pct = item_meta["price_pct"]; item_nov = -np.log2(item_meta["pop_prob"] + 1e-12)
@@ -1417,12 +1448,19 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
     return eps_rows
 
 
-def load_or_run_seed(seed, out_dir, model_label, dataset, run_one_seed_fn, *args, **kwargs):
+def load_or_run_seed(seed, out_dir, model_label, dataset, cfg, dcfg, run_one_seed_fn, *args, **kwargs):
     """시드 하나의 최종 결과(eps_rows)를 개별 파일로 저장/로드한다. 이미 이 시드가
     끝나있으면(파일 존재) run_one_seed_fn을 다시 부르지 않는다 — SEED_LIST 3개를
     순서대로 도는데 세 번째 시드 도중 세션이 끊기면, 이전에는 첫 두 시드까지
-    포함해서 처음부터 다시 돌아야 했다."""
-    path = Path(out_dir) / f"result_{model_label}_{dataset}_s{seed}.json"
+    포함해서 처음부터 다시 돌아야 했다.
+
+    이 캐시는 재개 체인에서 가장 바깥쪽(=가장 먼저 확인되는) 캐시라, 파일명에
+    seed_result_fingerprint(cfg, dcfg, seed)를 접어 넣어야 한다 — 안 그러면 WINDOW_DAYS나
+    가드레일 epsilon, K_LIST 등을 바꿔도 이전 설정으로 만든 result_*.json을 그대로 다시
+    반환해버려서, grid_fingerprint가 막으려던 stale-cache 재사용이 이 바깥 캐시에서
+    되살아난다."""
+    path = Path(out_dir) / (f"result_{model_label}_{dataset}_s{seed}_"
+                             f"{seed_result_fingerprint(cfg, dcfg, seed)}.json")
     if path.exists():
         print(f"[시드 RESUME] seed {seed}는 이미 완료됨 ({path}) — 재계산 없이 로드")
         with open(path) as f:
@@ -1488,7 +1526,7 @@ def run_dualspace():
     eps_grid = CFG["HIGH_CLV_EPSILON_GRID"]
     all_results = []  # all_results[seed_idx][eps_idx] = 결과 dict (seed × ε_high)
     for seed in CFG["SEED_LIST"]:
-        res = load_or_run_seed(seed, CFG["OUT_DIR"], CFG["MODEL_LABEL"], CFG["DATASET"],
+        res = load_or_run_seed(seed, CFG["OUT_DIR"], CFG["MODEL_LABEL"], CFG["DATASET"], CFG, DCFG,
                                 run_dualspace_one_seed, train, val_gt, val_rev, test_gt, test_rev,
                                 n_users, n_items, n_cat, tr_u, tr_i, pos_key, user_pos,
                                 item_cat_arr, cat_items, item_meta, user_meta, U_pref, I_pref,
