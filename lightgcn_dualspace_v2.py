@@ -445,12 +445,16 @@ class LightGCNCLV(nn.Module):
 def evaluate(model, gt, rev, ks, csr_ptr, csr_items, batch):
     model.eval()
     U, I, _, _ = model.propagate()
+    n_items = I.shape[0]
     users = np.fromiter(gt.keys(), dtype=np.int64)
     max_k = max(ks)
-    acc = {f"{m}@{k}": 0.0 for k in ks for m in ["Recall", "Precision", "NDCG", "HitRate", "Revenue"]}
-    disc = 1.0 / np.log2(np.arange(2, max_k + 2))
-    cum_idcg = np.concatenate([[0.0], np.cumsum(disc)])
+    pos_key_sorted, pos_rev_sorted = build_pos_lookup(gt, rev, n_items)
+    ideal_rev_cumsum = build_ideal_rev_cumsum(gt, rev)
+    P_arr = np.zeros(int(users.max()) + 1, dtype=np.int64)
+    for u in users: P_arr[u] = len(gt[u])
+    price_pct = np.zeros(n_items); item_nov = np.zeros(n_items); cat_arr = np.full(n_items, -1)
 
+    acc = {f"{m}@{k}": 0.0 for k in ks for m in ["Recall", "Precision", "NDCG", "HitRate", "Revenue"]}
     for s in range(0, len(users), batch):
         bu = users[s:s + batch]
         scores = U[torch.from_numpy(bu).to(DEVICE)] @ I.T
@@ -463,19 +467,14 @@ def evaluate(model, gt, rev, ks, csr_ptr, csr_items, batch):
             scores[torch.from_numpy(np.concatenate(rr)).to(DEVICE),
                    torch.from_numpy(np.concatenate(cc)).to(DEVICE)] = -np.inf
         topk = torch.topk(scores, max_k, dim=1).indices.cpu().numpy()
-        for bi, u in enumerate(bu):
-            g = gt[u]; gset = set(g.tolist()); rec = topk[bi]
-            rmap = dict(zip(g.tolist(), rev[u].tolist()))
-            hit = np.fromiter((x in gset for x in rec), dtype=bool, count=max_k)
-            gain = np.fromiter((rmap.get(x, 0.0) for x in rec), dtype=np.float64, count=max_k)
-            for k in ks:
-                h = hit[:k]; nh = int(h.sum())
-                acc[f"Recall@{k}"] += nh / len(g)
-                acc[f"Precision@{k}"] += nh / k
-                acc[f"HitRate@{k}"] += 1.0 if nh else 0.0
-                dcg = float((h * disc[:k]).sum()); idcg = cum_idcg[min(len(g), k)]
-                acc[f"NDCG@{k}"] += dcg / idcg if idcg > 0 else 0.0
-                acc[f"Revenue@{k}"] += float(gain[:k].sum())
+        res = score_topk(topk, bu, ks, pos_key_sorted, pos_rev_sorted, n_items,
+                          P_arr, price_pct, item_nov, cat_arr, ideal_rev_cumsum)
+        for k in ks:
+            acc[f"Recall@{k}"] += res[k]["recall"].sum()
+            acc[f"Precision@{k}"] += res[k]["precision"].sum()
+            acc[f"NDCG@{k}"] += res[k]["ndcg"].sum()
+            acc[f"HitRate@{k}"] += res[k]["hr"].sum()
+            acc[f"Revenue@{k}"] += res[k]["revenue"].sum()
     n = len(users)
     model.train()
     return {m: v / n for m, v in acc.items()}
@@ -574,6 +573,30 @@ def score_topk(topk, bu, ks, pos_key_sorted, pos_rev_sorted, n_items,
             novelty=nov_row[:, :k].mean(axis=1),
             diversity=diversity,
         )
+    return out
+
+
+def build_pos_lookup(gt, rev, n_items):
+    """gt/rev(유저→정답아이템, 유저→revenue)를 score_topk()가 쓰는
+    "정렬된 u*n_items+i 키 배열 + 같은 순서 revenue 배열"로 변환."""
+    keys, revs = [], []
+    for u, items in gt.items():
+        keys.append(u * n_items + items.astype(np.int64))
+        revs.append(rev[u])
+    keys = np.concatenate(keys); revs = np.concatenate(revs).astype(np.float64)
+    order = np.argsort(keys, kind="stable")
+    return keys[order], revs[order]
+
+
+def build_ideal_rev_cumsum(gt, rev):
+    """유저별 '정답 revenue를 내림차순 정렬 후 NDCG discount를 곱해 누적합'한 배열.
+    V-NDCG의 이상적(ideal) DCG를 매 grid 호출마다 다시 정렬하지 않고 인덱싱만으로
+    꺼내 쓰기 위한 사전계산 — gt/rev가 고정된 seed 하나당 한 번만 계산하면 된다."""
+    out = {}
+    for u, items in gt.items():
+        sorted_rev = np.sort(rev[u])[::-1]
+        disc = 1.0 / np.log2(np.arange(2, len(sorted_rev) + 2))
+        out[u] = np.cumsum(sorted_rev * disc)
     return out
 
 
@@ -887,11 +910,14 @@ def _combined_scores(U_pref, I_pref, Uv, Iv, gate_arr, lam_base, bu):
 @torch.no_grad()
 def evaluate_combined(U_pref, I_pref, Uv, Iv, gate_arr, lam_base,
                        gt, rev, item_meta, user_meta, ks, csr_ptr, csr_items, batch=1024,
-                       clv_lo_th=None, clv_hi_th=None):
+                       clv_lo_th=None, clv_hi_th=None, pos_lookup=None, ideal_rev_cumsum=None):
     # clv_lo_th/clv_hi_th를 명시하지 않으면(기존 동작 유지) 이번에 평가되는 유저 집합만으로
     # 임계값을 다시 계산합니다 — 단, run_dualspace_one_seed에서는 게이트 마스크(is_low_clv)와
     # 완전히 동일한 전역 임계값을 항상 넘겨서, "누구를 dampen했는지"와 "누구를 저CLV로 채점하는지"가
     # 어긋나지 않도록 합니다 (어긋나면 dampen=0으로도 제약이 항상 실패하는 버그가 생김).
+    # pos_lookup/ideal_rev_cumsum: Stage A/B 그리드에서 매 호출마다 gt/rev로부터 다시 만들지
+    # 않고 run_dualspace_one_seed()가 seed당 한 번 만든 걸 넘겨받아 재사용하기 위한 선택적 캐시.
+    # None이면 기존처럼 함수 내부에서 계산(하위호환).
     n_items = I_pref.shape[0]
     price_pct, pop_prob, cat = item_meta["price_pct"], item_meta["pop_prob"], item_meta["cat"]
     item_nov = -np.log2(pop_prob + 1e-12)
@@ -904,47 +930,40 @@ def evaluate_combined(U_pref, I_pref, Uv, Iv, gate_arr, lam_base,
     seg_of = {u: ("저CLV" if c <= lo_th else ("고CLV" if c >= hi_th else "중간")) for u, c in zip(users, uclv)}
     segs = ["저CLV", "고CLV"]; seg_cnt = {s: sum(1 for u in users if seg_of[u] == s) for s in segs}
 
+    pos_key_sorted, pos_rev_sorted = pos_lookup if pos_lookup is not None else build_pos_lookup(gt, rev, n_items)
+    if ideal_rev_cumsum is None:
+        ideal_rev_cumsum = build_ideal_rev_cumsum(gt, rev)
+    users_arr = np.array(users)
+    P_arr = np.zeros(int(users_arr.max()) + 1, dtype=np.int64)
+    for u in users: P_arr[u] = len(gt[u])
+
     overall = {k: {m: 0.0 for m in _METS} for k in ks}
     seg_acc = {k: {s: {m: 0.0 for m in _METS} for s in segs} for k in ks}
     expo = {k: np.zeros(n_items) for k in ks}
     cal_v, cal_p = [], []
     max_k = max(ks); k0 = ks[0]
+    seg_arr = np.array([seg_of[u] for u in users])
 
     for s in range(0, len(users), batch):
-        bu = users[s:s+batch]
+        bu = users_arr[s:s+batch]
         scores = _combined_scores(U_pref, I_pref, Uv, Iv, gate_arr, lam_base, bu)
         for bi, u in enumerate(bu):
             a, b = csr_ptr[u], csr_ptr[u+1]
             if b > a: scores[bi, csr_items[a:b]] = -1e9
         topk = scores.topk(max_k, dim=1).indices.cpu().numpy()
-        for bi, u in enumerate(bu):
-            pos = set(gt[u].tolist()); ur = dict(zip(gt[u].tolist(), rev[u].tolist()))
-            pred = topk[bi]
-            for k in ks:
-                pk = pred[:k]
-                hits = np.fromiter((x in pos for x in pk), dtype=bool, count=k)
-                nh = int(hits.sum()); P = len(pos)
-                dcg = sum(1.0/np.log2(r+2) for r in range(k) if hits[r])
-                idcg = sum(1.0/np.log2(r+2) for r in range(min(P,k)))
-                ch = s_ap = 0
-                for r in range(k):
-                    if hits[r]: ch += 1; s_ap += ch/(r+1)
-                dcgv = sum(ur.get(pk[r],0.0)*hits[r]/np.log2(r+2) for r in range(k))
-                ideal = sorted(ur.values(), reverse=True)[:k]
-                idcgv = sum(ideal[r]/np.log2(r+2) for r in range(len(ideal)))
-                cats = cat[pk]; nvalid = cats[cats >= 0]
-                vals = dict(recall=nh/P, precision=nh/k, hr=float(nh>0),
-                            ndcg=(dcg/idcg if idcg>0 else 0.0), map=s_ap/min(P,k),
-                            revenue=sum(ur.get(it,0.0) for it in pk if it in pos),
-                            vndcg=(dcgv/idcgv if idcgv>0 else 0.0),
-                            arp=float(price_pct[pk].mean()), novelty=float(item_nov[pk].mean()),
-                            diversity=(len(set(nvalid.tolist()))/k if len(nvalid) else 0.0))
-                for m in _METS: overall[k][m] += vals[m]
-                sg = seg_of[u]
-                if sg in segs:
-                    for m in _METS: seg_acc[k][sg][m] += vals[m]
-                expo[k][pk] += 1
-                if k == k0: cal_v.append(vhat[u]); cal_p.append(vals["arp"])
+        res = score_topk(topk, bu, ks, pos_key_sorted, pos_rev_sorted, n_items,
+                          P_arr, price_pct, item_nov, cat, ideal_rev_cumsum)
+        bseg = seg_arr[s:s+batch]
+        for k in ks:
+            for m in _METS: overall[k][m] += res[k][m].sum()
+            for sg in segs:
+                mask = bseg == sg
+                if mask.any():
+                    for m in _METS: seg_acc[k][sg][m] += res[k][m][mask].sum()
+            for bi in range(len(bu)):
+                expo[k][topk[bi, :k]] += 1
+            if k == k0:
+                cal_v.extend(vhat[u] for u in bu); cal_p.extend(res[k]["arp"].tolist())
 
     n = len(users)
     for k in ks:
@@ -961,17 +980,24 @@ def evaluate_combined(U_pref, I_pref, Uv, Iv, gate_arr, lam_base,
 
 @torch.no_grad()
 def evaluate_combined_peruser(U_pref, I_pref, Uv, Iv, gate_arr, lam_base,
-                               gt, rev, item_meta, user_meta, csr_ptr, csr_items, k=10, batch=1024):
+                               gt, rev, item_meta, user_meta, csr_ptr, csr_items, k=10, batch=1024,
+                               pos_lookup=None, ideal_rev_cumsum=None):
     """유저별 Recall/NDCG/Revenue/ARP 배열 (bootstrap CI 용). users 순서 고정 보장.
     csr_ptr/csr_items를 인자로 명시 전달 — 모듈 전역(csr_ptr_global 등)에 암묵적으로
     의존하면 재현성·독립 실행이 깨지기 쉬우므로 함수 시그니처에 드러낸다."""
     users = np.array(sorted(gt.keys()))
     n = len(users)
-    idx_map = {u: i for i, u in enumerate(users)}
+    price_pct = item_meta["price_pct"]; item_nov = -np.log2(item_meta["pop_prob"] + 1e-12)
+    cat = item_meta["cat"]; vhat = user_meta["vhat"]
+    n_items = I_pref.shape[0]
+    pos_key_sorted, pos_rev_sorted = pos_lookup if pos_lookup is not None else build_pos_lookup(gt, rev, n_items)
+    if ideal_rev_cumsum is None:
+        ideal_rev_cumsum = build_ideal_rev_cumsum(gt, rev)
+    P_arr = np.zeros(int(users.max()) + 1, dtype=np.int64)
+    for u in users: P_arr[u] = len(gt[u])
+
     recall_arr = np.zeros(n); ndcg_arr = np.zeros(n); revenue_arr = np.zeros(n); arp_arr = np.zeros(n)
-    price_pct = item_meta["price_pct"]
-    vhat = user_meta["vhat"]
-    disc = 1.0 / np.log2(np.arange(2, k + 2))
+    idx_map = {u: i for i, u in enumerate(users)}
 
     for s in range(0, n, batch):
         bu = users[s:s+batch]
@@ -980,17 +1006,12 @@ def evaluate_combined_peruser(U_pref, I_pref, Uv, Iv, gate_arr, lam_base,
             a, b = csr_ptr[u], csr_ptr[u+1]
             if b > a: scores[bi, csr_items[a:b]] = -1e9
         topk = scores.topk(k, dim=1).indices.cpu().numpy()
+        res = score_topk(topk, bu, [k], pos_key_sorted, pos_rev_sorted, n_items,
+                          P_arr, price_pct, item_nov, cat, ideal_rev_cumsum)[k]
         for bi, u in enumerate(bu):
-            pos = set(gt[u].tolist()); ur = dict(zip(gt[u].tolist(), rev[u].tolist()))
-            pred = topk[bi]
-            hits = np.fromiter((x in pos for x in pred), dtype=bool, count=k)
-            nh = int(hits.sum()); P = len(pos)
-            dcg = float((hits * disc).sum()); idcg = sum(1.0/np.log2(r+2) for r in range(min(P, k)))
             j = idx_map[u]
-            recall_arr[j] = nh / P
-            ndcg_arr[j] = dcg/idcg if idcg > 0 else 0.0
-            revenue_arr[j] = sum(ur.get(it, 0.0) for it in pred if it in pos)
-            arp_arr[j] = float(price_pct[pred].mean())
+            recall_arr[j] = res["recall"][bi]; ndcg_arr[j] = res["ndcg"][bi]
+            revenue_arr[j] = res["revenue"][bi]; arp_arr[j] = res["arp"][bi]
     vhat_arr = np.array([vhat[u] for u in users])
     return dict(users=users, recall=recall_arr, ndcg=ndcg_arr, revenue=revenue_arr,
                 arp=arp_arr, vhat=vhat_arr)
@@ -1069,10 +1090,21 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
     is_low_clv = np.where(np.isnan(clv), False, clv <= clv_lo_th)
     is_high_clv = np.where(np.isnan(clv), False, clv >= clv_hi_th)
 
+    # ── Stage A/B 그리드(seed당 evaluate_combined() 약 800회 호출)가 매번 gt/rev로부터
+    #    pos_key_sorted/ideal_rev_cumsum을 다시 만들지 않도록, val/test 각각 seed당 한 번만
+    #    캐시를 만들어 _eval()이 재사용한다 (gt_가 val_gt인지 test_gt인지로 어느 캐시를 쓸지 결정).
+    pos_lookup = build_pos_lookup(val_gt, val_rev, n_items)
+    ideal_rev_cumsum_val = build_ideal_rev_cumsum(val_gt, val_rev)
+    pos_lookup_test = build_pos_lookup(test_gt, test_rev, n_items)
+    ideal_rev_cumsum_test = build_ideal_rev_cumsum(test_gt, test_rev)
+
     def _eval(gate, lam, gt_, rev_, Uv_, Iv_):
+        is_val = gt_ is val_gt
         return evaluate_combined(U_pref, I_pref, Uv_, Iv_, gate, lam, gt_, rev_, item_meta, user_meta,
                                   CFG["K_LIST"], csr_ptr, csr_items,
-                                  clv_lo_th=clv_lo_th, clv_hi_th=clv_hi_th)
+                                  clv_lo_th=clv_lo_th, clv_hi_th=clv_hi_th,
+                                  pos_lookup=pos_lookup if is_val else pos_lookup_test,
+                                  ideal_rev_cumsum=ideal_rev_cumsum_val if is_val else ideal_rev_cumsum_test)
 
     # ── baseline(λ=0)은 gate/dampen/Uv/Iv 값과 완전히 무관하다: _combined_scores에서
     #    lam_base=0이면 s_val 항 전체가 사라지므로 value tower의 어떤 체크포인트를

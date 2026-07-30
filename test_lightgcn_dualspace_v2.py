@@ -262,3 +262,22 @@ def test_score_topk_zero_ground_truth_user_no_divzero():
         # P=0인 유저 0은 맞출 정답 자체가 없으므로 recall/precision/hr/map/ndcg가 0.0이어야 함
         for m in ["recall", "precision", "hr", "map", "ndcg"]:
             assert out[k][m][0] == 0.0, f"k={k} metric={m}: P=0 유저는 0.0이어야 하는데 {out[k][m][0]}"
+
+
+def test_build_pos_lookup_and_ideal_rev_cumsum():
+    ns = _load_module_upto_cfg()
+    np = ns["np"]
+    gt = {0: np.array([1, 2], dtype=np.int32), 1: np.array([3], dtype=np.int32)}
+    rev = {0: np.array([10.0, 30.0], dtype=np.float32), 1: np.array([5.0], dtype=np.float32)}
+    n_items = 10
+
+    pos_key_sorted, pos_rev_sorted = ns["build_pos_lookup"](gt, rev, n_items)
+    assert np.all(np.diff(pos_key_sorted) >= 0), "정렬되어 있어야 searchsorted가 맞음"
+    # 유저0-아이템2(키=0*10+2=2)의 revenue가 30.0으로 조회되는지
+    idx = np.searchsorted(pos_key_sorted, 2)
+    assert pos_key_sorted[idx] == 2 and pos_rev_sorted[idx] == 30.0
+
+    cumsum = ns["build_ideal_rev_cumsum"](gt, rev)
+    # 유저0: revenue [10,30] 내림차순 정렬 -> [30,10], discount[log2(2),log2(3)]
+    expected0 = np.array([30.0 / np.log2(2), 30.0 / np.log2(2) + 10.0 / np.log2(3)])
+    np.testing.assert_allclose(cumsum[0], expected0, rtol=1e-6)
