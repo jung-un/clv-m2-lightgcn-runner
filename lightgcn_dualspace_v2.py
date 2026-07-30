@@ -817,7 +817,12 @@ def train_value_tower(x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
                                    torch.from_numpy(bn).to(DEVICE))
             opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item()
         val_score = evaluate_value_only(model, val_gt, csr_ptr, csr_items, k=10)
-        state_snapshot = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        # x_val_u/x_val_i are static input-feature buffers (never trained, identical across
+        # every epoch) — excluding them keeps each all_epochs snapshot small. They're already
+        # present on `model` at construction time, so load_state_dict(..., strict=False) below
+        # is exactly correct, not a workaround.
+        state_snapshot = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                          if k not in ("x_val_u", "x_val_i")}
         star = ""
         if val_score > best_score:
             best_score, best_ep, bad = val_score, ep, 0
@@ -841,7 +846,7 @@ def train_value_tower(x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
         if cfg["VT_PATIENCE"] and bad >= cfg["VT_PATIENCE"]:
             print("  early stop"); break
 
-    model.load_state_dict(best_state)
+    model.load_state_dict(best_state, strict=False)  # best_state has no x_val_u/x_val_i (see above); already correct on model
     if ckpt_path:
         print(f"  저장 → {ckpt_path} (VT 단독최고 epoch={best_ep}, 총 {len(all_epochs)}개 epoch 보관)")
     return model, best_ep, best_score, all_epochs
@@ -1148,7 +1153,7 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
     screen_lam = CFG["EPOCH_SCREEN_LAMBDA"]
     screen_rows = []
     for ck in vt_all_epochs:
-        value_model.load_state_dict(ck["state"])
+        value_model.load_state_dict(ck["state"], strict=False)  # x_val_u/x_val_i excluded from snapshot, already correct on value_model
         with torch.no_grad():
             Uv_s, Iv_s = value_model.encode()
         res_s = _eval(gate_f, screen_lam, val_gt, val_rev, Uv_s, Iv_s)
@@ -1174,7 +1179,7 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
     grid_results = {}
     for ck in vt_topk:
         ep_id = ck["epoch"]
-        value_model.load_state_dict(ck["state"])
+        value_model.load_state_dict(ck["state"], strict=False)  # same as above
         with torch.no_grad():
             Uv_c, Iv_c = value_model.encode()
         for dampen_low in CFG["CLV_DAMPEN_GRID"]:
@@ -1221,7 +1226,7 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
             candidates, key=lambda k: grid_results[k]["overall"][10]["revenue"])
         gate_arr = gate_f * np.where(is_low_clv, best_dampen_low, np.where(is_high_clv, best_dampen_high, 1.0))
         selected_state = next(ck["state"] for ck in vt_topk if ck["epoch"] == best_ep)
-        value_model.load_state_dict(selected_state)
+        value_model.load_state_dict(selected_state, strict=False)  # same as above
         with torch.no_grad():
             Uv, Iv = value_model.encode()
 

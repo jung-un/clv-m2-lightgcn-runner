@@ -343,20 +343,53 @@ def test_train_value_tower_resumes_from_checkpoint(tmp_path):
 
     cfg = dict(ns["CFG"]); cfg["VT_MAX_EPOCHS"] = 4; cfg["VT_PATIENCE"] = 100
     cfg["BATCH_SIZE"] = 64; cfg["HARD_NEG_RATIO"] = 0.0; cfg["MLP_HIDDEN"] = 8; cfg["D_VALUE"] = 4
+    args = (x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
+            item_cat_arr, cat_items, val_gt, csr_ptr, csr_items)
     ckpt = tmp_path / "vt_test.pt"
 
     # 1차: 2 epoch만
     cfg1 = dict(cfg); cfg1["VT_MAX_EPOCHS"] = 2
-    ns["train_value_tower"](x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
-                            item_cat_arr, cat_items, val_gt, csr_ptr, csr_items, cfg1, seed=0,
-                            ckpt_path=ckpt)
+    ns["train_value_tower"](*args, cfg1, seed=0, ckpt_path=ckpt)
     saved = torch.load(ckpt, weights_only=False)
     assert saved["last_epoch"] == 2
 
     # 2차: 같은 ckpt_path로 이어서 최대 4 epoch까지
-    ns["train_value_tower"](x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
-                            item_cat_arr, cat_items, val_gt, csr_ptr, csr_items, cfg, seed=0,
-                            ckpt_path=ckpt)
+    ns["train_value_tower"](*args, cfg, seed=0, ckpt_path=ckpt)
     saved2 = torch.load(ckpt, weights_only=False)
     assert saved2["last_epoch"] == 4
     assert len(saved2["all_epochs"]) == 4  # 처음 2개 + 이어서 2개
+
+    # 대조군: 중단 없이 한 번에 4 epoch을 도는 참조 실행 (동일 seed/data).
+    # epoch 1~2는 중단 시점 이전이므로, 재개했든 안 했든 rng 소비 시퀀스가 완전히
+    # 같아 bit-identical해야 한다 (epoch 3~4는 재개 시 rng가 새로 seed되어 이어서
+    # 소비되지 않으므로 — train_loop()도 동일한 한계 — 여기서는 비교하지 않는다).
+    ckpt_ref = tmp_path / "vt_ref.pt"
+    ns["train_value_tower"](*args, cfg, seed=0, ckpt_path=ckpt_ref)
+    ref = torch.load(ckpt_ref, weights_only=False)
+
+    for i in (0, 1):
+        assert ref["all_epochs"][i]["val_recall10"] == saved2["all_epochs"][i]["val_recall10"]
+        ref_state, resumed_state = ref["all_epochs"][i]["state"], saved2["all_epochs"][i]["state"]
+        assert set(ref_state.keys()) == set(resumed_state.keys())
+        for k in ref_state:
+            assert torch.equal(ref_state[k], resumed_state[k]), \
+                f"epoch {i + 1} tensor '{k}' diverged between uninterrupted and resumed run"
+
+    # x_val_u/x_val_i는 학습 중 절대 안 바뀌는 static 입력 버퍼 — all_epochs 스냅샷마다
+    # 이 두 버퍼가 통째로 복제되면 체크포인트가 epoch 수에 비례해 계속 커진다(리뷰 지적).
+    for entry in saved2["all_epochs"]:
+        assert "x_val_u" not in entry["state"] and "x_val_i" not in entry["state"]
+
+    # bad/best_epoch/best_val_score이 실제 기록된 val_recall10 히스토리와 정합적인지 —
+    # 재개 시 bad가 0으로 리셋되거나 best_epoch/best_val_score가 유실되면 이 불변식이 깨진다.
+    def _assert_bookkeeping_consistent(ckpt_dict):
+        best_score, best_ep = -1.0, -1
+        for e in ckpt_dict["all_epochs"]:
+            if e["val_recall10"] > best_score:
+                best_score, best_ep = e["val_recall10"], e["epoch"]
+        assert ckpt_dict["best_val_score"] == best_score
+        assert ckpt_dict["best_epoch"] == best_ep
+        assert ckpt_dict["bad"] == ckpt_dict["last_epoch"] - best_ep
+
+    _assert_bookkeeping_consistent(saved)
+    _assert_bookkeeping_consistent(saved2)
