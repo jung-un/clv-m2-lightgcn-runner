@@ -497,6 +497,86 @@ def _spearman(a, b):
     return float(spearmanr(a[mask], b[mask]).statistic)
 
 
+def score_topk(topk, bu, ks, pos_key_sorted, pos_rev_sorted, n_items,
+               P_arr, price_pct, item_nov, cat_arr, ideal_rev_cumsum):
+    """evaluate()/evaluate_combined()/evaluate_combined_peruser()가 공유하는 유일한
+    지표계산 함수. 이전에는 이 셋이 유저별 python for문으로 Recall/NDCG/HR 등을
+    서로 다른 스타일로 중복 구현했었다 — 여기서는 배치 전체를 numpy 벡터 연산으로
+    한 번에 계산한다.
+
+    핵심 트릭: "히트 여부"를 python의 set 멤버십 검사 대신, build_graph()가 이미 쓰는
+    것과 같은 "u*n_items+i를 정렬한 키 배열 + searchsorted" 패턴으로 판정한다.
+    topk[bi, r]이 유저 bu[bi]의 실제 정답(ground truth)인지를 배치 전체에 대해
+    한 번의 searchsorted 호출로 알아내고, 동시에 그 정답의 revenue 값까지 같은
+    인덱스로 gather한다 (하나의 조회로 히트여부와 revenue를 동시에 얻음).
+
+    파라미터:
+      topk: [batch, max_k] 추천 아이템 인덱스 (이미 구매한 아이템은 -inf 마스킹된 상태의 topk)
+      bu: [batch] 이 배치의 유저 인덱스
+      ks: 평가할 K 목록 (예: [10, 20, 50]) — max(ks) <= topk.shape[1]이어야 함
+      pos_key_sorted, pos_rev_sorted: 정답 집합 전체를 u*n_items+i로 인코딩해 정렬한
+        키 배열과, 같은 순서의 revenue 배열 (호출부가 한 번만 만들어 재사용)
+      P_arr: [n_users] 유저별 정답 개수(0-indexed 유저ID로 바로 조회 가능한 배열)
+      price_pct, item_nov, cat_arr: [n_items] 아이템별 가격백분위/novelty/카테고리
+      ideal_rev_cumsum: {user_idx: np.ndarray} 유저별 "정답 revenue를 내림차순 정렬 후
+        NDCG discount를 곱해 누적합한 배열" — V-NDCG의 분모(idcgv)를 매번 다시 정렬하지
+        않고 인덱싱만으로 얻기 위한 사전계산 캐시(그리드 탐색 내내 gt/rev가 고정이므로
+        이 캐시도 seed 하나당 한 번만 만들면 됨).
+
+    반환: {k: {metric_name: np.ndarray[batch]}} — 합산/평균은 호출부가 한다.
+    """
+    batch, max_k = topk.shape
+    keys = bu[:, None].astype(np.int64) * n_items + topk.astype(np.int64)
+    idx = np.clip(np.searchsorted(pos_key_sorted, keys), 0, len(pos_key_sorted) - 1)
+    is_hit = pos_key_sorted[idx] == keys
+    gain = np.where(is_hit, pos_rev_sorted[idx], 0.0)
+
+    disc_full = 1.0 / np.log2(np.arange(2, max_k + 2))
+    P_batch = P_arr[bu]
+
+    price_row = price_pct[topk]; nov_row = item_nov[topk]; cat_row = cat_arr[topk]
+
+    out = {}
+    for k in ks:
+        hit_k = is_hit[:, :k]; gain_k = gain[:, :k]; disc_k = disc_full[:k]
+        nh = hit_k.sum(axis=1)
+        Pk = np.minimum(P_batch, k)
+        idcg = np.cumsum(disc_k)[Pk - 1]
+        idcg = np.where(Pk > 0, idcg, 0.0)
+        dcg = (hit_k * disc_k).sum(axis=1)
+        cum_hits = np.cumsum(hit_k, axis=1)
+        ranks = np.arange(1, k + 1)
+        map_num = (cum_hits * hit_k / ranks).sum(axis=1)
+        idcgv = np.array([ideal_rev_cumsum[u][min(len(ideal_rev_cumsum[u]), k) - 1]
+                           if len(ideal_rev_cumsum[u]) > 0 else 0.0 for u in bu])
+        dcgv = (gain_k * disc_k).sum(axis=1)
+
+        # diversity: top-k 슬라이스(랭크 0..k-1)에 대해서만 카테고리 정렬해 distinct count.
+        # (주의: max_k 전체를 한 번 정렬해서 [:k]로 자르면 "top-k 안의 서로 다른 카테고리 수"가
+        # 아니라 "max_k개 중 카테고리값이 가장 작은 k개"가 돼버려 k < max_k일 때 값이 달라진다
+        # — 반드시 k마다 cat_row[:, :k]를 새로 정렬해야 함.)
+        cat_k = cat_row[:, :k]
+        sorted_cat = np.sort(cat_k, axis=1)
+        changed = np.concatenate([np.ones((batch, 1), dtype=bool), sorted_cat[:, 1:] != sorted_cat[:, :-1]], axis=1)
+        valid_cat = sorted_cat >= 0
+        n_valid = valid_cat.sum(axis=1)
+        diversity = np.where(n_valid > 0, (changed & valid_cat).sum(axis=1) / k, 0.0)
+
+        out[k] = dict(
+            recall=np.where(P_batch > 0, nh / np.maximum(P_batch, 1), 0.0),
+            precision=nh / k,
+            hr=(nh > 0).astype(np.float64),
+            ndcg=np.where(idcg > 0, dcg / np.maximum(idcg, 1e-12), 0.0),
+            map=np.where(Pk > 0, map_num / np.maximum(Pk, 1), 0.0),
+            revenue=gain_k.sum(axis=1),
+            vndcg=np.where(idcgv > 0, dcgv / np.maximum(idcgv, 1e-12), 0.0),
+            arp=price_row[:, :k].mean(axis=1),
+            novelty=nov_row[:, :k].mean(axis=1),
+            diversity=diversity,
+        )
+    return out
+
+
 def sample_batch(u_arr, pos_arr, n_items, pos_key, user_pos, item_cat_arr, cat_items,
                   rng, hard_ratio=0.5, max_try=50):
     # 주의: train에서 관측된 positive가 negative로 뽑히지 않도록만 보장합니다.

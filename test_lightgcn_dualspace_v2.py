@@ -142,3 +142,75 @@ def test_prepare_data_returns_consistent_shapes(tmp_path):
     assert data["n_users"] > 0 and data["n_items"] > 0
     assert data["csr_ptr"].shape[0] == data["n_users"] + 1
     assert len(data["train"]) > 0
+
+
+def _reference_score_topk_loop(topk, bu, ks, gt, rev, price_pct, item_nov, cat):
+    """기존 evaluate_combined()의 순수 python for문 로직을 그대로 옮긴 참조 구현.
+    score_topk()가 이거랑 정확히 같은 숫자를 내야 벡터화가 맞다는 뜻."""
+    out = {k: {m: [] for m in ["recall", "precision", "hr", "ndcg", "map", "revenue",
+                                 "arp", "novelty", "diversity"]} for k in ks}
+    for bi, u in enumerate(bu):
+        pos = set(gt[u].tolist()); ur = dict(zip(gt[u].tolist(), rev[u].tolist()))
+        pred = topk[bi]
+        for k in ks:
+            pk = pred[:k]
+            hits = [1 if x in pos else 0 for x in pk]
+            nh = sum(hits); P = len(pos)
+            import math as _m
+            dcg = sum(h / _m.log2(r + 2) for r, h in enumerate(hits))
+            idcg = sum(1.0 / _m.log2(r + 2) for r in range(min(P, k)))
+            ch = s_ap = 0
+            for r in range(k):
+                if hits[r]:
+                    ch += 1; s_ap += ch / (r + 1)
+            out[k]["recall"].append(nh / P)
+            out[k]["precision"].append(nh / k)
+            out[k]["hr"].append(1.0 if nh > 0 else 0.0)
+            out[k]["ndcg"].append(dcg / idcg if idcg > 0 else 0.0)
+            out[k]["map"].append(s_ap / min(P, k))
+            out[k]["revenue"].append(sum(ur.get(it, 0.0) for it in pk if it in pos))
+            out[k]["arp"].append(float(price_pct[pk].mean()))
+            out[k]["novelty"].append(float(item_nov[pk].mean()))
+            valid = [c for c in cat[pk] if c >= 0]
+            out[k]["diversity"].append(len(set(valid)) / k if valid else 0.0)
+    return out
+
+
+def test_score_topk_matches_reference_loop():
+    ns = _load_module_upto_cfg()
+    np = ns["np"]
+    rng = np.random.default_rng(1)
+    n_items, n_users_eval, max_k = 30, 8, 10
+    ks = [5, 10]
+    bu = np.arange(n_users_eval)
+    topk = np.stack([rng.permutation(n_items)[:max_k] for _ in range(n_users_eval)])
+    gt = {u: rng.choice(n_items, size=rng.integers(1, 4), replace=False).astype(np.int32) for u in bu}
+    rev = {u: rng.uniform(10, 50, size=len(gt[u])).astype(np.float32) for u in bu}
+    price_pct = rng.uniform(0, 1, n_items).astype(np.float32)
+    item_nov = rng.uniform(0, 5, n_items).astype(np.float32)
+    cat = rng.integers(0, 4, n_items).astype(np.int64)
+
+    ref = _reference_score_topk_loop(topk, bu, ks, gt, rev, price_pct, item_nov, cat)
+
+    pos_key_list, pos_rev_list = [], []
+    for u in bu:
+        for i, r in zip(gt[u], rev[u]):
+            pos_key_list.append(int(u) * n_items + int(i)); pos_rev_list.append(float(r))
+    order = np.argsort(pos_key_list)
+    pos_key_sorted = np.array(pos_key_list)[order]
+    pos_rev_sorted = np.array(pos_rev_list)[order]
+    P_arr = np.array([len(gt[u]) for u in bu])
+
+    ideal_rev_cumsum = {}
+    for u in bu:
+        sorted_rev = np.sort(rev[u])[::-1]
+        disc = 1.0 / np.log2(np.arange(2, len(sorted_rev) + 2))
+        ideal_rev_cumsum[u] = np.cumsum(sorted_rev * disc)
+
+    out = ns["score_topk"](topk, bu, ks, pos_key_sorted, pos_rev_sorted, n_items,
+                            P_arr, price_pct, item_nov, cat, ideal_rev_cumsum)
+
+    for k in ks:
+        for m in ["recall", "precision", "hr", "ndcg", "map", "revenue", "arp", "novelty", "diversity"]:
+            np.testing.assert_allclose(out[k][m], ref[k][m], rtol=1e-6, atol=1e-8,
+                                        err_msg=f"k={k} metric={m} 불일치")
