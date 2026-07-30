@@ -418,6 +418,21 @@ class SideMLP(nn.Module):
 
 
 class LightGCNCLV(nn.Module):
+    """M1(z^pref) backbone. 순수 협업신호만으로 유저/아이템 임베딩을 학습하는
+    표준 LightGCN이다 — 이름에 "CLV"가 들어있지만 이 클래스 자체는 CLV 정보를
+    전혀 쓰지 않는다(과거에는 side-injection 방식(M2 원본, 실패)이 이 클래스
+    안에 있었으나 전부 제거됨, lightgcn_clv_exp_colab_emb2.ipynb에 원본 보존).
+
+    CLV를 반영하는 부분(z^value)은 이 클래스가 아니라 ValueTower가 완전히 별도로
+    담당한다(Dual-Space 구조) — 두 임베딩 공간은 학습 중 파라미터를 전혀 공유하지
+    않고, 최종적으로 run_dualspace_one_seed()의 _combined_scores()에서 점수만
+    더해진다. 이 클래스는 M1 학습(main())과 Dual-Space의 z^pref 동결 로드
+    (run_dualspace()) 양쪽에서 동일하게 쓰인다.
+
+    구조: user_emb/item_emb(layer-0) → N_LAYERS번 정규화 인접행렬(adj)과 곱해
+    이웃 정보를 전파 → 모든 레이어 출력의 평균이 최종 임베딩(LightGCN 원 논문의
+    핵심 아이디어: 비선형 변환 없이 단순 평균).
+    """
     # ponytail: 이전에는 cfg["MODEL"] != "M1"일 때 유저/아이템 side 정보(CLV 파생 변수)를
     # layer-0 임베딩에 가산 주입하는 분기(use_side, x_rep/x_val_u/x_val_i, mlp_rep/val_u/val_i,
     # gamma_rep/val_u/val_i)가 있었음(구 M2 원본 가산주입 방식). 이 스크립트는 MODEL이 항상
@@ -715,7 +730,15 @@ def train_loop(model, opt, tr_u, tr_i, n_items, pos_key, user_pos, item_cat_arr,
 
 
 def main():
-    """M1을 학습/재개. 이미 체크포인트가 있으면 즉시 복원되고 끝남."""
+    """M1(z^pref)을 학습하거나, 이미 학습되어 있으면(체크포인트 존재) 즉시 복원하고
+    끝낸다. prepare_data()로 데이터를 준비한 뒤 LightGCNCLV를 표준 BPR loss로
+    학습한다 — CLV 정보는 전혀 관여하지 않는 순수 협업필터링 학습이다.
+
+    이 함수가 만드는 체크포인트(ckpt_{RUN_TAG}.pt)는 run_dualspace()가 z^pref로
+    그대로 가져다 쓴다 — 이 함수를 다시 실행할 필요가 있는 경우는: (1) 아직 한
+    번도 학습 안 한 경우, (2) CFG의 cfg_fingerprint 대상 키(DIM/EPOCHS/WINDOW_DAYS
+    등)를 바꿔서 RUN_TAG 자체가 달라진 경우, (3) 2년 전체 데이터로 최종 검증할 때
+    (WINDOW_DAYS=None으로 바꾸면 자동으로 새 RUN_TAG가 되어 새로 학습됨) 뿐이다."""
     set_seed(CFG["SEED"])
     print(f"DATASET={CFG['DATASET']} | DEVICE={DEVICE} | RUN_TAG={CFG['RUN_TAG']}")
 
@@ -737,6 +760,17 @@ def main():
 
 
 class ValueTower(nn.Module):
+    """z^value — CLV(가치) 신호만으로 학습되는 독립 임베딩 공간. LightGCNCLV(z^pref)와
+    파라미터를 전혀 공유하지 않고(Dual-Space), 오직 유저/아이템의 "가치 특징"
+    (x_val_u: AOV/Prem/CatShare, x_val_i: 가격백분위/카테고리내순위)만 입력으로
+    받는 얕은 MLP(SideMLP) 두 개로 구성된다.
+
+    z^pref는 M1에서 이미 학습되어 완전히 동결된 채로 쓰이는 반면, z^value는
+    run_dualspace() 안에서 이 클래스로 매번 새로 학습된다(seed별로 독립).
+    encode()가 반환하는 (zu, zi)는 L2 정규화되어 있어 내적이 코사인 유사도와
+    같아진다 — 결합 시(_combined_scores) z^pref 점수와 스케일을 맞추기 위한
+    zscore 정규화와 별개로, z^value 자체의 내부 스케일을 안정시키는 역할.
+    """
     def __init__(self, x_val_u, x_val_i, hidden, d_value):
         super().__init__()
         self.register_buffer("x_val_u", torch.from_numpy(x_val_u))
@@ -1147,10 +1181,23 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
                             n_users, n_items, n_cat, tr_u, tr_i, pos_key, user_pos,
                             item_cat_arr, cat_items, item_meta, user_meta,
                             U_pref, I_pref, csr_ptr, csr_items):
-    """이 함수는 seed 하나에 대해 고CLV Recall 보호수준(ε_high) 스윕 전체를 실행하고,
-    ε_high별 결과를 리스트로 반환한다(단일 dict가 아님 — 호출부가 스윕 비교표를 만든다).
-    탐색 비용이 큰 (epoch×λ×dampen_low×dampen_high) 그리드는 ε_high와 무관하므로 딱 한 번만
-    계산하고, ε_high별로는 그 결과를 재필터링만 한다(추가 재학습·재평가 없음)."""
+    """이 함수가 하나의 seed에 대해 하는 일 (순서대로):
+      1) build_user_features/build_item_features로 CLV 파생 유저·아이템 특징 생성
+      2) train_value_tower()로 z^value 학습 (M1과 완전 독립, epoch-resume 지원)
+      3) compute_fbucket_gate()로 F_u(구매빈도) 구간별 게이트 산출 — 구매이력이
+         적은 유저일수록 CatShare 신호를 믿기 어려우므로 게이트를 낮춤
+      4) Stage A: VT 저장된 전체 epoch 중, "결합 시 PWGain이 높은" 상위
+         VT_TOPK_CKPTS개만 스크리닝 (VT 단독 Recall 기준이 아님)
+      5) Stage B: (epoch × dampen_low × dampen_high × λ) 그리드를 validation에서
+         전부 계산(run_stage_b_grid, epoch 단위 재개 지원)
+      6) HIGH_CLV_EPSILON_GRID의 각 보호수준(ε_high)마다, 가드레일을 통과하는
+         조합 중 val PWGain이 최댓값인 조합을 선택하고 test에서 딱 한 번 평가
+      7) bootstrap CI(Recall/NDCG/PWGain/ValueAlignment)까지 계산해 반환
+
+    반환값은 ε_high 개수만큼의 원소를 가진 리스트다(단일 dict 아님) — 호출부
+    (run_dualspace)가 여러 보호수준을 비교하는 표를 만들기 때문이다. 탐색 비용이
+    큰 (epoch×λ×dampen_low×dampen_high) 그리드(위 5번) 자체는 ε_high와 무관하므로
+    딱 한 번만 계산하고, ε_high별로는 그 결과를 재필터링만 한다(추가 재학습·재평가 없음)."""
     set_seed(seed)  # ── 수정 #1: 재현성 확보 ──
 
     x_rep, x_val_u, F_u = build_user_features(train, n_users, n_cat, CFG, DCFG["is_date"])
@@ -1397,6 +1444,16 @@ def load_or_run_seed(seed, out_dir, model_label, dataset, run_one_seed_fn, *args
 
 
 def run_dualspace():
+    """전체 파이프라인의 최상위 진입점. prepare_data()로 데이터를 한 번 준비하고,
+    M1(z^pref) 체크포인트를 로드/동결한 뒤, CFG["SEED_LIST"]의 각 시드에 대해
+    run_dualspace_one_seed()를 실행한다(load_or_run_seed()를 통해 이미 끝난
+    시드는 건너뜀). 모든 시드가 끝나면 시드간 비교표를 출력하고 최종 결과를
+    result_{MODEL_LABEL}_{DATASET}_multiseed.json으로 저장한다.
+
+    주의: M1(z^pref)은 항상 CFG["SEED"](기본 42) 체크포인트 하나만 쓴다.
+    SEED_LIST의 42/43/44는 value tower(z^value) 초기화·negative sampling에만
+    적용되는 시드다 — 즉 이 함수의 결과는 "전체 모델 다중시드"가 아니라
+    "고정 M1 위에서 z^value만 다중시드로 재현성을 확인한 것"이다."""
     d = prepare_data(CFG, DCFG)
     train, val_gt, val_rev, test_gt, test_rev = d["train"], d["val_gt"], d["val_rev"], d["test_gt"], d["test_rev"]
     n_users, n_items, n_cat = d["n_users"], d["n_items"], d["n_cat"]
