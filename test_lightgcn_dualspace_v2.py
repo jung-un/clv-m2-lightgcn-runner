@@ -281,3 +281,45 @@ def test_build_pos_lookup_and_ideal_rev_cumsum():
     # 유저0: revenue [10,30] 내림차순 정렬 -> [30,10], discount[log2(2),log2(3)]
     expected0 = np.array([30.0 / np.log2(2), 30.0 / np.log2(2) + 10.0 / np.log2(3)])
     np.testing.assert_allclose(cumsum[0], expected0, rtol=1e-6)
+
+
+def test_evaluate_combined_cache_matches_internal_computation():
+    """evaluate_combined()에 pos_lookup/ideal_rev_cumsum을 미리 만들어 넘긴 결과가,
+    안 넘겨서(None) 내부에서 build_pos_lookup()/build_ideal_rev_cumsum()을 다시 계산하는
+    기존 경로와 정확히 같은 숫자를 내는지 확인 — 캐시는 순수 성능 최적화일 뿐 결과를
+    바꾸면 안 된다(run_dualspace_one_seed()의 Stage A/B 그리드가 이 캐시에 의존함)."""
+    ns = _load_module_upto_cfg()
+    np = ns["np"]; torch = ns["torch"]
+    torch.manual_seed(0)
+
+    n_users, n_items, dim = 6, 12, 4
+    U_pref = torch.randn(n_users, dim); I_pref = torch.randn(n_items, dim)
+    Uv = torch.randn(n_users, dim); Iv = torch.randn(n_items, dim)
+    gate_arr = np.ones(n_users)
+    rng = np.random.default_rng(0)
+    gt = {u: rng.choice(n_items, size=2, replace=False).astype(np.int32) for u in range(n_users)}
+    rev = {u: rng.uniform(5, 50, size=2).astype(np.float32) for u in range(n_users)}
+    item_meta = dict(price_pct=rng.uniform(0, 1, n_items).astype(np.float32),
+                      pop_prob=rng.uniform(0.01, 1, n_items).astype(np.float32),
+                      cat=rng.integers(0, 3, n_items))
+    user_meta = dict(clv=rng.uniform(0, 100, n_users), vhat=rng.uniform(0, 1, n_users))
+    csr_ptr = np.zeros(n_users + 1, dtype=np.int64)  # no purchased-item exclusions
+    csr_items = np.array([], dtype=np.int64)
+    ks = [5, 10]
+
+    r_internal = ns["evaluate_combined"](U_pref, I_pref, Uv, Iv, gate_arr, 0.5, gt, rev,
+                                          item_meta, user_meta, ks, csr_ptr, csr_items,
+                                          pos_lookup=None, ideal_rev_cumsum=None)
+
+    pos_lookup = ns["build_pos_lookup"](gt, rev, n_items)
+    ideal_rev_cumsum = ns["build_ideal_rev_cumsum"](gt, rev)
+    r_cached = ns["evaluate_combined"](U_pref, I_pref, Uv, Iv, gate_arr, 0.5, gt, rev,
+                                        item_meta, user_meta, ks, csr_ptr, csr_items,
+                                        pos_lookup=pos_lookup, ideal_rev_cumsum=ideal_rev_cumsum)
+
+    for k in ks:
+        for m in ns["_METS"]:
+            np.testing.assert_allclose(r_internal["overall"][k][m], r_cached["overall"][k][m],
+                                        rtol=1e-9, atol=1e-12,
+                                        err_msg=f"k={k} metric={m}: cached path diverged from internal-compute path")
+    assert r_internal["value_alignment_spearman"] == r_cached["value_alignment_spearman"]
