@@ -164,10 +164,19 @@ def grid_fingerprint(cfg):
     한 걸음 더 나아가 실제 크래시 경로가 있다: 이 값이 줄어든 채로 예전(더 컸던) grid_partial을
     재사용하면, _passes()가 현재 vt_topk에는 없는 (더 이상 스크리닝에 안 뽑힌) epoch를 후보로
     골라버릴 수 있고, 그 뒤 `next(ck["state"] for ck in vt_topk if ck["epoch"] == best_ep)`가
-    StopIteration을 던진다."""
+    StopIteration을 던진다. EPOCH_SCREEN_LAMBDA도 같은 크래시 종류다 — Stage A 스크리닝이
+    어떤 epoch를 vt_topk에 뽑는지를 이 값이 바꾸므로, 예전(다른 스크리닝 λ로 뽑은) grid_partial을
+    재사용하면 마찬가지로 지금 vt_topk에 없는 epoch가 후보로 남아있을 수 있다.
+
+    cfg["RUN_TAG"]도 통째로 payload에 접어 넣는다 — RUN_TAG는 이미 M1(z^pref) 정체성의
+    정규 지문(cfg_fingerprint 기반)이라 DIM/N_LAYERS/EPOCHS/WD/SEED 등을 여기서 따로 나열할
+    필요가 없다: M1을 재학습해 RUN_TAG가 바뀌면(=z^pref 임베딩 자체가 다른 값) 이 캐시도
+    자동으로 무효화된다."""
     keys = ["LAMBDA_GRID", "CLV_DAMPEN_GRID", "HIGH_CLV_DAMPEN_GRID",
-            "GATE_N_NEG", "F_BUCKET_EDGES", "F_BUCKET_LABELS", "LOW_CLV_PCTL", "VT_TOPK_CKPTS"]
+            "GATE_N_NEG", "F_BUCKET_EDGES", "F_BUCKET_LABELS", "LOW_CLV_PCTL", "VT_TOPK_CKPTS",
+            "EPOCH_SCREEN_LAMBDA"]
     payload = {k: cfg[k] for k in keys}
+    payload["RUN_TAG"] = cfg["RUN_TAG"]
     s = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.md5(s.encode()).hexdigest()[:8]
 
@@ -1362,9 +1371,14 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
           f"'가치극대화' 목표이므로 Recall 소폭 손실을 감내하고 PWGain을 취하는 것도 설계 의도에 부합할 "
           f"수 있음) 여러 보호수준의 트레이드오프를 함께 비교한다.")
 
+    vt_topk_epochs = {c["epoch"] for c in vt_topk}
     eps_rows = []
     for eps_high in CFG["HIGH_CLV_EPSILON_GRID"]:
-        candidates = [key for key, res in grid_results.items() if _passes(res, eps_high)]
+        # ponytail: grid_fingerprint()가 이미 캐시 무효화를 막지만, 아직 지문화 안 된 키가
+        # 나중에 하나 더 생겨도 크래시(StopIteration) 대신 그냥 그 epoch 후보를 조용히
+        # 제외(안전한 재계산으로 폴백)하도록 이중 방어.
+        candidates = [key for key, res in grid_results.items()
+                      if key[0] in vt_topk_epochs and _passes(res, eps_high)]
         if not candidates:
             fallback_ep = vt_best_ep if vt_best_ep in [c["epoch"] for c in vt_topk] else vt_topk[0]["epoch"]
             candidates = [(fallback_ep, 0, 1.0, 1.0)]

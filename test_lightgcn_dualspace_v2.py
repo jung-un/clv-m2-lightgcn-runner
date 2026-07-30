@@ -621,9 +621,11 @@ def test_grid_fingerprint_changes_when_any_of_the_three_grids_change():
     wider_high = dict(base); wider_high["HIGH_CLV_DAMPEN_GRID"] = [1.0, 0.9, 0.8]
     assert ns["grid_fingerprint"](wider_high) != base_fp
 
-    # 세 그리드가 동일하면(다른 무관한 CFG 키가 달라도) 같은 지문이어야 한다 —
-    # 캐시가 딱 이 세 값의 함수여야지, 다른 키 변화로 불필요하게 무효화되면 안 된다
-    unrelated_change = dict(base); unrelated_change["SEED"] = base["SEED"] + 999
+    # 세 그리드가 동일하면(다른 무관한 CFG 키가 달라도) 같은 지문이어야 한다 — 캐시가 딱
+    # 이 세 값(+RUN_TAG 등 다른 테스트가 다루는 키)의 함수여야지, 정말 무관한 키 변화로
+    # 불필요하게 무효화되면 안 된다. SEED는 더 이상 "무관한 키"가 아니다(RUN_TAG를 통해
+    # M1 정체성에 접혀 들어감) — N_BOOT로 교체.
+    unrelated_change = dict(base); unrelated_change["N_BOOT"] = base["N_BOOT"] + 1
     assert ns["grid_fingerprint"](unrelated_change) == base_fp
 
 
@@ -655,8 +657,17 @@ def test_grid_fingerprint_changes_when_gate_or_segment_knobs_change():
     changed_topk_ckpts = dict(base); changed_topk_ckpts["VT_TOPK_CKPTS"] = base["VT_TOPK_CKPTS"] - 1
     assert ns["grid_fingerprint"](changed_topk_ckpts) != base_fp
 
-    # 위 다섯 키와 무관한 변화는 지문이 그대로여야 한다
-    unrelated_change = dict(base); unrelated_change["SEED"] = base["SEED"] + 999
+    # EPOCH_SCREEN_LAMBDA도 같은 크래시 종류(Stage A가 vt_topk에 뽑는 epoch 집합이 바뀜)
+    changed_screen_lam = dict(base); changed_screen_lam["EPOCH_SCREEN_LAMBDA"] = base["EPOCH_SCREEN_LAMBDA"] + 0.5
+    assert ns["grid_fingerprint"](changed_screen_lam) != base_fp
+
+    # RUN_TAG(M1 정체성) 자체가 바뀌면(M1 재학습) 지문도 바뀌어야 한다
+    changed_run_tag = dict(base); changed_run_tag["RUN_TAG"] = base["RUN_TAG"] + "_retrained"
+    assert ns["grid_fingerprint"](changed_run_tag) != base_fp
+
+    # 위 키들과 무관한 변화는 지문이 그대로여야 한다. SEED는 더 이상 "무관한 키"가 아니다
+    # (RUN_TAG를 통해 M1 정체성에 접혀 들어감) — N_BOOT로 교체.
+    unrelated_change = dict(base); unrelated_change["N_BOOT"] = base["N_BOOT"] + 1
     assert ns["grid_fingerprint"](unrelated_change) == base_fp
 
 
