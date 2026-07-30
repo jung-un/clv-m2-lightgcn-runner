@@ -558,3 +558,15 @@ def test_load_or_run_seed_roundtrips_integer_keys(tmp_path):
     r1 = ns["load_or_run_seed"](7, tmp_path, "M2", "hm", fake)
     r2 = ns["load_or_run_seed"](7, tmp_path, "M2", "hm", fake)
     assert 10 in r2[0]["test_base"]["overall"], "재로드 후에도 K값 키는 int 10이어야 함(str '10' 아님)"
+
+
+def test_load_or_run_seed_roundtrips_coverage_and_gini_integer_keys(tmp_path):
+    """test_base/test_best의 coverage·gini도 overall/seg와 똑같이 K(10/20/50) 정수키 dict이므로
+    (evaluate_combined()의 반환값 그대로 흘러들어감), round-trip 후에도 int 키여야 한다."""
+    ns = _load_module_upto_cfg()
+    def fake(seed, *a, **kw):
+        return [{"seed": seed, "test_base": {"coverage": {10: 0.5}, "gini": {10: 0.3}}}]
+    r1 = ns["load_or_run_seed"](8, tmp_path, "M2", "hm", fake)
+    r2 = ns["load_or_run_seed"](8, tmp_path, "M2", "hm", fake)
+    assert 10 in r2[0]["test_base"]["coverage"], "coverage 키는 int 10이어야 함(str '10' 아님)"
+    assert 10 in r2[0]["test_base"]["gini"], "gini 키는 int 10이어야 함(str '10' 아님)"

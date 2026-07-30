@@ -1383,7 +1383,7 @@ def load_or_run_seed(seed, out_dir, model_label, dataset, run_one_seed_fn, *args
         for row in eps_rows:
             for section in ("test_base", "test_best"):
                 if section in row:
-                    for outer_key in ("overall", "seg"):
+                    for outer_key in ("overall", "seg", "coverage", "gini"):
                         if outer_key in row[section]:
                             row[section][outer_key] = {int(k): v for k, v in row[section][outer_key].items()}
             if "ci" in row:  # JSON은 (mean, lo, hi) 튜플도 리스트로 바꾸므로 원래 타입으로 복원
