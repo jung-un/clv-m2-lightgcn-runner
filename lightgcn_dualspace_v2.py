@@ -151,10 +151,22 @@ def grid_fingerprint(cfg):
     """Stage B 그리드 캐시(run_stage_b_grid의 grid_partial_*.pt)가 실제로 의존하는
     하이퍼파라미터만 지문화한다. vt_fingerprint는 M1/VT 체크포인트용이라 일부러
     LAMBDA_GRID 등 그리드 탐색 전용 키를 뺐는데(cfg_fingerprint와 동일한 이유),
-    Stage B 캐시는 반대로 이 세 그리드값 자체가 결과의 정의다 — LAMBDA_GRID를
+    Stage B 캐시는 반대로 이 그리드값들 자체가 결과의 정의다 — LAMBDA_GRID를
     넓히면(예: 로드맵의 "선택 구간 주변 재탐색") 예전 grid_partial 파일의 done_epochs를
-    그대로 재사용해선 안 되므로 별도 지문으로 캐시 파일명 자체를 갈아치운다."""
-    keys = ["LAMBDA_GRID", "CLV_DAMPEN_GRID", "HIGH_CLV_DAMPEN_GRID"]
+    그대로 재사용해선 안 되므로 별도 지문으로 캐시 파일명 자체를 갈아치운다.
+
+    grid_partial_*.pt에 저장되는 grid_results(및 그 안에 재사용되는 λ=0 baseline)는
+    run_stage_b_grid()에 넘겨받는 gate_f/is_low_clv/is_high_clv/base_val_res의 함수이기도
+    하다 — 그래서 그 값들을 만드는 GATE_N_NEG/F_BUCKET_EDGES/F_BUCKET_LABELS(gate_f, via
+    compute_fbucket_gate/compute_gate)와 LOW_CLV_PCTL(is_low_clv/is_high_clv 세그먼트 경계)도
+    여기 포함해야 한다 — 안 그러면 예전 grid_partial이 그대로 재사용되면서 캐시된
+    recall/revenue 숫자 자체가 새 설정과 안 맞는 값으로 조용히 굳어버린다. VT_TOPK_CKPTS는
+    한 걸음 더 나아가 실제 크래시 경로가 있다: 이 값이 줄어든 채로 예전(더 컸던) grid_partial을
+    재사용하면, _passes()가 현재 vt_topk에는 없는 (더 이상 스크리닝에 안 뽑힌) epoch를 후보로
+    골라버릴 수 있고, 그 뒤 `next(ck["state"] for ck in vt_topk if ck["epoch"] == best_ep)`가
+    StopIteration을 던진다."""
+    keys = ["LAMBDA_GRID", "CLV_DAMPEN_GRID", "HIGH_CLV_DAMPEN_GRID",
+            "GATE_N_NEG", "F_BUCKET_EDGES", "F_BUCKET_LABELS", "LOW_CLV_PCTL", "VT_TOPK_CKPTS"]
     payload = {k: cfg[k] for k in keys}
     s = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.md5(s.encode()).hexdigest()[:8]

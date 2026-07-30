@@ -627,6 +627,39 @@ def test_grid_fingerprint_changes_when_any_of_the_three_grids_change():
     assert ns["grid_fingerprint"](unrelated_change) == base_fp
 
 
+def test_grid_fingerprint_changes_when_gate_or_segment_knobs_change():
+    """grid_partial_*.pt에 캐시되는 grid_results(및 재사용되는 λ=0 baseline)는
+    run_stage_b_grid()에 넘겨받는 gate_f/is_low_clv/is_high_clv의 함수이기도 하다 —
+    GATE_N_NEG/F_BUCKET_EDGES/F_BUCKET_LABELS는 compute_fbucket_gate/compute_gate를 통해
+    gate_f를, LOW_CLV_PCTL은 저/고CLV 세그먼트 경계(is_low_clv/is_high_clv)를 바꾸므로 이
+    넷 모두 grid_fingerprint에 들어가야 한다. VT_TOPK_CKPTS는 그리드가 줄어들 때 예전(더
+    컸던) grid_partial을 재사용하면 _passes()가 현재 vt_topk에 없는 epoch를 골라
+    `next(... if ck["epoch"] == best_ep)`가 StopIteration을 던지는 실제 크래시 경로가 있어
+    반드시 포함해야 한다."""
+    ns = _load_module_upto_cfg()
+    base = dict(ns["CFG"])
+    base_fp = ns["grid_fingerprint"](base)
+
+    changed_gate_n_neg = dict(base); changed_gate_n_neg["GATE_N_NEG"] = base["GATE_N_NEG"] + 1
+    assert ns["grid_fingerprint"](changed_gate_n_neg) != base_fp
+
+    changed_f_edges = dict(base); changed_f_edges["F_BUCKET_EDGES"] = [1, 2, 5, 10, 20]
+    assert ns["grid_fingerprint"](changed_f_edges) != base_fp
+
+    changed_f_labels = dict(base); changed_f_labels["F_BUCKET_LABELS"] = list(base["F_BUCKET_LABELS"]) + ["x"]
+    assert ns["grid_fingerprint"](changed_f_labels) != base_fp
+
+    changed_low_pctl = dict(base); changed_low_pctl["LOW_CLV_PCTL"] = base["LOW_CLV_PCTL"] + 0.05
+    assert ns["grid_fingerprint"](changed_low_pctl) != base_fp
+
+    changed_topk_ckpts = dict(base); changed_topk_ckpts["VT_TOPK_CKPTS"] = base["VT_TOPK_CKPTS"] - 1
+    assert ns["grid_fingerprint"](changed_topk_ckpts) != base_fp
+
+    # 위 다섯 키와 무관한 변화는 지문이 그대로여야 한다
+    unrelated_change = dict(base); unrelated_change["SEED"] = base["SEED"] + 999
+    assert ns["grid_fingerprint"](unrelated_change) == base_fp
+
+
 def test_seed_result_fingerprint_changes_when_selection_knobs_change():
     """load_or_run_seed()의 result_*.json 캐시 파일명은 vt_fingerprint/grid_fingerprint뿐
     아니라, 학습에는 영향 없이 선택/평가 단계(및 개입 게이트 산출)에서만 쓰이는 나머지 노브
