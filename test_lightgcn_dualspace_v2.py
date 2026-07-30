@@ -441,18 +441,82 @@ def test_stage_b_grid_resumes_partial_progress(tmp_path):
     cfg = dict(ns["CFG"])
     cfg["CLV_DAMPEN_GRID"] = [1.0]; cfg["HIGH_CLV_DAMPEN_GRID"] = [1.0]; cfg["LAMBDA_GRID"] = [0, 1]
 
-    # 1차: epoch 1만 계산되도록 vt_topk를 1개짜리로 잘라서 실행
+    # 1차: epoch 1만 계산되도록 vt_topk를 1개짜리로 잘라서 실행.
+    # 그리드는 dampen_low=1.0 x dampen_high=1.0 x lam in [0,1] 뿐이고, lam=0은 base_val_res를
+    # 재사용하는 지름길이라 _eval을 안 부르므로, epoch당 정확히 1번만 fake_eval이 불려야 한다.
     grid1 = ns["run_stage_b_grid"](vt_topk[:1], cfg, grid_path,
                                     is_low_clv=ns["np"].array([False]), is_high_clv=ns["np"].array([False]),
                                     gate_f=ns["np"].array([1.0]), base_val_res={"overall": {10: {"recall": 0.1, "revenue": 0}}},
                                     _eval=fake_eval)
     n_calls_after_first = len(call_log)
-    assert n_calls_after_first > 0
+    assert n_calls_after_first == 1
 
-    # 2차: epoch 1+2 전체로 재실행 — epoch 1은 캐시에서 로드되어 fake_eval이 다시 안 불려야 함
+    # 2차: epoch 1+2 전체로 재실행 — epoch 1은 캐시에서 로드되어 fake_eval이 다시 안 불려야 하고,
+    # 정확히 epoch2분(1번)만 새로 호출되어야 한다.
     grid2 = ns["run_stage_b_grid"](vt_topk, cfg, grid_path,
                                     is_low_clv=ns["np"].array([False]), is_high_clv=ns["np"].array([False]),
                                     gate_f=ns["np"].array([1.0]), base_val_res={"overall": {10: {"recall": 0.1, "revenue": 0}}},
                                     _eval=fake_eval)
-    assert len(call_log) > n_calls_after_first  # epoch2분은 새로 호출됨
+    assert len(call_log) == n_calls_after_first + 1  # epoch1은 재계산 안 됨, epoch2분만 정확히 1번 추가
     assert (1, 0, 1.0, 1.0) in grid2 and (2, 0, 1.0, 1.0) in grid2
+
+
+def test_stage_b_grid_crash_mid_epoch_does_not_mark_epoch_done(tmp_path):
+    """epoch 하나의 내부 그리드(dampen_low×dampen_high×λ)를 다 끝내기 전에 죽으면,
+    디스크에 저장된 done_epochs/grid_results에 그 epoch가 (부분적으로도) 남으면 안 된다 —
+    저장은 epoch 블록 전체가 끝난 뒤에만 일어나야 재시작 시 안전하게 이어서 돌 수 있다."""
+    ns = _load_module_upto_cfg()
+
+    call_count = [0]
+
+    def maybe_crashing_eval(gate, lam, gt_, rev_, Uv_, Iv_):
+        call_count[0] += 1
+        if call_count[0] == 3:  # epoch1의 2번 호출은 성공, epoch2의 첫 호출(3번째)에서 크래시
+            raise RuntimeError("simulated crash mid-epoch")
+        return {"overall": {10: {"recall": 0.1, "revenue": lam}}}
+
+    grid_path = tmp_path / "grid_partial_crash.pt"
+    vt_topk = [{"epoch": 1, "state": {}}, {"epoch": 2, "state": {}}]
+    cfg = dict(ns["CFG"])
+    cfg["CLV_DAMPEN_GRID"] = [1.0]; cfg["HIGH_CLV_DAMPEN_GRID"] = [1.0]; cfg["LAMBDA_GRID"] = [0, 1, 2]
+    # 그리드는 dampen_low=1.0 x dampen_high=1.0 x lam in [0,1,2] — lam=0은 지름길(호출 없음),
+    # lam=1/lam=2만 _eval을 부르므로 epoch당 정확히 2번 호출된다.
+
+    try:
+        ns["run_stage_b_grid"](vt_topk, cfg, grid_path,
+                                is_low_clv=ns["np"].array([False]), is_high_clv=ns["np"].array([False]),
+                                gate_f=ns["np"].array([1.0]), base_val_res={"overall": {10: {"recall": 0.1, "revenue": 0}}},
+                                _eval=maybe_crashing_eval)
+        assert False, "expected the simulated crash to propagate"
+    except RuntimeError:
+        pass
+
+    saved = ns["torch"].load(grid_path, weights_only=False)
+    assert saved["done_epochs"] == {1}, "epoch1은 완주했으니 저장돼야 하고, epoch2는 크래시로 미완주라 없어야 함"
+    assert all(key[0] == 1 for key in saved["grid_results"]), \
+        "크래시 시점에 epoch2용으로 이미 계산된 grid_results 항목이 하나도 디스크에 남으면 안 됨"
+
+
+def test_grid_fingerprint_changes_when_any_of_the_three_grids_change():
+    """grid_path의 캐시 파일명은 vt_fingerprint뿐 아니라 grid_fingerprint(LAMBDA_GRID/
+    CLV_DAMPEN_GRID/HIGH_CLV_DAMPEN_GRID)에도 의존해야 한다 — 안 그러면 LAMBDA_GRID를
+    넓혀 재탐색할 때(로드맵에 있는 다음 단계) 예전 grid_partial 파일의 done_epochs를
+    그대로 재사용해버려 새로 추가된 λ/dampen 조합이 조용히 grid_results에서 빠진다."""
+    ns = _load_module_upto_cfg()
+    base = dict(ns["CFG"])
+    base["LAMBDA_GRID"] = [0, 1, 2]; base["CLV_DAMPEN_GRID"] = [1.0, 0.9]; base["HIGH_CLV_DAMPEN_GRID"] = [1.0, 0.9]
+    base_fp = ns["grid_fingerprint"](base)
+
+    wider_lambda = dict(base); wider_lambda["LAMBDA_GRID"] = [0, 1, 2, 3]
+    assert ns["grid_fingerprint"](wider_lambda) != base_fp
+
+    wider_low = dict(base); wider_low["CLV_DAMPEN_GRID"] = [1.0, 0.9, 0.8]
+    assert ns["grid_fingerprint"](wider_low) != base_fp
+
+    wider_high = dict(base); wider_high["HIGH_CLV_DAMPEN_GRID"] = [1.0, 0.9, 0.8]
+    assert ns["grid_fingerprint"](wider_high) != base_fp
+
+    # 세 그리드가 동일하면(다른 무관한 CFG 키가 달라도) 같은 지문이어야 한다 —
+    # 캐시가 딱 이 세 값의 함수여야지, 다른 키 변화로 불필요하게 무효화되면 안 된다
+    unrelated_change = dict(base); unrelated_change["SEED"] = base["SEED"] + 999
+    assert ns["grid_fingerprint"](unrelated_change) == base_fp

@@ -146,6 +146,19 @@ def vt_fingerprint(cfg, dcfg, seed):
     return hashlib.md5(s.encode()).hexdigest()[:8]
 
 
+def grid_fingerprint(cfg):
+    """Stage B 그리드 캐시(run_stage_b_grid의 grid_partial_*.pt)가 실제로 의존하는
+    하이퍼파라미터만 지문화한다. vt_fingerprint는 M1/VT 체크포인트용이라 일부러
+    LAMBDA_GRID 등 그리드 탐색 전용 키를 뺐는데(cfg_fingerprint와 동일한 이유),
+    Stage B 캐시는 반대로 이 세 그리드값 자체가 결과의 정의다 — LAMBDA_GRID를
+    넓히면(예: 로드맵의 "선택 구간 주변 재탐색") 예전 grid_partial 파일의 done_epochs를
+    그대로 재사용해선 안 되므로 별도 지문으로 캐시 파일명 자체를 갈아치운다."""
+    keys = ["LAMBDA_GRID", "CLV_DAMPEN_GRID", "HIGH_CLV_DAMPEN_GRID"]
+    payload = {k: cfg[k] for k in keys}
+    s = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.md5(s.encode()).hexdigest()[:8]
+
+
 CFG["RUN_TAG"] = f"M1_{CFG['DATASET']}_s{CFG['SEED']}_{cfg_fingerprint(CFG, DCFG)}"
 
 
@@ -1236,7 +1249,8 @@ def run_dualspace_one_seed(seed, train, val_gt, val_rev, test_gt, test_rev,
     eps_div = CFG["DIVERSITY_EPSILON"]
     tol = CFG["EPS_TOL"]
 
-    grid_path = Path(CFG["OUT_DIR"]) / f"grid_partial_{CFG['MODEL_LABEL']}_{CFG['DATASET']}_s{seed}_{vt_fingerprint(CFG, DCFG, seed)}.pt"
+    grid_path = Path(CFG["OUT_DIR"]) / (f"grid_partial_{CFG['MODEL_LABEL']}_{CFG['DATASET']}_s{seed}_"
+                                         f"{vt_fingerprint(CFG, DCFG, seed)}_{grid_fingerprint(CFG)}.pt")
     grid_results = run_stage_b_grid(vt_topk, CFG, grid_path, is_low_clv, is_high_clv, gate_f, base_val_res,
                                      _eval, value_model=value_model, val_gt=val_gt, val_rev=val_rev)
 
