@@ -88,6 +88,10 @@ CFG = {
     "K_LIST": [10, 20, 50], "SELECT_METRIC": "Recall@10",
     "N_BOOT": 2000,
     "LOW_CLV_PCTL": 0.2,       # 세그먼트 리포팅/가드레일 경계 — 게이트 계산과는 무관(리포팅 전용)
+    "CLV_GATE_POWER": 2.0,     # gate(u)=percentile_rank(CLV_u)**power. power=1이면 저CLV(하위
+                               # 20%)도 gate가 최대 0.2까지 나와 LOW_CLV_EPSILON=0.0 가드레일을
+                               # 거의 항상 위반한다(2026-07-31 실측). power>1로 저CLV를 더 세게
+                               # 누르되(0.2**2=0.04) 여전히 연속함수(계단 없음)로 유지.
 
     # ── phase2 그리드 탐색 (dampen 없음 — gate가 CLV percentile로 고정 결정되므로) ──
     "LAMBDA_GRID": [0, 0.01, 0.03, 0.05, 0.1, 0.2, 0.5, 0.7, 1.0, 1.5, 2.0],
@@ -151,8 +155,10 @@ def grid_fingerprint(cfg):
     VT_TOPK_CKPTS/EPOCH_SCREEN_LAMBDA(Stage A 스크리닝이 vt_topk에 어떤 epoch를 뽑는지를
     바꿔, 캐시된 epoch 키가 안 맞으면 StopIteration 크래시로 이어짐)만 있으면 된다.
     LOW_CLV_PCTL은 세그먼트 리포팅/가드레일 임계값에 영향을 주므로 포함한다.
+    CLV_GATE_POWER는 gate_arr 자체를 바꿔 그리드의 모든 (epoch,λ) 조합의 결합점수에
+    영향을 주므로 포함한다.
     cfg["RUN_TAG"]도 포함 — M1이 재학습되면(RUN_TAG 변경) 이 캐시도 자동 무효화."""
-    keys = ["LAMBDA_GRID", "VT_TOPK_CKPTS", "EPOCH_SCREEN_LAMBDA", "LOW_CLV_PCTL"]
+    keys = ["LAMBDA_GRID", "VT_TOPK_CKPTS", "EPOCH_SCREEN_LAMBDA", "LOW_CLV_PCTL", "CLV_GATE_POWER"]
     payload = {k: cfg[k] for k in keys}
     payload["RUN_TAG"] = cfg["RUN_TAG"]
     s = json.dumps(payload, sort_keys=True, default=str)
@@ -161,9 +167,11 @@ def grid_fingerprint(cfg):
 
 def seed_result_fingerprint(cfg, dcfg, seed):
     """load_or_run_seed()의 최종 결과 캐시 지문. PHASE/PHASE1_LAMBDA(phase1 결과 자체를
-    바꿈)와 가드레일 epsilon들·K_LIST·N_BOOT(phase2 선택/리포팅에 영향)를 포함한다."""
+    바꿈)와 가드레일 epsilon들·K_LIST·N_BOOT(phase2 선택/리포팅에 영향)를 포함한다.
+    CLV_GATE_POWER는 phase1/phase2 둘 다의 결합점수 자체를 바꾸므로 포함한다."""
     keys = ["PHASE", "PHASE1_LAMBDA", "ACCURACY_EPSILON", "LOW_CLV_EPSILON", "RECALL50_EPSILON",
-            "HR_EPSILON", "DIVERSITY_EPSILON", "EPS_TOL", "K_LIST", "N_BOOT", "LOW_CLV_PCTL"]
+            "HR_EPSILON", "DIVERSITY_EPSILON", "EPS_TOL", "K_LIST", "N_BOOT", "LOW_CLV_PCTL",
+            "CLV_GATE_POWER"]
     payload = {k: cfg[k] for k in keys}
     own = hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:8]
     combined = f"{vt_fingerprint(cfg, dcfg, seed)}_{grid_fingerprint(cfg)}_{own}"
@@ -937,20 +945,28 @@ def train_value_tower(x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos,
     return model, best_ep, best_score, all_epochs
 
 
-def compute_clv_gate(clv):
-    """gate(u) = percentile_rank(CLV_u) — CLV가 낮을수록 z^value 반영을 자동으로 줄이고,
-    높을수록 그대로 반영한다. v1의 gate_F(u)(F_u 구간별 CatShare 신뢰도 기반)와
+def compute_clv_gate(clv, power=1.0):
+    """gate(u) = percentile_rank(CLV_u)**power — CLV가 낮을수록 z^value 반영을 자동으로
+    줄이고, 높을수록 그대로 반영한다. v1의 gate_F(u)(F_u 구간별 CatShare 신뢰도 기반)와
     dampen_low/dampen_high(저/고CLV 3단계 계단식)를 이 연속함수 하나로 대체한다.
 
     근거: 마스터 보고서 §7.2에서 λ를 키울수록 저CLV 유저의 Recall/PWGain이 함께
     나빠지는 게 실측됐다 — 저CLV에게 가치 임베딩을 세게 반영하는 건 실제 손해다.
     percentile_rank는 저CLV 유저의 gate를 0에 가깝게 만들어 이 손해를 구조적으로 막는다.
 
+    power(2026-07-31 추가): power=1이면 저CLV 리포팅 경계(하위 20%)에 속한 유저도
+    gate가 최대 0.2까지 나와 LOW_CLV_EPSILON=0.0 가드레일을 실측상 거의 항상 위반한다
+    (Recall@10은 top-10 경계에서 순위가 한 칸만 밀려도 hit→miss로 뒤집히는 이분법
+    지표라, gate=0.2 정도의 미세한 개입도 걸림돌이 됨). power>1을 주면 0~1 사이 값이
+    거듭제곱되어 저CLV(작은 값)는 훨씬 더 0에 가깝게, 고CLV(1에 가까운 값)는 상대적으로
+    덜 줄어든다(예: power=2일 때 0.2**2=0.04, 0.95**2=0.9025) — 계단함수 없이 곡선
+    형태만 바꾸는 것이라 "CLV 한 등수 차이로 gate가 급변" 문제는 생기지 않는다.
+
     관측 없는 유저(train 거래 없어 CLV가 NaN, compute_clv_vhat 참고)는 percentile
     계산에서 제외하고 gate=0으로 고정한다(가장 보수적인 값)."""
     valid = ~np.isnan(clv)
     gate = np.zeros_like(clv, dtype=np.float32)
-    gate[valid] = pd.Series(clv[valid]).rank(pct=True).to_numpy(np.float32)
+    gate[valid] = pd.Series(clv[valid]).rank(pct=True).to_numpy(np.float32) ** power
     return gate
 
 
@@ -1159,7 +1175,7 @@ def run_dualspace_one_seed_phase1(seed, train, val_gt, val_rev, test_gt, test_re
         x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos, item_cat_arr, cat_items,
         val_gt, csr_ptr, csr_items, CFG, seed, ckpt_path=vt_ckpt)
 
-    gate_arr = compute_clv_gate(user_meta["clv"])
+    gate_arr = compute_clv_gate(user_meta["clv"], power=CFG["CLV_GATE_POWER"])
 
     clv = user_meta["clv"]; clv_valid = clv[~np.isnan(clv)]
     clv_lo_th = np.quantile(clv_valid, CFG["LOW_CLV_PCTL"])
@@ -1229,7 +1245,7 @@ def run_dualspace_one_seed_phase2(seed, train, val_gt, val_rev, test_gt, test_re
         x_val_u, x_val_i, tr_u, tr_i, n_items, pos_key, user_pos, item_cat_arr, cat_items,
         val_gt, csr_ptr, csr_items, CFG, seed, ckpt_path=vt_ckpt)
 
-    gate_arr = compute_clv_gate(user_meta["clv"])
+    gate_arr = compute_clv_gate(user_meta["clv"], power=CFG["CLV_GATE_POWER"])
 
     clv = user_meta["clv"]; clv_valid = clv[~np.isnan(clv)]
     clv_lo_th = np.quantile(clv_valid, CFG["LOW_CLV_PCTL"])

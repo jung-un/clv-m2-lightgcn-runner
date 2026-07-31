@@ -17,6 +17,7 @@ def test_cfg_has_phase_keys_and_no_dead_dampen_keys():
     assert cfg["MODEL_LABEL"] == "M2v2"
     assert cfg["PHASE"] in (1, 2)
     assert "PHASE1_LAMBDA" in cfg
+    assert cfg["CLV_GATE_POWER"] >= 1.0
     for dead_key in ["F_BUCKET_EDGES", "F_BUCKET_LABELS", "GATE_N_NEG",
                       "CLV_DAMPEN_GRID", "HIGH_CLV_DAMPEN_GRID", "HIGH_CLV_EPSILON_GRID"]:
         assert dead_key not in cfg, f"CFG에서 {dead_key}는 제거되어야 함"
@@ -31,6 +32,20 @@ def test_compute_clv_gate_is_percentile_rank_and_nan_safe():
     assert gate[3] == 0.0  # NaN CLV → gate 0
     assert gate[0] < gate[1] < gate[2] < gate[4]  # 순위 보존
     assert gate.min() >= 0.0 and gate.max() <= 1.0
+
+
+def test_compute_clv_gate_power_suppresses_low_percentile_more_than_high():
+    ns = _load_module_upto_cfg()
+    np = ns["np"]
+    compute_clv_gate = ns["compute_clv_gate"]
+    clv = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)  # percentile 0.2/0.4/0.6/0.8/1.0
+    g1 = compute_clv_gate(clv, power=1.0)
+    g2 = compute_clv_gate(clv, power=2.0)
+    np.testing.assert_allclose(g2, g1 ** 2, atol=1e-6)
+    lowest_shrink = g1[0] - g2[0]
+    highest_shrink = g1[-1] - g2[-1]
+    assert lowest_shrink > highest_shrink  # 저CLV가 고CLV보다 더 많이 눌려야 함
+    assert g2[0] < g1[0]  # power>1이면 저CLV gate는 줄어듦
 
 
 def test_build_user_features_prefixes_frt_before_aov_prem_catshare():
