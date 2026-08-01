@@ -51,7 +51,7 @@ SCHEMA = {
 # ═══════════════════════════════════════════════════════════════════
 CFG = {
     # ── 실행 대상 ──
-    "DATASET": "dunnhumby",   # "hm" | "dunnhumby"
+    "DATASET": "hm",          # "hm" | "dunnhumby"
     "MODEL_LABEL": "M2v2",    # v1("M2")과 구분 — CLV 임베딩 재설계 버전
     "SEED": 42,
     "SEED_LIST": [42, 43, 44],  # value tower 다중시드 재현성 확인용
@@ -62,10 +62,10 @@ CFG = {
 
     # ── 데이터 필터링/기간 ──
     "OUT_DIR": None,          # 아래에서 DATASET 확정 후 채움
-    # 최근 N일만 사용 (None=전체기간). H&M 기준 60≈2개월. Dunnhumby는 전체가 ~2,500가구뿐이라
-    # 60일 윈도우가 이미 87%(2,189명)를 차지해 "서브셋"의 의미가 없음(2026-08-01) — None으로
-    # 전체기간 사용. DATASET을 "hm"으로 되돌리면 이 값도 60으로 되돌릴 것.
-    "WINDOW_DAYS": None,
+    # 최근 N일만 사용 (None=전체기간). H&M 기준 60≈2개월(현재 값). Dunnhumby는 전체가
+    # ~2,500가구뿐이라 60일 윈도우가 이미 87%(2,189명)를 차지해 "서브셋" 의미가 없어서
+    # None(전체기간)을 씀(2026-08-01) — DATASET을 "dunnhumby"로 바꾸면 이 값도 None으로.
+    "WINDOW_DAYS": 60,
     "VAL_DAYS": 7, "TEST_DAYS": 7,
     "MIN_USER_INTER": 1, "MIN_ITEM_INTER": 1,
 
@@ -91,6 +91,12 @@ CFG = {
     "K_LIST": [10, 20, 50], "SELECT_METRIC": "Recall@10",
     "N_BOOT": 2000,
     "LOW_CLV_PCTL": 0.2,       # 세그먼트 리포팅/가드레일 경계 — 게이트 계산과는 무관(리포팅 전용)
+    # build_user_features()의 x_val_u 구성(코드 변경)이 바뀔 때마다 올릴 것 — CFG 값이
+    # 아니라 코드 자체의 변경이라 지문에 자동으로 안 잡히므로, VT/시드 캐시가 구버전
+    # 체크포인트를 잘못 재사용(차원 불일치 크래시)하거나 결과를 통째로 잘못 재사용(조용한
+    # 오류)하는 걸 막으려면 이 값을 수동으로 올려야 한다. v1=CatShare 포함, v2(2026-08-01)
+    # =CatShare 제거, 순수 CLV 변수(F/T/R/AOV/Prem)만.
+    "VALUE_FEATURE_VERSION": 2,
     "CLV_GATE_POWER": 2.0,     # gate(u)=percentile_rank(CLV_u)**power. power=1이면 저CLV(하위
                                # 20%)도 gate가 최대 0.2까지 나와 LOW_CLV_EPSILON=0.0 가드레일을
                                # 거의 항상 위반한다(2026-07-31 실측). power>1로 저CLV를 더 세게
@@ -142,10 +148,13 @@ def cfg_fingerprint(cfg, dcfg):
 
 
 def vt_fingerprint(cfg, dcfg, seed):
-    """value tower 전용 설정 지문 (D_VALUE 등 포함, SEED는 인자로 개별 지정)."""
+    """value tower 전용 설정 지문 (D_VALUE 등 포함, SEED는 인자로 개별 지정).
+    VALUE_FEATURE_VERSION 포함 — x_val_u 구성(build_user_features 내부)이 바뀌면
+    이 값을 올려야 구버전 체크포인트(다른 입력 차원)를 잘못 재사용하지 않는다."""
     keys = ["MIN_USER_INTER", "MIN_ITEM_INTER", "SHRINKAGE_K", "PREMIUM_THR",
             "BATCH_SIZE", "LR", "HARD_NEG_RATIO", "D_VALUE", "MLP_HIDDEN",
-            "VT_MAX_EPOCHS", "VT_PATIENCE", "WINDOW_DAYS", "VAL_DAYS", "TEST_DAYS"]
+            "VT_MAX_EPOCHS", "VT_PATIENCE", "WINDOW_DAYS", "VAL_DAYS", "TEST_DAYS",
+            "VALUE_FEATURE_VERSION"]
     payload = {k: cfg[k] for k in keys}
     payload.update(category_col=dcfg["category_col"], seed=seed)
     s = json.dumps(payload, sort_keys=True, default=str)
