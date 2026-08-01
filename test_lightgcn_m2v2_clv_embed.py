@@ -52,23 +52,22 @@ def test_compute_clv_gate_power_suppresses_low_percentile_more_than_high():
     assert g2[0] < g1[0]  # power>1이면 저CLV gate는 줄어듦
 
 
-def test_build_user_features_prefixes_frt_before_aov_prem_catshare():
+def test_build_user_features_is_pure_clv_frt_aov_prem_only():
     ns = _load_module_upto_cfg()
     pd, np = ns["pd"], ns["np"]
     build_user_features = ns["build_user_features"]
     rng = np.random.default_rng(0)
     n = 30
-    n_cat = 3
     train = pd.DataFrame({
         "u_idx": rng.integers(0, 6, n),
         "i_idx": rng.integers(0, 5, n),
         "t": pd.to_datetime("2020-01-01") + pd.to_timedelta(rng.integers(0, 30, n), unit="D"),
         "v": rng.uniform(10, 100, n).round(2),
-        "cat_idx": rng.integers(0, n_cat, n),
+        "cat_idx": rng.integers(0, 3, n),
     })
     cfg = dict(ns["CFG"])
-    x_val, F_u_full = build_user_features(train, n_users=6, n_cat=n_cat, cfg=cfg, is_date=True)
-    assert x_val.shape == (6, 3 + 2 + n_cat)  # F/T/R + AOV/Prem + CatShare(n_cat)
+    x_val, F_u_full = build_user_features(train, n_users=6, cfg=cfg, is_date=True)
+    assert x_val.shape == (6, 5)  # F/T/R + AOV/Prem — CatShare 없음(CLV 공식과 무관해 제거)
     assert F_u_full.shape == (6,)
 
 

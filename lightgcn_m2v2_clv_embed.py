@@ -357,35 +357,25 @@ def _user_pct_stats(train, cfg, is_date):
     return g
 
 
-def build_user_features(train, n_users, n_cat, cfg, is_date):
-    """z^value 입력 특징. v1과의 차이: 반복거래축(F_p/T_p/R_p, CLV의 N̂ 성분)을
-    가치축(AOV_p/Prem_p/CatShare, V̂ 성분) 앞에 이어붙인다 — CLV를 구성하는 두 축
-    전부를 z^value가 직접 학습하도록(v1은 V̂ 관련 변수만 썼음). 단일 MLP가 이
-    확장된 벡터를 통째로 받는다(축별 분리 MLP 아님)."""
+def build_user_features(train, n_users, cfg, is_date):
+    """z^value 입력 특징 = CLV를 구성하는 변수만(F_p/T_p/R_p → N̂ 성분, AOV_p/Prem_p → V̂
+    성분), 5차원. CatShare(카테고리별 지출비중)는 2026-08-01 제거 — CatShare는 CLV 공식
+    (N̂×V̂)의 구성요소가 아니라 v1 때 "가치정보만으론 어떤 상품인지 못 맞힌다"(마스터
+    보고서 §5.1, AUC~0.5)는 문제를 완화하려고 별도로 끼워넣었던 신호였다. z^value 입력을
+    "CLV를 나타내는 변수"로 좁게 유지하기로(사용자 확인) 빼고, F/T/R/AOV/Prem만 남긴다."""
     g = _user_pct_stats(train, cfg, is_date)
-    k = cfg["SHRINKAGE_K"]
 
     ftr_full = np.full((n_users, 3), 0.5, np.float32)
     ftr_full[g.index.values] = np.stack([g["F_p"].values, g["T_p"].values, g["R_p"].values], axis=1)
-
-    Spend_u = train.groupby("u_idx")["v"].sum()
-    cat_spend = (train.groupby(["u_idx", "cat_idx"])["v"].sum()
-                 .unstack(fill_value=0.0).reindex(columns=range(n_cat), fill_value=0.0))
-    obs_share = cat_spend.div(Spend_u, axis=0).fillna(0.0)
-    p_bar = (train.groupby("cat_idx")["v"].sum() / train["v"].sum()).reindex(range(n_cat), fill_value=0.0)
-    catshare = obs_share.mul(g["F"], axis=0).add(k * p_bar, axis=1).div(g["F"] + k, axis=0)
-
-    cat_full = np.tile(p_bar.values, (n_users, 1)).astype(np.float32)
-    cat_full[catshare.index.values] = catshare.values.astype(np.float32)
 
     aov_full = np.full(n_users, 0.5, np.float32); prem_full = np.full(n_users, 0.5, np.float32)
     aov_full[g.index.values] = g["AOV_p"].values.astype(np.float32)
     prem_full[g.index.values] = g["Prem_p"].values.astype(np.float32)
 
-    x_val_u = np.concatenate([ftr_full, aov_full[:, None], prem_full[:, None], cat_full], axis=1)
+    x_val_u = np.concatenate([ftr_full, aov_full[:, None], prem_full[:, None]], axis=1)
     F_u_full = np.zeros(n_users, dtype=np.int64)
     F_u_full[g.index.values] = g["F"].values
-    print(f"  유저 특징: val(F,T,R+AOV,Prem+CatShare[금액기준]{n_cat}) {x_val_u.shape}")
+    print(f"  유저 특징: val(F,T,R,AOV,Prem — 순수 CLV 변수) {x_val_u.shape}")
     return x_val_u.astype(np.float32), F_u_full
 
 
@@ -790,7 +780,7 @@ def main():
 class ValueTower(nn.Module):
     """z^value — CLV(가치) 신호만으로 학습되는 독립 임베딩 공간. LightGCNCLV(z^pref)와
     파라미터를 전혀 공유하지 않고(Dual-Space), 오직 유저/아이템의 "가치 특징"
-    (x_val_u: AOV/Prem/CatShare, x_val_i: 가격백분위/카테고리내순위)만 입력으로
+    (x_val_u: F/T/R/AOV/Prem — 순수 CLV 변수, x_val_i: 가격백분위/카테고리내순위)만 입력으로
     받는 얕은 MLP(SideMLP) 두 개로 구성된다.
 
     z^pref는 M1에서 이미 학습되어 완전히 동결된 채로 쓰이는 반면, z^value는
@@ -1187,7 +1177,7 @@ def run_dualspace_one_seed_phase1(seed, train, val_gt, val_rev, test_gt, test_re
     결합해 baseline(λ=0)과 비교한다. 지표 계산 깊이(세그먼트별+bootstrap CI)는
     phase2와 동일 — 생략하는 건 여러 epoch·λ 조합을 비교하는 그리드 탐색뿐이다."""
     set_seed(seed)
-    x_val_u, F_u = build_user_features(train, n_users, n_cat, CFG, DCFG["is_date"])
+    x_val_u, F_u = build_user_features(train, n_users, CFG, DCFG["is_date"])
     x_val_i = build_item_features(train, n_items, n_cat)
 
     vt_ckpt = Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['MODEL_LABEL']}_vt_{CFG['DATASET']}_s{seed}_{vt_fingerprint(CFG, DCFG, seed)}.pt"
@@ -1257,7 +1247,7 @@ def run_dualspace_one_seed_phase2(seed, train, val_gt, val_rev, test_gt, test_re
     validation에서 최적 (epoch, λ)를 고르고 test에서 1회 평가한다. phase1에서 개선이
     확인된 뒤에만 CFG["PHASE"]=2로 명시 전환해서 쓴다(자동 트리거 아님)."""
     set_seed(seed)
-    x_val_u, F_u = build_user_features(train, n_users, n_cat, CFG, DCFG["is_date"])
+    x_val_u, F_u = build_user_features(train, n_users, CFG, DCFG["is_date"])
     x_val_i = build_item_features(train, n_items, n_cat)
 
     vt_ckpt = Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['MODEL_LABEL']}_vt_{CFG['DATASET']}_s{seed}_{vt_fingerprint(CFG, DCFG, seed)}.pt"
@@ -1509,7 +1499,8 @@ def run_dualspace():
         "note_pwgain": "revenue/pwgain 필드는 가격가중 추천 적중값(price-weighted gain proxy)이며 "
                        "실제 통화 매출·증분매출·수익성 지표가 아님.",
         "note_gate": "gate(u) = percentile_rank(CLV_u) — v1의 gate_F(u)/dampen_low/dampen_high를 "
-                     "대체. F/T/R을 z^value 입력에 포함(v1은 AOV/Prem/CatShare만).",
+                     "대체. z^value 입력은 F/T/R/AOV/Prem(순수 CLV 변수)만 사용(v1은 AOV/Prem/"
+                     "CatShare, CatShare는 CLV 공식과 무관해 2026-08-01 제거).",
         "note_exploratory": "본 H&M 결과는 개발/탐색 결과이며 confirmatory test가 아님.",
     }
     with open(out_path, "w") as f:
