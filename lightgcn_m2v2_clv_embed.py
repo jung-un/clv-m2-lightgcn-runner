@@ -51,7 +51,7 @@ SCHEMA = {
 # ═══════════════════════════════════════════════════════════════════
 CFG = {
     # ── 실행 대상 ──
-    "DATASET": "hm",          # "hm" | "dunnhumby"
+    "DATASET": "dunnhumby",   # "hm" | "dunnhumby"
     "MODEL_LABEL": "M2v2",    # v1("M2")과 구분 — CLV 임베딩 재설계 버전
     "SEED": 42,
     "SEED_LIST": [42, 43, 44],  # value tower 다중시드 재현성 확인용
