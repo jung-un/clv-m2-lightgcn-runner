@@ -52,7 +52,7 @@ def test_compute_clv_gate_power_suppresses_low_percentile_more_than_high():
     assert g2[0] < g1[0]  # power>1이면 저CLV gate는 줄어듦
 
 
-def test_build_user_features_is_pure_clv_frt_aov_prem_only():
+def test_build_user_features_is_pure_clv_frt_aov_prem_clv():
     ns = _load_module_upto_cfg()
     pd, np = ns["pd"], ns["np"]
     build_user_features = ns["build_user_features"]
@@ -67,8 +67,27 @@ def test_build_user_features_is_pure_clv_frt_aov_prem_only():
     })
     cfg = dict(ns["CFG"])
     x_val, F_u_full = build_user_features(train, n_users=6, cfg=cfg, is_date=True)
-    assert x_val.shape == (6, 5)  # F/T/R + AOV/Prem — CatShare 없음(CLV 공식과 무관해 제거)
+    assert x_val.shape == (6, 6)  # F/T/R + AOV/Prem + CLV — CatShare 없음(CLV와 무관해 제거)
     assert F_u_full.shape == (6,)
+    assert ((x_val >= 0) & (x_val <= 1)).all()  # 전부 백분위 스케일이어야 함(CLV_p 포함)
+
+
+def test_clv_column_is_product_of_nhat_vhat():
+    """CLV_p가 실제로 N̂×V̂의 백분위인지 — 곱을 명시적으로 주는 게 이 변수의 존재 이유."""
+    ns = _load_module_upto_cfg()
+    pd, np = ns["pd"], ns["np"]
+    rng = np.random.default_rng(1)
+    n = 60
+    train = pd.DataFrame({
+        "u_idx": rng.integers(0, 12, n),
+        "i_idx": rng.integers(0, 8, n),
+        "t": pd.to_datetime("2020-01-01") + pd.to_timedelta(rng.integers(0, 40, n), unit="D"),
+        "v": rng.uniform(5, 200, n).round(2),
+        "cat_idx": rng.integers(0, 3, n),
+    })
+    g = ns["_user_pct_stats"](train, dict(ns["CFG"]), True)
+    np.testing.assert_allclose(g["CLV_raw"], g["N_hat"] * g["V_hat"], rtol=1e-9)
+    np.testing.assert_allclose(g["CLV_p"], g["CLV_raw"].rank(pct=True), rtol=1e-9)
 
 
 def test_no_gate_f_or_dampen_functions_remain():

@@ -94,9 +94,10 @@ CFG = {
     # build_user_features()의 x_val_u 구성(코드 변경)이 바뀔 때마다 올릴 것 — CFG 값이
     # 아니라 코드 자체의 변경이라 지문에 자동으로 안 잡히므로, VT/시드 캐시가 구버전
     # 체크포인트를 잘못 재사용(차원 불일치 크래시)하거나 결과를 통째로 잘못 재사용(조용한
-    # 오류)하는 걸 막으려면 이 값을 수동으로 올려야 한다. v1=CatShare 포함, v2(2026-08-01)
-    # =CatShare 제거, 순수 CLV 변수(F/T/R/AOV/Prem)만.
-    "VALUE_FEATURE_VERSION": 2,
+    # 오류)하는 걸 막으려면 이 값을 수동으로 올려야 한다. v1=CatShare 포함,
+    # v2(2026-08-01)=CatShare 제거·순수 CLV 변수(F/T/R/AOV/Prem) 5차원,
+    # v3(2026-08-01)=CLV_p(=N̂×V̂ 백분위) 추가 6차원.
+    "VALUE_FEATURE_VERSION": 3,
     "CLV_GATE_POWER": 2.0,     # gate(u)=percentile_rank(CLV_u)**power. power=1이면 저CLV(하위
                                # 20%)도 gate가 최대 0.2까지 나와 LOW_CLV_EPSILON=0.0 가드레일을
                                # 거의 항상 위반한다(2026-07-31 실측). power>1로 저CLV를 더 세게
@@ -363,28 +364,44 @@ def _user_pct_stats(train, cfg, is_date):
     AOV = (g.F * g.AOV_raw + k * glob_aov) / (g.F + k)
     Prem = (g.prem + k * glob_prem) / (g.F + k)
     g["AOV_p"], g["Prem_p"] = AOV.rank(pct=True), Prem.rank(pct=True)
+
+    # CLV = N̂ × V̂ (반복거래강도 × 가치성향). raw는 compute_clv_vhat()의 게이트/세그먼트용,
+    # CLV_p(백분위)는 z^value 입력용 — 나머지 입력이 전부 백분위라 스케일을 맞춘다.
+    # 곱을 명시적으로 넣는 이유: MLP(Linear+LeakyReLU)는 곱셈 관계를 사실상 학습하지 못해
+    # N̂·V̂를 따로 주는 것만으로는 "자주 사면서 비싸게 사는 고객"을 구분할 수 없다.
+    g["N_hat"] = g[["F_p", "T_p", "R_p"]].mean(axis=1)
+    g["V_hat"] = g[["AOV_p", "Prem_p"]].mean(axis=1)
+    g["CLV_raw"] = g["N_hat"] * g["V_hat"]
+    g["CLV_p"] = g["CLV_raw"].rank(pct=True)
     return g
 
 
 def build_user_features(train, n_users, cfg, is_date):
-    """z^value 입력 특징 = CLV를 구성하는 변수만(F_p/T_p/R_p → N̂ 성분, AOV_p/Prem_p → V̂
-    성분), 5차원. CatShare(카테고리별 지출비중)는 2026-08-01 제거 — CatShare는 CLV 공식
-    (N̂×V̂)의 구성요소가 아니라 v1 때 "가치정보만으론 어떤 상품인지 못 맞힌다"(마스터
-    보고서 §5.1, AUC~0.5)는 문제를 완화하려고 별도로 끼워넣었던 신호였다. z^value 입력을
-    "CLV를 나타내는 변수"로 좁게 유지하기로(사용자 확인) 빼고, F/T/R/AOV/Prem만 남긴다."""
+    """z^value 입력 특징 = CLV를 나타내는 변수만, 6차원.
+    [F_p, T_p, R_p](→N̂ 성분) + [AOV_p, Prem_p](→V̂ 성분) + [CLV_p](=N̂×V̂ 백분위).
+
+    - CatShare(카테고리별 지출비중)는 2026-08-01 제거 — CLV 공식의 구성요소가 아니라
+      v1 때 "가치정보만으론 어떤 상품인지 못 맞힌다"(마스터 보고서 §5.1)는 성능 문제를
+      완화하려고 끼워넣었던 별개 신호였다. 논문 주제상 CLV 무관 변수는 성능과 무관하게 배제.
+    - CLV_p는 2026-08-01 추가 — N̂/V̂는 기존 입력의 단순 평균(선형결합)이라 MLP가 스스로
+      만들 수 있어 추가해도 정보량이 없지만, 그 '곱'인 CLV는 Linear+LeakyReLU 구조가
+      사실상 학습하지 못하므로 명시적으로 제공한다."""
     g = _user_pct_stats(train, cfg, is_date)
 
     ftr_full = np.full((n_users, 3), 0.5, np.float32)
     ftr_full[g.index.values] = np.stack([g["F_p"].values, g["T_p"].values, g["R_p"].values], axis=1)
 
     aov_full = np.full(n_users, 0.5, np.float32); prem_full = np.full(n_users, 0.5, np.float32)
+    clv_full = np.full(n_users, 0.5, np.float32)
     aov_full[g.index.values] = g["AOV_p"].values.astype(np.float32)
     prem_full[g.index.values] = g["Prem_p"].values.astype(np.float32)
+    clv_full[g.index.values] = g["CLV_p"].values.astype(np.float32)
 
-    x_val_u = np.concatenate([ftr_full, aov_full[:, None], prem_full[:, None]], axis=1)
+    x_val_u = np.concatenate([ftr_full, aov_full[:, None], prem_full[:, None],
+                               clv_full[:, None]], axis=1)
     F_u_full = np.zeros(n_users, dtype=np.int64)
     F_u_full[g.index.values] = g["F"].values
-    print(f"  유저 특징: val(F,T,R,AOV,Prem — 순수 CLV 변수) {x_val_u.shape}")
+    print(f"  유저 특징: val(F,T,R,AOV,Prem,CLV — 순수 CLV 변수) {x_val_u.shape}")
     return x_val_u.astype(np.float32), F_u_full
 
 
@@ -422,11 +439,9 @@ def build_item_meta(train, n_items):
 def compute_clv_vhat(train, n_users, cfg, is_date):
     """평가/세그먼트 전용 CLV — 모델 입력(CatShare 등)과 독립적으로, 원시 행동변수로만 산출."""
     g = _user_pct_stats(train, cfg, is_date)
-    n_hat = g[["F_p", "T_p", "R_p"]].mean(axis=1)
-    v_hat = g[["AOV_p", "Prem_p"]].mean(axis=1)
     clv_full = np.full(n_users, np.nan); vhat_full = np.full(n_users, 0.5, np.float32)
-    clv_full[g.index.values] = (n_hat * v_hat).values
-    vhat_full[g.index.values] = v_hat.values.astype(np.float32)
+    clv_full[g.index.values] = g["CLV_raw"].values          # = N̂ × V̂ (백분위 변환 전 원값)
+    vhat_full[g.index.values] = g["V_hat"].values.astype(np.float32)
     return clv_full, vhat_full
 
 
