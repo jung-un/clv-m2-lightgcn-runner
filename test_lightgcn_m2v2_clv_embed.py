@@ -4,8 +4,12 @@ SCRIPT_PATH = Path(__file__).parent / "lightgcn_m2v2_clv_embed.py"
 
 
 def _load_module_upto_cfg():
+    """CFG/함수 정의까지만 실행하고 멈춘다. 파일 끝의 'M1 체크포인트 없으면 main()으로
+    학습' 가드보다 앞에서 잘라야 한다 — 안 그러면 로컬에 체크포인트가 없는 조합(예:
+    dunnhumby)에서 이 테스트가 실제로 전체 학습을 로컬 CPU로 돌려버린다(2026-08-01 발견,
+    WINDOW_DAYS=60일 땐 우연히 37초라 안 드러났다가 None으로 바꾸며 36분+ 걸려 발각됨)."""
     src = SCRIPT_PATH.read_text(encoding="utf-8")
-    src = src.split("results = run_dualspace()")[0]
+    src = src.split("# M1 체크포인트(RUN_TAG 지문 기준)가 없으면")[0]
     ns = {"__name__": "test_module"}
     exec(compile(src, str(SCRIPT_PATH), "exec"), ns)
     return ns

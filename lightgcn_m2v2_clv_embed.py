@@ -62,7 +62,10 @@ CFG = {
 
     # ── 데이터 필터링/기간 ──
     "OUT_DIR": None,          # 아래에서 DATASET 확정 후 채움
-    "WINDOW_DAYS": 60,        # 최근 N일만 사용 (None=전체기간). 60≈2개월 "기준 세팅". 2년 승격 시 None.
+    # 최근 N일만 사용 (None=전체기간). H&M 기준 60≈2개월. Dunnhumby는 전체가 ~2,500가구뿐이라
+    # 60일 윈도우가 이미 87%(2,189명)를 차지해 "서브셋"의 의미가 없음(2026-08-01) — None으로
+    # 전체기간 사용. DATASET을 "hm"으로 되돌리면 이 값도 60으로 되돌릴 것.
+    "WINDOW_DAYS": None,
     "VAL_DAYS": 7, "TEST_DAYS": 7,
     "MIN_USER_INTER": 1, "MIN_ITEM_INTER": 1,
 
