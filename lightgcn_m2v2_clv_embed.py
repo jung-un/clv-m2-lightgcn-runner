@@ -1155,6 +1155,23 @@ def run_stage_b_grid(vt_topk, cfg, grid_path, gate_arr, base_val_res, _eval,
         Path(grid_path).parent.mkdir(parents=True, exist_ok=True)
         torch.save({"grid_results": grid_results, "done_epochs": done_epochs}, grid_path)
         print(f"  [Stage B] epoch {ep_id} 블록 완료 및 저장 ({len(done_epochs)}/{len(vt_topk)} epoch)")
+
+    # 캐시에서 재개해 아무것도 새로 안 돌려도, 사람이 (epoch,λ)별 val 지표를 직접
+    # 비교할 수 있도록 읽기 쉬운 요약을 항상 남긴다(.pt는 텍스트로 못 읽음).
+    summary_rows = []
+    for (ep_id, lam), res in sorted(grid_results.items()):
+        o10, o50, seg10 = res["overall"][10], res["overall"][50], res["seg"][10]
+        summary_rows.append({
+            "epoch": ep_id, "lambda": lam,
+            "val_recall10": o10["recall"], "val_recall50": o50["recall"],
+            "val_pwgain10": o10["revenue"], "val_hr10": o10["hr"], "val_diversity10": o10["diversity"],
+            "저CLV_recall10": seg10["저CLV"]["recall"], "저CLV_pwgain10": seg10["저CLV"]["revenue"],
+            "고CLV_recall10": seg10["고CLV"]["recall"], "고CLV_pwgain10": seg10["고CLV"]["revenue"],
+        })
+    summary_path = Path(str(grid_path).replace(".pt", "_summary.json"))
+    with open(summary_path, "w") as f:
+        json.dump(summary_rows, f, indent=2, ensure_ascii=False)
+    print(f"  [Stage B] 그리드 {len(summary_rows)}개 조합 λ별 val 지표 요약 → {summary_path}")
     return grid_results
 
 
