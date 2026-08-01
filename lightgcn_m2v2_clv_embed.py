@@ -96,9 +96,9 @@ CFG = {
     # ── phase2 그리드 탐색 (dampen 없음 — gate가 CLV percentile로 고정 결정되므로) ──
     "LAMBDA_GRID": [0, 0.01, 0.03, 0.05, 0.1, 0.2, 0.5, 0.7, 1.0, 1.5, 2.0],
 
-    # ── 가드레일 (0.0으로 되돌리지 말 것 — CLAUDE.md §4, λ>0 전체 탈락 버그 재현됨) ──
+    # ── 가드레일 (전체 종합 성과 기준 — 세그먼트별 무손실 요구는 2026-08-01 제거함) ──
+    # RECALL50/HR/DIVERSITY를 0.0으로 되돌리지 말 것 — CLAUDE.md §4, λ>0 전체 탈락 버그 재현됨
     "ACCURACY_EPSILON": 0.0,
-    "LOW_CLV_EPSILON": 0.0,
     "RECALL50_EPSILON": 0.01,
     "HR_EPSILON": 0.01,
     "DIVERSITY_EPSILON": 0.03,
@@ -169,7 +169,7 @@ def seed_result_fingerprint(cfg, dcfg, seed):
     """load_or_run_seed()의 최종 결과 캐시 지문. PHASE/PHASE1_LAMBDA(phase1 결과 자체를
     바꿈)와 가드레일 epsilon들·K_LIST·N_BOOT(phase2 선택/리포팅에 영향)를 포함한다.
     CLV_GATE_POWER는 phase1/phase2 둘 다의 결합점수 자체를 바꾸므로 포함한다."""
-    keys = ["PHASE", "PHASE1_LAMBDA", "ACCURACY_EPSILON", "LOW_CLV_EPSILON", "RECALL50_EPSILON",
+    keys = ["PHASE", "PHASE1_LAMBDA", "ACCURACY_EPSILON", "RECALL50_EPSILON",
             "HR_EPSILON", "DIVERSITY_EPSILON", "EPS_TOL", "K_LIST", "N_BOOT", "LOW_CLV_PCTL",
             "CLV_GATE_POWER"]
     payload = {k: cfg[k] for k in keys}
@@ -1285,8 +1285,6 @@ def run_dualspace_one_seed_phase2(seed, train, val_gt, val_rev, test_gt, test_re
         Uv0, Iv0 = value_model.encode()
     base_val_res = _eval(gate_arr, 0, val_gt, val_rev, Uv0, Iv0)
     base_val_recall = base_val_res["overall"][10]["recall"]
-    base_val_low_recall = base_val_res["seg"][10]["저CLV"]["recall"]
-    base_val_low_revenue = base_val_res["seg"][10]["저CLV"]["revenue"]
     base_val_recall50 = base_val_res["overall"][50]["recall"]
     base_val_hr10 = base_val_res["overall"][10]["hr"]
     base_val_div10 = base_val_res["overall"][10]["diversity"]
@@ -1305,7 +1303,7 @@ def run_dualspace_one_seed_phase2(seed, train, val_gt, val_rev, test_gt, test_re
     print(f"\n[seed {seed}, PHASE 2] VT epoch 스크리닝(대표 λ={screen_lam}, 전체 {len(vt_all_epochs)}개 중 "
           f"결합 PWGain 상위 {len(vt_topk)}개 채택): {[c['epoch'] for c in vt_topk]}")
 
-    eps = CFG["ACCURACY_EPSILON"]; eps_low = CFG["LOW_CLV_EPSILON"]
+    eps = CFG["ACCURACY_EPSILON"]
     eps_r50 = CFG["RECALL50_EPSILON"]; eps_hr = CFG["HR_EPSILON"]; eps_div = CFG["DIVERSITY_EPSILON"]
     tol = CFG["EPS_TOL"]
 
@@ -1315,12 +1313,12 @@ def run_dualspace_one_seed_phase2(seed, train, val_gt, val_rev, test_gt, test_re
                                      value_model=value_model, val_gt=val_gt, val_rev=val_rev)
 
     def _passes(res):
+        """전체 종합 성과 기준 가드레일만 적용한다(2026-08-01) — 세그먼트별(저CLV) 무손실
+        요구는 뺐다. 사용자가 "결국 보는 것은 저CLV/고CLV 세그먼트가 아니라 전체 종합 성과"
+        라고 명시적으로 방향을 정함 — 이전에는 저CLV Recall/PWGain 완전 무손실을 요구했었다."""
         r = res["overall"][10]["recall"]
-        low_r = res["seg"][10]["저CLV"]["recall"]; low_rev = res["seg"][10]["저CLV"]["revenue"]
         r50 = res["overall"][50]["recall"]; hr10 = res["overall"][10]["hr"]; div10 = res["overall"][10]["diversity"]
         return (r >= base_val_recall * (1 - eps) - tol and
-                low_r >= base_val_low_recall * (1 - eps_low) - tol and
-                low_rev >= base_val_low_revenue * (1 - eps_low) - tol and
                 r50 >= base_val_recall50 * (1 - eps_r50) - tol and
                 hr10 >= base_val_hr10 * (1 - eps_hr) - tol and
                 div10 >= base_val_div10 * (1 - eps_div) - tol)
