@@ -67,50 +67,39 @@ def test_build_user_features_is_pure_clv_frt_aov_prem_clv():
     })
     cfg = dict(ns["CFG"])
     x_val, F_u_full = build_user_features(train, n_users=6, cfg=cfg, is_date=True)
-    assert x_val.shape == (6, 5)  # F/T/R + AOV/Prem — CatShare 없음, CLV_p도 없음(v3에서 폐기)
+    assert x_val.shape == (6, 5)  # F/T/R + AOV/Prem — CatShare 없음, CLV_p도 없음(v3 폐기)
     assert F_u_full.shape == (6,)
     assert ((x_val >= 0) & (x_val <= 1)).all()  # 전부 백분위 스케일
 
 
-def test_item_features_are_price_plus_buyer_clv_profile():
-    """아이템 특징 = 가격 2개 + 구매자 CLV 프로파일 3개, CategoryID one-hot 없음."""
+def test_item_features_are_price_plus_category_onehot():
+    """아이템 특징 = [가격백분위, 카테고리내 가격순위] + CategoryID one-hot(n_cat).
+    구매자 CLV 프로파일(5차원)로 교체하는 안은 2026-08-03 실측 악화로 되돌렸다 —
+    원핫이 CLV와 무관하더라도 아이템 간 구별 정보를 담고 있어 제거 시 표현력이 무너진다."""
     ns = _load_module_upto_cfg()
     pd, np = ns["pd"], ns["np"]
     rng = np.random.default_rng(2)
-    n, n_items = 200, 10
+    n, n_items, n_cat = 200, 10, 4
     train = pd.DataFrame({
         "u_idx": rng.integers(0, 25, n),
         "i_idx": rng.integers(0, n_items, n),
         "t": pd.to_datetime("2020-01-01") + pd.to_timedelta(rng.integers(0, 40, n), unit="D"),
         "v": rng.uniform(5, 200, n).round(2),
-        "cat_idx": rng.integers(0, 4, n),
+        "cat_idx": rng.integers(0, n_cat, n),
     })
-    cfg = dict(ns["CFG"])
-    clv, _ = ns["compute_clv_vhat"](train, 25, cfg, True)
-    x_item = ns["build_item_features"](train, n_items, clv, cfg)
-    assert x_item.shape == (n_items, 5)          # 카테고리 원핫이 있었다면 5+n_cat이 됐을 것
+    x_item = ns["build_item_features"](train, n_items, n_cat)
+    assert x_item.shape == (n_items, 2 + n_cat)
     assert ((x_item >= 0) & (x_item <= 1)).all()
-    assert np.isfinite(x_item).all()             # 구매자 1명 아이템의 std NaN이 새지 않는지
+    assert np.isfinite(x_item).all()
 
 
-def test_item_buyer_stats_use_unique_buyers_and_shrink():
-    """반복구매가 아이템 통계를 지배하지 않아야 하고(고유 구매자), 구매자 적은 아이템은
-    전체 평균 쪽으로 당겨져야 한다(축소추정)."""
+def test_value_feature_version_matches_current_feature_defs():
+    """특징 정의가 v2(유저 5차원 + 아이템 원핫)로 되돌아왔으므로 버전도 2여야 한다 —
+    그래야 지문이 일치해 그 시점 VT 체크포인트를 재사용한다(재학습 회피). 특징 정의를
+    바꾸면 반드시 이 값을 새 번호로 올릴 것."""
     ns = _load_module_upto_cfg()
-    pd, np = ns["pd"], ns["np"]
-    cfg = dict(ns["CFG"]); cfg["ITEM_SHRINKAGE_K"] = 5.0
-    # item 0: 유저 0이 10번 반복구매(고유 구매자 1명) / item 1: 유저 1~10이 1번씩(10명)
-    rows = [(0, 0)] * 10 + [(u, 1) for u in range(1, 11)]
-    extra = [(u, 2) for u in range(1, 11)]
-    train = pd.DataFrame(rows + extra, columns=["u_idx", "i_idx"])
-    train["t"] = pd.to_datetime("2020-01-01") + pd.to_timedelta(np.arange(len(train)) % 30, unit="D")
-    train["v"] = np.linspace(10, 100, len(train))
-    train["cat_idx"] = 0
-    clv, _ = ns["compute_clv_vhat"](train, 11, cfg, True)
-    x_item = ns["build_item_features"](train, 3, clv, cfg)
-    # 고유 구매자 1명인 item 0은 전체 고CLV비중(=LOW_CLV_PCTL)에 10명짜리보다 가까워야 함
-    p_g = cfg["LOW_CLV_PCTL"]
-    assert abs(x_item[0, 4] - p_g) < abs(x_item[1, 4] - p_g) or x_item[1, 4] == x_item[0, 4]
+    assert ns["CFG"]["VALUE_FEATURE_VERSION"] == 2
+    assert "ITEM_SHRINKAGE_K" not in ns["CFG"]  # v4에서만 쓰던 키, 되돌리며 제거됨
 
 
 def test_no_gate_f_or_dampen_functions_remain():

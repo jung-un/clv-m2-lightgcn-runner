@@ -57,7 +57,7 @@ CFG = {
     "SEED_LIST": [42, 43, 44],  # value tower 다중시드 재현성 확인용
 
     # ── 실행 단계 ──
-    "PHASE": 1,                # 1=개념검증(고정 epoch/λ 1회 평가), 2=λ 그리드 본탐색
+    "PHASE": 2,                # 1=개념검증(고정 epoch/λ 1회 평가), 2=λ 그리드 본탐색
     "PHASE1_LAMBDA": 1.0,      # 1단계 고정 λ (epoch은 VT 단독 최고를 씀)
 
     # ── 데이터 필터링/기간 ──
@@ -86,11 +86,6 @@ CFG = {
 
     # ── CLV 파생 변수 ──
     "SHRINKAGE_K": 5.0, "PREMIUM_THR": 0.8,
-    # 아이템 구매자 CLV 통계 전용 축소추정 상수 — 유저쪽 SHRINKAGE_K와 의도적으로 분리.
-    # 유저 k는 '구매 횟수', 아이템 k는 '고유 구매자 수' 스케일이라 같은 값을 쓸 근거가 없고,
-    # 아이템 쪽만 조정해도 유저 CLV 정의(=기존 결과와의 비교 기준)가 안 흔들려야 한다.
-    # 5는 유도값이 아니라 유저쪽과 같은 출발점일 뿐 — 필요하면 이 값만 따로 조정할 것.
-    "ITEM_SHRINKAGE_K": 5.0,
 
     # ── 평가 ──
     "K_LIST": [10, 20, 50], "SELECT_METRIC": "Recall@10",
@@ -100,11 +95,13 @@ CFG = {
     # 아니라 코드 자체의 변경이라 지문에 자동으로 안 잡히므로, VT/시드 캐시가 구버전
     # 체크포인트를 잘못 재사용(차원 불일치 크래시)하거나 결과를 통째로 잘못 재사용(조용한
     # 오류)하는 걸 막으려면 이 값을 수동으로 올려야 한다. v1=CatShare 포함,
-    # v2(2026-08-01)=CatShare 제거·순수 CLV 변수(F/T/R/AOV/Prem) 5차원,
+    # v2(2026-08-01)=CatShare 제거·순수 CLV 변수(F/T/R/AOV/Prem) 5차원 + 아이템은 기존
+    #                (PricePct/WithinCat/CategoryID one-hot) ← 현재값, 지금까지 중 최선,
     # v3(2026-08-01)=CLV_p(=N̂×V̂ 백분위) 추가 6차원 — 실측 악화로 폐기,
-    # v4(2026-08-01)=유저는 v2로 복귀(5차원) + 아이템을 CategoryID one-hot 대신
-    #                구매자 CLV 프로파일(평균/표준편차/고CLV비중)로 교체(20→5차원).
-    "VALUE_FEATURE_VERSION": 4,
+    # v4(2026-08-03)=아이템을 구매자 CLV 프로파일 5차원으로 교체 — 실측 악화로 폐기.
+    # v2로 되돌린 이유로 값도 2로 복원한다: 특징 정의가 그때와 완전히 동일하므로 지문이
+    # 일치해 그 시점 VT 체크포인트를 그대로 재사용한다(재학습 불필요, 결과도 동일 보장).
+    "VALUE_FEATURE_VERSION": 2,
     "CLV_GATE_POWER": 2.0,     # gate(u)=percentile_rank(CLV_u)**power. power=1이면 저CLV(하위
                                # 20%)도 gate가 최대 0.2까지 나와 LOW_CLV_EPSILON=0.0 가드레일을
                                # 거의 항상 위반한다(2026-07-31 실측). power>1로 저CLV를 더 세게
@@ -162,7 +159,7 @@ def vt_fingerprint(cfg, dcfg, seed):
     keys = ["MIN_USER_INTER", "MIN_ITEM_INTER", "SHRINKAGE_K", "PREMIUM_THR",
             "BATCH_SIZE", "LR", "HARD_NEG_RATIO", "D_VALUE", "MLP_HIDDEN",
             "VT_MAX_EPOCHS", "VT_PATIENCE", "WINDOW_DAYS", "VAL_DAYS", "TEST_DAYS",
-            "VALUE_FEATURE_VERSION", "ITEM_SHRINKAGE_K", "LOW_CLV_PCTL"]
+            "VALUE_FEATURE_VERSION"]
     payload = {k: cfg[k] for k in keys}
     payload.update(category_col=dcfg["category_col"], seed=seed)
     s = json.dumps(payload, sort_keys=True, default=str)
@@ -412,23 +409,17 @@ def build_user_features(train, n_users, cfg, is_date):
     return x_val_u.astype(np.float32), F_u_full
 
 
-def build_item_features(train, n_items, user_clv, cfg):
-    """z^value 아이템 입력 = 가격축 2개 + "이 상품을 사는 고객층의 CLV 프로파일" 3개, 5차원.
+def build_item_features(train, n_items, n_cat):
+    """z^value 아이템 입력 = [가격백분위, 카테고리내 가격순위, CategoryID one-hot(n_cat)].
 
-    CategoryID one-hot(2026-08-01 제거)은 CLV와 무관한 카테고리 선호를 아이템 임베딩에
-    직접 넣는 것이라, 유저 쪽 CatShare를 뺀 것과 같은 논리로 배제했다. 카테고리는
-    within_category_price_pct 계산에만 쓰인다(가격의 상대적 프리미엄 수준을 재기 위함).
-
-    아이템 자체는 CLV를 갖지 않는다(CLV는 유저 단위 지표) — 그래서 "구매자 CLV 프로파일"
-    또는 "CLV 친화도"로 표현한다. 이러면 유저·아이템이 같은 CLV 언어로 표현되어 내적이
-    "이 가치수준의 고객이 선호하는 상품인가"를 직접 재게 된다.
-
-    희소 아이템 보정: 구매자가 1명뿐인 상품은 평균=그 1명의 CLV, 비중=0 또는 1로 극단화돼
-    "모든 고CLV 유저에게 최적인 상품"처럼 보이는 가짜 신호를 만든다. 유저 쪽 AOV/Prem과
-    동일한 축소추정을 적용하되, 상수는 ITEM_SHRINKAGE_K로 분리했다 — 유저 k는 '구매 횟수',
-    아이템 k는 '고유 구매자 수' 스케일이라 같은 값을 쓸 근거가 없고, 한쪽 조정이 다른 쪽
-    CLV 정의를 오염시키면 안 되기 때문이다."""
-    k = cfg["ITEM_SHRINKAGE_K"]
+    2026-08-03: 이 CategoryID one-hot을 "구매자 CLV 프로파일"(평균/표준편차/고CLV비중,
+    축소추정 적용) 3개로 교체해 20→5차원으로 줄이는 안을 시도했다가 되돌렸다. 논문 주제상
+    카테고리 원핫이 CLV와 무관하다는 문제의식은 여전히 타당하지만, 실측에서 전 지표가
+    악화됐다 — Recall +0.98%→~0%, PWGain +5.87%→~+0.5%, 가치정렬도 +30.0%→+15.1%,
+    PWGain 유의 시드도 3/3→1/3. VT가 epoch 2~5에서 조기종료한 걸 보면, 원핫이 CLV와는
+    무관해도 34,254개 아이템을 서로 구별하는 역할은 하고 있었고, 5개 숫자만으로는 가격대·
+    구매자CLV가 비슷한 상품 수천 개가 사실상 구별 불가능해진 것으로 보인다.
+    (같은 실패 패턴: 표현력 축소 → 조기수렴 → 성능 하락. CLV 스칼라 추가 때와 동일.)"""
     g = train.groupby("i_idx").agg(med=("v", "median"))
     price_pct = np.full(n_items, 0.5, np.float32)
     price_pct[g.index.values] = g["med"].rank(pct=True).to_numpy(np.float32)
@@ -439,34 +430,11 @@ def build_item_features(train, n_items, user_clv, cfg):
     for c, sub in joined.groupby("cat_idx"):
         within_pct[sub.index.values] = sub["med"].rank(pct=True).to_numpy(np.float32)
 
-    # 고유 구매자 기준 — 거래 행을 그대로 쓰면 반복구매가 많은(=F 높은) 고객의 CLV가
-    # 여러 번 반영돼, 유저 쪽에서 이미 센 F 효과가 아이템 쪽에서 중복 계상된다.
-    pairs = train[["u_idx", "i_idx"]].drop_duplicates().copy()
-    clv_series = pd.Series(user_clv)                       # NaN=train 거래 없는 유저
-    pairs["clv"] = pairs["u_idx"].map(clv_series)
-    pairs = pairs[pairs["clv"].notna()]
-    hi_th = pairs["clv"].quantile(1 - cfg["LOW_CLV_PCTL"])  # 고CLV 임계값(상위 20%)
-    pairs["is_hi"] = (pairs["clv"] >= hi_th).astype("float64")
+    cat_onehot = np.zeros((n_items, n_cat), np.float32)
+    cat_onehot[cat_of_item.index.values, cat_of_item.values] = 1.0
 
-    gi = pairs.groupby("i_idx")["clv"].agg(n="count", mean="mean", std=lambda s: s.std(ddof=0))
-    gi["hi"] = pairs.groupby("i_idx")["is_hi"].sum()
-    gi["std"] = gi["std"].fillna(0.0)                       # 구매자 1명 → 편차 관측 불가
-    mu_g, sd_g = pairs["clv"].mean(), gi["std"].mean()
-    p_g = cfg["LOW_CLV_PCTL"]                               # 전체 고CLV 비중 = 정의상 0.2
-
-    mean_s = (gi["n"] * gi["mean"] + k * mu_g) / (gi["n"] + k)
-    std_s  = (gi["n"] * gi["std"]  + k * sd_g) / (gi["n"] + k)
-    hi_s   = (gi["hi"]             + k * p_g)  / (gi["n"] + k)
-
-    buyer_mean = np.full(n_items, 0.5, np.float32); buyer_std = np.full(n_items, 0.5, np.float32)
-    buyer_hi = np.full(n_items, p_g, np.float32)
-    buyer_mean[gi.index.values] = mean_s.rank(pct=True).to_numpy(np.float32)
-    buyer_std[gi.index.values] = std_s.rank(pct=True).to_numpy(np.float32)
-    buyer_hi[gi.index.values] = hi_s.to_numpy(np.float32)    # 이미 0~1 비율
-
-    x_item = np.concatenate([price_pct[:, None], within_pct[:, None], buyer_mean[:, None],
-                              buyer_std[:, None], buyer_hi[:, None]], axis=1)
-    print(f"  아이템 특징: val(PricePct,WithinCat + 구매자CLV 평균/표준편차/고CLV비중) {x_item.shape}")
+    x_item = np.concatenate([price_pct[:, None], within_pct[:, None], cat_onehot], axis=1)
+    print(f"  아이템 특징: val(PricePct,WithinCat+CategoryID{n_cat}) {x_item.shape}")
     return x_item.astype(np.float32)
 
 
@@ -1248,7 +1216,7 @@ def run_dualspace_one_seed_phase1(seed, train, val_gt, val_rev, test_gt, test_re
     phase2와 동일 — 생략하는 건 여러 epoch·λ 조합을 비교하는 그리드 탐색뿐이다."""
     set_seed(seed)
     x_val_u, F_u = build_user_features(train, n_users, CFG, DCFG["is_date"])
-    x_val_i = build_item_features(train, n_items, user_meta["clv"], CFG)
+    x_val_i = build_item_features(train, n_items, n_cat)
 
     vt_ckpt = Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['MODEL_LABEL']}_vt_{CFG['DATASET']}_s{seed}_{vt_fingerprint(CFG, DCFG, seed)}.pt"
     value_model, vt_best_ep, vt_best_val, vt_all_epochs = train_value_tower(
@@ -1318,7 +1286,7 @@ def run_dualspace_one_seed_phase2(seed, train, val_gt, val_rev, test_gt, test_re
     확인된 뒤에만 CFG["PHASE"]=2로 명시 전환해서 쓴다(자동 트리거 아님)."""
     set_seed(seed)
     x_val_u, F_u = build_user_features(train, n_users, CFG, DCFG["is_date"])
-    x_val_i = build_item_features(train, n_items, user_meta["clv"], CFG)
+    x_val_i = build_item_features(train, n_items, n_cat)
 
     vt_ckpt = Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['MODEL_LABEL']}_vt_{CFG['DATASET']}_s{seed}_{vt_fingerprint(CFG, DCFG, seed)}.pt"
     value_model, vt_best_ep, vt_best_val, vt_all_epochs = train_value_tower(
