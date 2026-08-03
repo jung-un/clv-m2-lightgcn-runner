@@ -52,24 +52,80 @@ def test_compute_clv_gate_power_suppresses_low_percentile_more_than_high():
     assert g2[0] < g1[0]  # power>1이면 저CLV gate는 줄어듦
 
 
-def test_build_user_features_is_pure_clv_frt_aov_prem_clv():
-    ns = _load_module_upto_cfg()
-    pd, np = ns["pd"], ns["np"]
-    build_user_features = ns["build_user_features"]
-    rng = np.random.default_rng(0)
-    n = 30
-    train = pd.DataFrame({
+def _toy_train(pd, np, seed=0, n=30, with_basket=False):
+    rng = np.random.default_rng(seed)
+    df = pd.DataFrame({
         "u_idx": rng.integers(0, 6, n),
         "i_idx": rng.integers(0, 5, n),
         "t": pd.to_datetime("2020-01-01") + pd.to_timedelta(rng.integers(0, 30, n), unit="D"),
         "v": rng.uniform(10, 100, n).round(2),
         "cat_idx": rng.integers(0, 3, n),
     })
-    cfg = dict(ns["CFG"])
-    x_val, F_u_full = build_user_features(train, n_users=6, cfg=cfg, is_date=True)
+    df["up"] = df["v"]
+    if with_basket:
+        df["b_raw"] = rng.integers(0, 8, n)
+    return df
+
+
+def test_build_user_features_is_pure_clv_frt_aov_prem_clv():
+    ns = _load_module_upto_cfg()
+    pd, np = ns["pd"], ns["np"]
+    train = _toy_train(pd, np)
+    x_val = ns["build_user_features"](train, n_users=6, cfg=dict(ns["CFG"]), is_date=True)
     assert x_val.shape == (6, 5)  # F/T/R + AOV/Prem — CatShare 없음, CLV_p도 없음(v3 폐기)
-    assert F_u_full.shape == (6,)
     assert ((x_val >= 0) & (x_val <= 1)).all()  # 전부 백분위 스케일
+
+
+def test_F_counts_baskets_not_line_items():
+    """F는 "구매 횟수"여야 한다 — 한 장바구니에서 상품 3개를 사면 F=1이지 3이 아니다.
+    Dunnhumby는 한 행이 BASKET_ID×PRODUCT_ID 라인이라 행 수를 세면 F가 9배 넘게 부풀고,
+    AOV도 "1회 구매당 금액"이 아니라 "상품 라인당 금액"이 된다(2026-08-03 수정)."""
+    ns = _load_module_upto_cfg()
+    pd = ns["pd"]
+    # 유저0: 장바구니 1개에 상품 3라인(총 60) / 유저1: 장바구니 3개에 각 1라인(각 20)
+    train = pd.DataFrame({
+        "u_idx":  [0, 0, 0, 1, 1, 1],
+        "i_idx":  [0, 1, 2, 0, 1, 2],
+        "b_raw":  [7, 7, 7, 1, 2, 3],
+        "t":      [0, 0, 0, 0, 5, 9],
+        "v":      [20.0, 20.0, 20.0, 20.0, 20.0, 20.0],
+        "up":     [20.0, 20.0, 20.0, 20.0, 20.0, 20.0],
+    })
+    g = ns["_user_pct_stats"](train, dict(ns["CFG"]), is_date=False)
+    assert g.loc[0, "F"] == 1 and g.loc[1, "F"] == 3     # 라인 수(3,3)가 아니어야 함
+    assert g.loc[0, "AOV_raw"] == 60.0                   # 장바구니 합계 (라인 평균 20이 아님)
+    assert g.loc[1, "AOV_raw"] == 20.0
+    assert g.loc[0, "n_line"] == 3 and g.loc[1, "n_line"] == 3  # Prem 축소추정 분모는 라인 수
+
+
+def test_no_basket_col_falls_back_to_user_day():
+    """H&M은 주문 ID가 없으므로 (고객, 날짜)를 구매 1건으로 본다."""
+    ns = _load_module_upto_cfg()
+    pd = ns["pd"]
+    train = pd.DataFrame({           # 유저0: 같은 날 2라인 + 다른 날 1라인 → F=2
+        "u_idx": [0, 0, 0],
+        "i_idx": [0, 1, 2],
+        "t": [3, 3, 8],
+        "v": [10.0, 30.0, 50.0],
+        "up": [10.0, 30.0, 50.0],
+    })
+    g = ns["_user_pct_stats"](train, dict(ns["CFG"]), is_date=False)
+    assert g.loc[0, "F"] == 2
+    assert g.loc[0, "AOV_raw"] == 45.0   # (40 + 50) / 2
+
+
+def test_unit_price_divides_by_quantity():
+    """단가 up = 라인금액 / 수량. 수량 0 이하(쿠폰 정산행 등)는 1로 간주."""
+    ns = _load_module_upto_cfg()
+    pd, np = ns["pd"], ns["np"]
+    dcfg = dict(ns["SCHEMA"]["dunnhumby"])
+    q = dcfg["qty_col"]
+    tx = pd.DataFrame({"v": [10.0, 10.0, 10.0], q: [1, 5, 0]})
+    up = (tx["v"] / tx[q].clip(lower=1)).astype(np.float32)
+    np.testing.assert_allclose(up.values, [10.0, 2.0, 10.0])
+    assert ns["SCHEMA"]["hm"]["qty_col"] is None      # H&M price는 이미 단가
+    assert ns["SCHEMA"]["hm"]["basket_col"] is None
+    assert dcfg["basket_col"] == "BASKET_ID"
 
 
 def test_item_features_are_price_plus_category_onehot():
@@ -78,15 +134,8 @@ def test_item_features_are_price_plus_category_onehot():
     원핫이 CLV와 무관하더라도 아이템 간 구별 정보를 담고 있어 제거 시 표현력이 무너진다."""
     ns = _load_module_upto_cfg()
     pd, np = ns["pd"], ns["np"]
-    rng = np.random.default_rng(2)
-    n, n_items, n_cat = 200, 10, 4
-    train = pd.DataFrame({
-        "u_idx": rng.integers(0, 25, n),
-        "i_idx": rng.integers(0, n_items, n),
-        "t": pd.to_datetime("2020-01-01") + pd.to_timedelta(rng.integers(0, 40, n), unit="D"),
-        "v": rng.uniform(5, 200, n).round(2),
-        "cat_idx": rng.integers(0, n_cat, n),
-    })
+    n_items, n_cat = 10, 4
+    train = _toy_train(pd, np, seed=2, n=200)
     x_item = ns["build_item_features"](train, n_items, n_cat)
     assert x_item.shape == (n_items, 2 + n_cat)
     assert ((x_item >= 0) & (x_item <= 1)).all()
@@ -94,11 +143,11 @@ def test_item_features_are_price_plus_category_onehot():
 
 
 def test_value_feature_version_matches_current_feature_defs():
-    """특징 정의가 v2(유저 5차원 + 아이템 원핫)로 되돌아왔으므로 버전도 2여야 한다 —
-    그래야 지문이 일치해 그 시점 VT 체크포인트를 재사용한다(재학습 회피). 특징 정의를
-    바꾸면 반드시 이 값을 새 번호로 올릴 것."""
+    """2026-08-03에 F/AOV를 구매 건 단위로, Prem·아이템가격을 단가 기준으로 재정의했다.
+    차원이 v2와 같아 크래시로 드러나지 않으므로(=옛 체크포인트를 조용히 재사용할 위험)
+    반드시 새 번호(5)여야 한다. 특징 정의를 바꾸면 매번 이 값을 올릴 것."""
     ns = _load_module_upto_cfg()
-    assert ns["CFG"]["VALUE_FEATURE_VERSION"] == 2
+    assert ns["CFG"]["VALUE_FEATURE_VERSION"] == 5
     assert "ITEM_SHRINKAGE_K" not in ns["CFG"]  # v4에서만 쓰던 키, 되돌리며 제거됨
 
 

@@ -32,6 +32,10 @@ SCHEMA = {
         "user_col": "customer_id", "item_col": "article_id",
         "time_col": "t_dat", "value_col": "price",
         "item_key_col": "article_id", "category_col": "product_group_name",
+        # basket_col=None → "구매 1건"을 (고객, 날짜)로 본다. H&M 원본에 주문 식별자가 없고
+        # 시간 해상도가 날짜(t_dat)뿐이라 같은 날 구매를 한 건으로 묶는 게 최선의 근사.
+        # qty_col=None → price가 이미 상품 1개당 단가라 나눌 수량이 없다.
+        "basket_col": None, "qty_col": None,
         "is_date": True,
     },
     "dunnhumby": {
@@ -42,6 +46,10 @@ SCHEMA = {
         "user_col": "household_key", "item_col": "PRODUCT_ID",
         "time_col": "DAY", "value_col": "SALES_VALUE",
         "item_key_col": "PRODUCT_ID", "category_col": "COMMODITY_DESC",
+        # 한 행 = BASKET_ID × PRODUCT_ID 구매 라인. 실측상 라인이 장바구니보다 약 9.4배 많아
+        # 행 수를 그대로 세면 F가 "구매 횟수"가 아니라 "상품 종류 수"가 된다 → BASKET_ID로 묶는다.
+        # QUANTITY!=1인 행이 약 21%라 SALES_VALUE는 단가가 아니다 → 단가는 QUANTITY로 나눈다.
+        "basket_col": "BASKET_ID", "qty_col": "QUANTITY",
         "is_date": False,
     },
 }
@@ -96,12 +104,13 @@ CFG = {
     # 체크포인트를 잘못 재사용(차원 불일치 크래시)하거나 결과를 통째로 잘못 재사용(조용한
     # 오류)하는 걸 막으려면 이 값을 수동으로 올려야 한다. v1=CatShare 포함,
     # v2(2026-08-01)=CatShare 제거·순수 CLV 변수(F/T/R/AOV/Prem) 5차원 + 아이템은 기존
-    #                (PricePct/WithinCat/CategoryID one-hot) ← 현재값, 지금까지 중 최선,
+    #                (PricePct/WithinCat/CategoryID one-hot),
     # v3(2026-08-01)=CLV_p(=N̂×V̂ 백분위) 추가 6차원 — 실측 악화로 폐기,
-    # v4(2026-08-03)=아이템을 구매자 CLV 프로파일 5차원으로 교체 — 실측 악화로 폐기.
-    # v2로 되돌린 이유로 값도 2로 복원한다: 특징 정의가 그때와 완전히 동일하므로 지문이
-    # 일치해 그 시점 VT 체크포인트를 그대로 재사용한다(재학습 불필요, 결과도 동일 보장).
-    "VALUE_FEATURE_VERSION": 2,
+    # v4(2026-08-03)=아이템을 구매자 CLV 프로파일 5차원으로 교체 — 실측 악화로 폐기,
+    # v5(2026-08-03)=차원은 v2와 같으나 F/AOV를 구매 건(장바구니) 단위로, Prem·아이템
+    #                가격을 단가(up) 기준으로 재정의 ← 현재값. 차원이 안 바뀌어 크래시로
+    #                드러나지 않으므로(=조용한 오류 위험) 반드시 새 번호를 써야 한다.
+    "VALUE_FEATURE_VERSION": 5,
     "CLV_GATE_POWER": 2.0,     # gate(u)=percentile_rank(CLV_u)**power. power=1이면 저CLV(하위
                                # 20%)도 gate가 최대 0.2까지 나와 LOW_CLV_EPSILON=0.0 가드레일을
                                # 거의 항상 위반한다(2026-07-31 실측). power>1로 저CLV를 더 세게
@@ -199,14 +208,29 @@ CFG["RUN_TAG"] = f"M1_{CFG['DATASET']}_s{CFG['SEED']}_{cfg_fingerprint(CFG, DCFG
 
 
 def load_transactions(dcfg):
+    """원본 거래 로드 + 파생 컬럼 2개.
+
+    - `b_raw`: 구매 건(장바구니) 식별자. 데이터셋에 주문 ID가 있으면 그걸 쓰고, 없으면
+      이 컬럼을 만들지 않는다(= 이후 (u_idx, t)로 묶음). CLV의 F/AOV가 "몇 번 샀나 /
+      한 번에 얼마 썼나"를 뜻하려면 반드시 이 단위로 세야 한다.
+    - `up`: 상품 1개당 단가 = 라인 금액 / 수량. 고가구매 성향(Prem)과 아이템 가격대를
+      라인 금액으로 재면 "싼 물건을 많이 산 것"이 "비싼 물건을 산 것"으로 오인된다.
+      수량이 0 이하인 행(쿠폰 정산 등)은 1로 간주한다."""
     tx = pd.read_parquet(dcfg["tx_path"]) if dcfg["tx_path"].endswith(".parquet") else pd.read_csv(dcfg["tx_path"])
-    tx = tx.rename(columns={dcfg["user_col"]: "u_raw", dcfg["item_col"]: "i_raw",
-                             dcfg["time_col"]: "t", dcfg["value_col"]: "v"})
+    ren = {dcfg["user_col"]: "u_raw", dcfg["item_col"]: "i_raw",
+           dcfg["time_col"]: "t", dcfg["value_col"]: "v"}
+    if dcfg["basket_col"]:
+        ren[dcfg["basket_col"]] = "b_raw"
+    tx = tx.rename(columns=ren)
     if dcfg["is_date"]:
         tx["t"] = pd.to_datetime(tx["t"])
         tx["i_raw"] = tx["i_raw"].astype(str)
     tx = tx.drop_duplicates()
-    print(f"원본 {len(tx):,}건 (완전중복 제거 완료)")
+
+    q = dcfg["qty_col"]
+    tx["up"] = (tx["v"] / tx[q].clip(lower=1) if q else tx["v"]).astype(np.float32)
+    unit = "BASKET_ID" if dcfg["basket_col"] else "(고객,날짜)"
+    print(f"원본 {len(tx):,}건 (완전중복 제거 완료) | 구매 1건 단위={unit} | 단가=금액/{q or 1}")
     return tx
 
 
@@ -343,19 +367,37 @@ def prepare_data(cfg, dcfg):
 
 
 def _user_pct_stats(train, cfg, is_date):
-    """유저별 F(구매횟수)/T(활동기간)/R(최근성)/AOV/Prem 원시값 + 백분위 순위.
-    build_user_features()와 compute_clv_vhat()가 거의 동일한 계산을 각자 중복 수행하던 걸
-    공용 헬퍼로 통합함(ponytail-review 지적) — 수식은 원래 코드와 완전히 동일, 계산 위치만 합침."""
+    """유저별 F(구매 횟수)/T(활동기간)/R(최근성)/AOV(1회 구매당 평균금액)/Prem(고가구매 성향)
+    원시값 + 백분위 순위. build_user_features()와 compute_clv_vhat()의 공용 헬퍼.
+
+    2026-08-03 수정 — 구매 "횟수"의 단위를 상품 라인이 아니라 **구매 건(장바구니)**으로
+    바로잡았다. 이전에는 `F=("v","count")`, `AOV_raw=("v","mean")`으로 **행 수**를 셌는데,
+    Dunnhumby의 한 행은 BASKET_ID × PRODUCT_ID 라인이라 그러면
+      - F = 반복 구매 횟수가 아니라 구매한 상품 라인 수 (실측상 라인이 장바구니의 약 9.4배)
+      - AOV = 1회 구매당 금액이 아니라 상품 라인당 금액
+    이 되어 논문의 CLV 변수 정의(Berger&Nasr, Fader et al.의 거래 단위 F)와 어긋난다.
+    H&M도 한 행이 "구매한 상품 1개"라 같은 문제가 있었으므로 두 데이터셋을 함께 고쳤다 —
+    주문 ID가 있으면 그 단위(Dunnhumby=BASKET_ID), 없으면 (고객, 날짜) 단위(H&M).
+
+    Prem도 라인 금액(v)이 아니라 **단가(up)** 기준으로 바꿨다. Dunnhumby는 약 21%의 행이
+    QUANTITY≠1이라, 라인 금액으로 재면 싼 물건을 대량으로 산 것이 고가 구매로 오인된다."""
     win_end = train["t"].max()
     span = win_end - train["t"].min()
     win_days = max((span.days if is_date else span), 1)
-    prem_flag = (train["v"].rank(pct=True) > cfg["PREMIUM_THR"]).astype("int8")
     k = cfg["SHRINKAGE_K"]
 
-    g = train.assign(_prem=prem_flag).groupby("u_idx").agg(
-        F=("v", "count"), first=("t", "min"), last=("t", "max"),
-        AOV_raw=("v", "mean"), prem=("_prem", "sum"))
-    glob_aov = train["v"].mean(); glob_prem = prem_flag.mean()
+    # ── 구매 건 단위 집계: F(건수), AOV(건당 평균금액), 활동 시점 ──
+    bkeys = ["u_idx", "b_raw"] if "b_raw" in train.columns else ["u_idx", "t"]
+    basket = train.groupby(bkeys, sort=False).agg(bval=("v", "sum"), btime=("t", "max"))
+    gb = basket.groupby(level="u_idx", sort=False)
+    g = pd.DataFrame({"F": gb.size(), "first": gb["btime"].min(),
+                      "last": gb["btime"].max(), "AOV_raw": gb["bval"].mean()})
+
+    # ── 라인 단위 집계: Prem(고가 단가 상품을 산 라인의 비율) ──
+    prem_flag = (train["up"].rank(pct=True) > cfg["PREMIUM_THR"]).astype("int8")
+    g = g.join(train.assign(_prem=prem_flag).groupby("u_idx")["_prem"]
+               .agg(prem="sum", n_line="count"))
+    glob_aov = basket["bval"].mean(); glob_prem = prem_flag.mean()
 
     if is_date:
         T = (g["last"] - g["first"]).dt.days
@@ -365,8 +407,11 @@ def _user_pct_stats(train, cfg, is_date):
         R = 1 - ((win_end - g["last"]) / win_days)
 
     g["F_p"], g["T_p"], g["R_p"] = g["F"].rank(pct=True), T.rank(pct=True), R.rank(pct=True)
+    # 축소추정 분모는 그 통계량의 표본 수여야 한다 — AOV는 "건당 평균"이라 건수(F),
+    # Prem은 "라인 중 고가 비율"이라 라인 수(n_line). 예전엔 F가 곧 라인 수라 같았지만
+    # 이제 둘이 다르므로 구분해서 쓴다(안 그러면 Prem이 과하게 전역평균으로 끌려간다).
     AOV = (g.F * g.AOV_raw + k * glob_aov) / (g.F + k)
-    Prem = (g.prem + k * glob_prem) / (g.F + k)
+    Prem = (g.prem + k * glob_prem) / (g.n_line + k)
     g["AOV_p"], g["Prem_p"] = AOV.rank(pct=True), Prem.rank(pct=True)
 
     # CLV = N̂ × V̂ (반복거래강도 × 가치성향). raw는 compute_clv_vhat()의 게이트/세그먼트용,
@@ -403,10 +448,8 @@ def build_user_features(train, n_users, cfg, is_date):
     prem_full[g.index.values] = g["Prem_p"].values.astype(np.float32)
 
     x_val_u = np.concatenate([ftr_full, aov_full[:, None], prem_full[:, None]], axis=1)
-    F_u_full = np.zeros(n_users, dtype=np.int64)
-    F_u_full[g.index.values] = g["F"].values
     print(f"  유저 특징: val(F,T,R,AOV,Prem — 순수 CLV 변수) {x_val_u.shape}")
-    return x_val_u.astype(np.float32), F_u_full
+    return x_val_u.astype(np.float32)
 
 
 def build_item_features(train, n_items, n_cat):
@@ -420,7 +463,8 @@ def build_item_features(train, n_items, n_cat):
     무관해도 34,254개 아이템을 서로 구별하는 역할은 하고 있었고, 5개 숫자만으로는 가격대·
     구매자CLV가 비슷한 상품 수천 개가 사실상 구별 불가능해진 것으로 보인다.
     (같은 실패 패턴: 표현력 축소 → 조기수렴 → 성능 하락. CLV 스칼라 추가 때와 동일.)"""
-    g = train.groupby("i_idx").agg(med=("v", "median"))
+    # 가격은 라인 금액(v)이 아니라 단가(up) 기준 — 수량이 섞이면 "대량구매"가 "고가상품"이 된다.
+    g = train.groupby("i_idx").agg(med=("up", "median"))
     price_pct = np.full(n_items, 0.5, np.float32)
     price_pct[g.index.values] = g["med"].rank(pct=True).to_numpy(np.float32)
 
@@ -441,7 +485,7 @@ def build_item_features(train, n_items, n_cat):
 def build_item_meta(train, n_items):
     pop = np.bincount(train["i_idx"].values.astype(np.int64), minlength=n_items).astype(np.float64)
     pop_prob = pop / max(pop.sum(), 1.0)
-    med = train.groupby("i_idx")["v"].median()
+    med = train.groupby("i_idx")["up"].median()   # 단가 기준(build_item_features와 동일 정의)
     price_pct = np.full(n_items, 0.5, np.float64)
     price_pct[med.index.values] = med.rank(pct=True).values
     cat = np.full(n_items, -1, np.int64)
@@ -1215,7 +1259,7 @@ def run_dualspace_one_seed_phase1(seed, train, val_gt, val_rev, test_gt, test_re
     결합해 baseline(λ=0)과 비교한다. 지표 계산 깊이(세그먼트별+bootstrap CI)는
     phase2와 동일 — 생략하는 건 여러 epoch·λ 조합을 비교하는 그리드 탐색뿐이다."""
     set_seed(seed)
-    x_val_u, F_u = build_user_features(train, n_users, CFG, DCFG["is_date"])
+    x_val_u = build_user_features(train, n_users, CFG, DCFG["is_date"])
     x_val_i = build_item_features(train, n_items, n_cat)
 
     vt_ckpt = Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['MODEL_LABEL']}_vt_{CFG['DATASET']}_s{seed}_{vt_fingerprint(CFG, DCFG, seed)}.pt"
@@ -1285,7 +1329,7 @@ def run_dualspace_one_seed_phase2(seed, train, val_gt, val_rev, test_gt, test_re
     validation에서 최적 (epoch, λ)를 고르고 test에서 1회 평가한다. phase1에서 개선이
     확인된 뒤에만 CFG["PHASE"]=2로 명시 전환해서 쓴다(자동 트리거 아님)."""
     set_seed(seed)
-    x_val_u, F_u = build_user_features(train, n_users, CFG, DCFG["is_date"])
+    x_val_u = build_user_features(train, n_users, CFG, DCFG["is_date"])
     x_val_i = build_item_features(train, n_items, n_cat)
 
     vt_ckpt = Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['MODEL_LABEL']}_vt_{CFG['DATASET']}_s{seed}_{vt_fingerprint(CFG, DCFG, seed)}.pt"
