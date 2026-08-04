@@ -73,6 +73,9 @@ CFG = {
     # 정렬도 3개만 저장돼서 나머지(Precision/NDCG/MAP/V-NDCG/Novelty/Coverage/Gini/@20/@50)를
     # 확인할 방법이 없었기 때문에 만든 경로다.
     "BASELINE_ONLY": True,
+    # True면 기존 grid_partial_*.pt에서 전체 지표 요약 json만 다시 쓰고 끝낸다(계산 없음).
+    # M1/VT/그리드 모두 안 건드리므로 GPU 런타임도 필요 없다.
+    "REGEN_GRID_SUMMARY": False,
     # True면 기존 M1 체크포인트가 있어도 무시하고 처음부터 다시 학습한다. 평소에는 지문이
     # 같으면 재사용하는 게 맞지만, "이 체크포인트가 정말 이 설정으로 학습된 게 맞나"를
     # 확인하려면 강제 재학습이 필요하다(Drive에서 .pt를 직접 지울 수단이 없어 플래그로 둠).
@@ -1222,6 +1225,63 @@ def bootstrap_spearman_diff_ci(vhat_arr, arp_a, arp_b, n_boot=2000, seed=0):
     return float(observed), float(lo), float(hi)
 
 
+def _flatten_metrics(res):
+    """evaluate_combined() 결과(중첩 dict)를 한 줄짜리 평탄한 dict으로 편다.
+    열 이름 규칙: recall@10 / coverage@50 / 고CLV_revenue@10 / value_alignment."""
+    out = {}
+    for k, mets in res["overall"].items():
+        for m, v in mets.items():
+            out[f"{m}@{k}"] = v
+    for name in ("coverage", "gini"):
+        for k, v in res[name].items():
+            out[f"{name}@{k}"] = v
+    out["value_alignment"] = res["value_alignment_spearman"]
+    for k, segs in res["seg"].items():
+        for sg, mets in segs.items():
+            for m, v in mets.items():
+                out[f"{sg}_{m}@{k}"] = v
+    return out
+
+
+def write_grid_summary(grid_results, grid_path):
+    """(epoch, λ)별 val 지표를 사람이 읽을 수 있는 json으로 남긴다(.pt는 텍스트로 못 읽음).
+
+    2026-08-04: 예전에는 Recall@10/@50, PWGain@10, HR@10, Diversity@10 + 세그먼트 4개,
+    총 9개 필드만 남겼다. 그래서 λ가 Precision/NDCG/MAP/V-NDCG/Novelty/평균가격백분위/
+    Coverage/Gini와 @20에 무슨 짓을 하는지 볼 방법이 아예 없었다. grid_results에는
+    evaluate_combined()의 결과가 통째로 들어있으므로 그냥 전부 내보낸다 —
+    지표를 더 계산하는 게 아니라 이미 계산된 걸 안 버리는 것뿐이라 비용이 0이다."""
+    rows = [{"epoch": ep, "lambda": lam, **res} for (ep, lam), res in sorted(grid_results.items())]
+    summary_path = Path(str(grid_path).replace(".pt", "_summary.json"))
+    with open(summary_path, "w") as f:
+        json.dump(rows, f, indent=2, ensure_ascii=False, default=float)
+
+    # json은 중첩 구조라 눈으로 λ끼리 비교하기 불편하다. 같은 내용을 한 줄=한 조합으로
+    # 평탄화한 csv도 같이 남긴다(스프레드시트/판다스로 바로 정렬·비교 가능).
+    flat = [{"epoch": ep, "lambda": lam, **_flatten_metrics(res)}
+            for (ep, lam), res in sorted(grid_results.items())]
+    csv_path = Path(str(grid_path).replace(".pt", "_summary.csv"))
+    pd.DataFrame(flat).to_csv(csv_path, index=False, float_format="%.6f")
+    print(f"  [Stage B] 그리드 {len(rows)}개 조합 × 전체 지표 → {summary_path.name} / "
+          f"{csv_path.name} ({len(flat[0])}개 열)")
+    return rows
+
+
+def regen_grid_summaries():
+    """이미 저장된 grid_partial_*.pt에서 전체 지표 요약 json만 다시 쓴다. 모델도 데이터도
+    안 건드리고 파일만 변환하므로 GPU 없이 몇 초면 끝난다 — 요약이 9개 필드로 좁던
+    시절에 만들어진 기존 실험 결과를 재실행 없이 되살리기 위한 경로다."""
+    paths = sorted(Path(CFG["OUT_DIR"]).glob(f"grid_partial_*{CFG['DATASET']}*.pt"))
+    if not paths:
+        print(f"[regen] {CFG['OUT_DIR']}에 grid_partial_*{CFG['DATASET']}*.pt 없음 — 할 일 없음")
+        return []
+    for p in paths:
+        saved = torch.load(p, weights_only=False)
+        rows = write_grid_summary(saved["grid_results"], p)
+        print(f"[regen] {p.name}: {len(rows)}개 조합")
+    return paths
+
+
 def run_stage_b_grid(vt_topk, cfg, grid_path, gate_arr, base_val_res, _eval,
                       value_model=None, val_gt=None, val_rev=None):
     """(epoch × λ) 그리드를 계산한다. v1과 달리 dampen 차원이 없다 — gate(u)가
@@ -1259,20 +1319,7 @@ def run_stage_b_grid(vt_topk, cfg, grid_path, gate_arr, base_val_res, _eval,
 
     # 캐시에서 재개해 아무것도 새로 안 돌려도, 사람이 (epoch,λ)별 val 지표를 직접
     # 비교할 수 있도록 읽기 쉬운 요약을 항상 남긴다(.pt는 텍스트로 못 읽음).
-    summary_rows = []
-    for (ep_id, lam), res in sorted(grid_results.items()):
-        o10, o50, seg10 = res["overall"][10], res["overall"][50], res["seg"][10]
-        summary_rows.append({
-            "epoch": ep_id, "lambda": lam,
-            "val_recall10": o10["recall"], "val_recall50": o50["recall"],
-            "val_pwgain10": o10["revenue"], "val_hr10": o10["hr"], "val_diversity10": o10["diversity"],
-            "저CLV_recall10": seg10["저CLV"]["recall"], "저CLV_pwgain10": seg10["저CLV"]["revenue"],
-            "고CLV_recall10": seg10["고CLV"]["recall"], "고CLV_pwgain10": seg10["고CLV"]["revenue"],
-        })
-    summary_path = Path(str(grid_path).replace(".pt", "_summary.json"))
-    with open(summary_path, "w") as f:
-        json.dump(summary_rows, f, indent=2, ensure_ascii=False)
-    print(f"  [Stage B] 그리드 {len(summary_rows)}개 조합 λ별 val 지표 요약 → {summary_path}")
+    write_grid_summary(grid_results, grid_path)
     return grid_results
 
 
@@ -1656,13 +1703,23 @@ def run_baseline_only():
             "note_alignment": "value_alignment_spearman = 유저 가치성향과 추천 가격대의 Spearman 상관."}
     with open(out_path, "w") as f:
         json.dump({"meta": meta, "results": out}, f, indent=2, default=float, ensure_ascii=False)
-    print(f"\n저장 → {out_path}")
+    # 그리드 요약 csv와 같은 열 이름 규칙으로 평탄화해서, baseline과 λ별 결과를
+    # 같은 스프레드시트에서 바로 붙여 비교할 수 있게 한다.
+    csv_path = Path(str(out_path).replace(".json", ".csv"))
+    pd.DataFrame([{"split": s, **_flatten_metrics(r)} for s, r in out.items()]).to_csv(
+        csv_path, index=False, float_format="%.6f")
+    print(f"\n저장 → {out_path}\n저장 → {csv_path}")
     return out
 
 
 # M1 체크포인트(RUN_TAG 지문 기준)가 없으면 자동으로 먼저 학습한다 — CFG를 바꿔서
 # RUN_TAG(지문)가 달라지면(예: WINDOW_DAYS 변경) 이 체크가 자동으로 재학습을 트리거한다.
 # 이미 존재하면 main() 자체가 즉시 복원만 하고 끝나므로 항상 호출해도 안전하다.
+if CFG["REGEN_GRID_SUMMARY"]:
+    # 파일 변환만 하는 경로 — M1 학습 가드보다 앞에서 끝내야 괜히 학습이 돌지 않는다.
+    results = regen_grid_summaries()
+    raise SystemExit(0)
+
 _m1_ckpt = Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['RUN_TAG']}.pt"
 if CFG["FORCE_M1_RETRAIN"]:
     # RESUME까지 꺼야 train_m1()이 기존 .pt에서 이어받지 않고 epoch 1부터 새로 학습한다.

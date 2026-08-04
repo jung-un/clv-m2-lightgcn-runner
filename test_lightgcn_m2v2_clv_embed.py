@@ -186,3 +186,43 @@ def test_combined_scores_is_baseline_when_lambda_zero():
     s_rel = U @ I.T
     expect = (s_rel - s_rel.mean(dim=1, keepdim=True)) / (s_rel.std(dim=1, keepdim=True) + 1e-8)
     torch.testing.assert_close(s0, expect)
+
+
+def test_grid_summary_keeps_every_metric():
+    """그리드 요약이 evaluate_combined 결과를 통째로 보존해야 한다. 예전엔 9개 필드만
+    남겨서 λ가 NDCG/MAP/Precision/V-NDCG/Novelty/Coverage/Gini/@20에 뭘 하는지
+    볼 수 없었다(2026-08-04 수정)."""
+    import json, tempfile
+    from pathlib import Path as P
+    ns = _load_module_upto_cfg()
+    mets = ns["_METS"]
+    fake = {k: {m: 0.5 for m in mets} for k in (10, 20, 50)}
+    res = {"overall": fake, "seg": {k: {"저CLV": {m: 0.1 for m in mets},
+                                        "고CLV": {m: 0.2 for m in mets}} for k in (10, 20, 50)},
+           "seg_cnt": {"저CLV": 3, "고CLV": 4}, "coverage": {10: 0.3, 20: 0.4, 50: 0.5},
+           "gini": {10: 0.6, 20: 0.7, 50: 0.8}, "value_alignment_spearman": 0.42, "n_eval": 7}
+    with tempfile.TemporaryDirectory() as td:
+        gp = P(td) / "grid_partial_x.pt"
+        rows = ns["write_grid_summary"]({(4, 0.0): res, (4, 1.5): res}, gp)
+        assert len(rows) == 2
+        saved = json.loads((P(td) / "grid_partial_x_summary.json").read_text())
+        csv_txt = (P(td) / "grid_partial_x_summary.csv").read_text()
+    hdr = csv_txt.splitlines()[0].split(",")
+    for col in ["epoch", "lambda", "recall@10", "ndcg@50", "map@20", "coverage@10",
+                "gini@50", "value_alignment", "고CLV_revenue@10", "저CLV_precision@20"]:
+        assert col in hdr, f"csv에 {col} 열 없음"
+    assert len(csv_txt.splitlines()) == 3   # 헤더 + 조합 2개
+    r = saved[0]
+    assert r["epoch"] == 4 and "lambda" in r
+    for m in mets:                                  # 10개 지표 × K 3개가 전부 있어야 함
+        for k in ("10", "20", "50"):
+            assert m in r["overall"][k], f"overall@{k}에 {m} 없음"
+            assert m in r["seg"][k]["고CLV"], f"고CLV@{k}에 {m} 없음"
+    for extra in ("coverage", "gini", "value_alignment_spearman", "seg_cnt", "n_eval"):
+        assert extra in r, f"{extra} 누락"
+
+
+def test_regen_grid_summary_flag_exists():
+    ns = _load_module_upto_cfg()
+    assert "REGEN_GRID_SUMMARY" in ns["CFG"]
+    assert "regen_grid_summaries" in ns
