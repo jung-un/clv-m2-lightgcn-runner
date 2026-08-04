@@ -59,7 +59,7 @@ SCHEMA = {
 # ═══════════════════════════════════════════════════════════════════
 CFG = {
     # ── 실행 대상 ──
-    "DATASET": "hm",          # "hm" | "dunnhumby"
+    "DATASET": "dunnhumby",   # "hm" | "dunnhumby"
     "MODEL_LABEL": "M2v2",    # v1("M2")과 구분 — CLV 임베딩 재설계 버전
     "SEED": 42,
     "SEED_LIST": [42, 43, 44],  # value tower 다중시드 재현성 확인용
@@ -70,10 +70,11 @@ CFG = {
 
     # ── 데이터 필터링/기간 ──
     "OUT_DIR": None,          # 아래에서 DATASET 확정 후 채움
-    # 최근 N일만 사용 (None=전체기간). H&M 기준 60≈2개월(현재 값). Dunnhumby는 전체가
-    # ~2,500가구뿐이라 60일 윈도우가 이미 87%(2,189명)를 차지해 "서브셋" 의미가 없어서
-    # None(전체기간)을 씀(2026-08-01) — DATASET을 "dunnhumby"로 바꾸면 이 값도 None으로.
-    "WINDOW_DAYS": 60,
+    # 최근 N일만 사용 (None=전체기간). H&M은 60≈2개월 서브셋을 쓴다. Dunnhumby는 전체가
+    # ~2,500가구뿐이라 60일 윈도우가 이미 87%(2,189명)를 차지해 "서브셋"이 의미가 없고,
+    # 그 상태로 돌리면 수 분 만에 끝나 검증력이 없다(2026-08-02 실측) → None(전체 ~2년).
+    # ⚠ DATASET을 바꿀 때 이 값도 같이 바꿀 것: hm=60, dunnhumby=None.
+    "WINDOW_DAYS": None,
     "VAL_DAYS": 7, "TEST_DAYS": 7,
     "MIN_USER_INTER": 1, "MIN_ITEM_INTER": 1,
 
