@@ -68,6 +68,16 @@ CFG = {
     "PHASE": 2,                # 1=개념검증(고정 epoch/λ 1회 평가), 2=λ 그리드 본탐색
     "PHASE1_LAMBDA": 1.0,      # 1단계 고정 λ (epoch은 VT 단독 최고를 씀)
 
+    # True면 M1(baseline)만 학습/로드해서 λ=0 상태의 **전체 지표**를 덤프하고 종료한다.
+    # value tower·그리드 탐색은 아예 돌지 않는다. multiseed json에는 Recall@10/PWGain@10/
+    # 정렬도 3개만 저장돼서 나머지(Precision/NDCG/MAP/V-NDCG/Novelty/Coverage/Gini/@20/@50)를
+    # 확인할 방법이 없었기 때문에 만든 경로다.
+    "BASELINE_ONLY": True,
+    # True면 기존 M1 체크포인트가 있어도 무시하고 처음부터 다시 학습한다. 평소에는 지문이
+    # 같으면 재사용하는 게 맞지만, "이 체크포인트가 정말 이 설정으로 학습된 게 맞나"를
+    # 확인하려면 강제 재학습이 필요하다(Drive에서 .pt를 직접 지울 수단이 없어 플래그로 둠).
+    "FORCE_M1_RETRAIN": True,
+
     # ── 데이터 필터링/기간 ──
     "OUT_DIR": None,          # 아래에서 DATASET 확정 후 채움
     # 최근 N일만 사용 (None=전체기간). H&M은 60≈2개월 서브셋을 쓴다. Dunnhumby는 전체가
@@ -1047,6 +1057,21 @@ def compute_clv_gate(clv, power=1.0):
 
 
 @torch.no_grad()
+def _load_m1_pref(n_users, n_items, adj):
+    """M1(z^pref) 체크포인트를 로드해 동결된 유저/아이템 임베딩을 반환.
+    run_dualspace()와 run_baseline_only()가 똑같이 쓰는 블록이라 한 곳으로 뽑아둔다."""
+    m1_path = Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['RUN_TAG']}.pt"
+    assert m1_path.exists(), f"M1 체크포인트 없음: {m1_path}\n먼저 main()으로 M1을 학습하세요."
+    m1_state = torch.load(m1_path, map_location=DEVICE, weights_only=False)["best_state"]
+    pref_model = LightGCNCLV(n_users, n_items, CFG, adj).to(DEVICE)
+    pref_model.load_state_dict(m1_state)
+    for p in pref_model.parameters(): p.requires_grad_(False)
+    with torch.no_grad():
+        U_pref, I_pref, _, _ = pref_model.propagate()
+    print(f"✓ M1 체크포인트 로드 완료 ({m1_path.name}), z^pref 동결")
+    return U_pref, I_pref
+
+
 def _combined_scores(U_pref, I_pref, Uv, Iv, gate_arr, lam_base, bu):
     uid_t = torch.tensor(bu, dtype=torch.long, device=DEVICE)
     s_rel = U_pref[uid_t] @ I_pref.T
@@ -1501,15 +1526,7 @@ def run_dualspace():
     # ── M1은 항상 CFG["RUN_TAG"] 하나의 체크포인트만 가리킨다 (MODEL 키가 없어졌으므로
     #    이전처럼 m1_cfg = {**CFG, "MODEL":"M1"}로 별도 dict를 만들 필요가 없음 —
     #    CFG 자체가 이미 M1 전용 설정이다) ──
-    m1_path = Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['RUN_TAG']}.pt"
-    assert m1_path.exists(), f"M1 체크포인트 없음: {m1_path}\n먼저 main()으로 M1을 학습하세요."
-    m1_state = torch.load(m1_path, map_location=DEVICE, weights_only=False)["best_state"]
-    pref_model = LightGCNCLV(n_users, n_items, CFG, adj).to(DEVICE)
-    pref_model.load_state_dict(m1_state)
-    for p in pref_model.parameters(): p.requires_grad_(False)
-    with torch.no_grad():
-        U_pref, I_pref, _, _ = pref_model.propagate()
-    print(f"✓ M1 체크포인트 로드 완료 ({m1_path.name}), z^pref 동결")
+    U_pref, I_pref = _load_m1_pref(n_users, n_items, adj)
 
     item_meta = build_item_meta(train, n_items)
     clv, vhat = compute_clv_vhat(train, n_users, CFG, DCFG["is_date"])
@@ -1592,10 +1609,69 @@ def run_dualspace():
     return all_results
 
 
+def run_baseline_only():
+    """M1(baseline) 단독 평가. λ=0 = 가치신호를 0배로 곱함 = 순수 LightGCN 그대로다.
+
+    evaluate_combined()가 원래 계산하던 전체 지표(_METS × K_LIST + coverage/gini/정렬도,
+    저CLV/고CLV 세그먼트 포함)를 하나도 빼지 않고 json으로 덤프한다. 지금까지 multiseed
+    json에는 Recall@10/PWGain@10/정렬도만 들어가서 baseline의 나머지 지표를 볼 수 없었다."""
+    d = prepare_data(CFG, DCFG)
+    U_pref, I_pref = _load_m1_pref(d["n_users"], d["n_items"], d["adj"])
+    item_meta = build_item_meta(d["train"], d["n_items"])
+    clv, vhat = compute_clv_vhat(d["train"], d["n_users"], CFG, DCFG["is_date"])
+    user_meta = dict(clv=clv, vhat=vhat)
+    # λ=0이라 아래 셋은 결과에 영향을 주지 않지만 evaluate_combined의 인자 형태는 맞춰야 한다.
+    # Uv/Iv가 전부 0이면 s_val의 표준편차도 0이지만 분모에 1e-8이 있어 NaN이 아니라 0이 된다.
+    gate_arr = np.zeros(d["n_users"], dtype=np.float32)
+    Uv = torch.zeros(d["n_users"], CFG["D_VALUE"], device=DEVICE)
+    Iv = torch.zeros(d["n_items"], CFG["D_VALUE"], device=DEVICE)
+
+    ks = CFG["K_LIST"]
+    out = {}
+    for split, gt, rev in [("val", d["val_gt"], d["val_rev"]), ("test", d["test_gt"], d["test_rev"])]:
+        r = evaluate_combined(U_pref, I_pref, Uv, Iv, gate_arr, 0.0, gt, rev, item_meta,
+                               user_meta, ks, d["csr_ptr"], d["csr_items"], batch=CFG["EVAL_BATCH"])
+        out[split] = r
+        print(f"\n{'='*88}")
+        print(f"[{split}] M1 baseline 전체 지표 — 평가유저 {r['n_eval']:,}명 "
+              f"(저CLV {r['seg_cnt']['저CLV']:,} / 고CLV {r['seg_cnt']['고CLV']:,})")
+        print('='*88)
+        print(f"{'지표':<12}" + "".join(f"{'@'+str(k):>14}" for k in ks))
+        for m in _METS:
+            print(f"{m:<12}" + "".join(f"{r['overall'][k][m]:>14.6f}" for k in ks))
+        print(f"{'coverage':<12}" + "".join(f"{r['coverage'][k]:>14.6f}" for k in ks))
+        print(f"{'gini':<12}" + "".join(f"{r['gini'][k]:>14.6f}" for k in ks))
+        print(f"{'정렬도':<12}{r['value_alignment_spearman']:>14.6f}  (K={ks[0]} 기준, Spearman)")
+        for sg in ["저CLV", "고CLV"]:
+            print(f"\n  [{sg}]  {'지표':<10}" + "".join(f"{'@'+str(k):>14}" for k in ks))
+            for m in _METS:
+                print(f"          {m:<10}" + "".join(f"{r['seg'][k][sg][m]:>14.6f}" for k in ks))
+
+    out_path = Path(CFG["OUT_DIR"]) / f"result_M1_baseline_{CFG['DATASET']}.json"
+    meta = {"dataset": CFG["DATASET"], "run_tag": CFG["RUN_TAG"], "seed": CFG["SEED"],
+            "window_days": CFG["WINDOW_DAYS"], "k_list": ks,
+            "forced_retrain": CFG["FORCE_M1_RETRAIN"],
+            "note_revenue": "revenue 필드 = 가격가중 추천 적중값(price-weighted gain proxy). 실제 통화 매출이 아님.",
+            "note_arp": "arp 필드 = 추천 상품의 평균 가격 백분위(인기도 기반 ARP와 다른 지표).",
+            "note_alignment": "value_alignment_spearman = 유저 가치성향과 추천 가격대의 Spearman 상관."}
+    with open(out_path, "w") as f:
+        json.dump({"meta": meta, "results": out}, f, indent=2, default=float, ensure_ascii=False)
+    print(f"\n저장 → {out_path}")
+    return out
+
+
 # M1 체크포인트(RUN_TAG 지문 기준)가 없으면 자동으로 먼저 학습한다 — CFG를 바꿔서
 # RUN_TAG(지문)가 달라지면(예: WINDOW_DAYS 변경) 이 체크가 자동으로 재학습을 트리거한다.
 # 이미 존재하면 main() 자체가 즉시 복원만 하고 끝나므로 항상 호출해도 안전하다.
-if not (Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['RUN_TAG']}.pt").exists():
+_m1_ckpt = Path(CFG["OUT_DIR"]) / f"ckpt_{CFG['RUN_TAG']}.pt"
+if CFG["FORCE_M1_RETRAIN"]:
+    # RESUME까지 꺼야 train_m1()이 기존 .pt에서 이어받지 않고 epoch 1부터 새로 학습한다.
+    print(f"[runner] FORCE_M1_RETRAIN=True — 기존 체크포인트를 무시하고 M1을 처음부터 재학습"
+          f"{' (기존 파일 있음, 덮어씀)' if _m1_ckpt.exists() else ''}")
+    CFG["RESUME"] = False
+    main()
+elif not _m1_ckpt.exists():
     print(f"[runner] M1 체크포인트 없음(RUN_TAG={CFG['RUN_TAG']}) — main()으로 먼저 학습")
     main()
-results = run_dualspace()
+
+results = run_baseline_only() if CFG["BASELINE_ONLY"] else run_dualspace()

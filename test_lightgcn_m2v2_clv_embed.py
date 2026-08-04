@@ -157,3 +157,32 @@ def test_no_gate_f_or_dampen_functions_remain():
         assert dead_fn not in ns, f"{dead_fn}는 v2에서 제거되어야 함"
     for fn in ["run_dualspace_one_seed_phase1", "run_dualspace_one_seed_phase2", "run_stage_b_grid"]:
         assert fn in ns, f"{fn}는 v2에 있어야 함"
+
+
+def test_baseline_only_and_force_retrain_flags_exist():
+    """baseline 단독 평가 경로와 M1 강제 재학습 플래그. 둘 다 CFG에 있어야 하고,
+    run_baseline_only()가 정의돼 있어야 한다(2026-08-04 추가)."""
+    ns = _load_module_upto_cfg()
+    assert "BASELINE_ONLY" in ns["CFG"]
+    assert "FORCE_M1_RETRAIN" in ns["CFG"]
+    assert "run_baseline_only" in ns
+    assert "_load_m1_pref" in ns          # run_dualspace와 공용으로 뽑아낸 헬퍼
+
+
+def test_combined_scores_is_baseline_when_lambda_zero():
+    """λ=0이면 가치신호가 전혀 안 섞여야 하고, Uv/Iv가 전부 0이어도 NaN이 나오면 안 된다
+    (s_val의 표준편차가 0이라 분모 1e-8이 없으면 0/0이 된다)."""
+    ns = _load_module_upto_cfg()
+    np, torch = ns["np"], ns["torch"]
+    n_u, n_i, d = 5, 7, 4
+    g = torch.Generator().manual_seed(0)
+    U = torch.randn(n_u, d, generator=g); I = torch.randn(n_i, d, generator=g)
+    Uv = torch.zeros(n_u, 3); Iv = torch.zeros(n_i, 3)
+    gate = np.ones(n_u, dtype=np.float32)
+    bu = np.arange(n_u)
+    s0 = ns["_combined_scores"](U, I, Uv, Iv, gate, 0.0, bu)
+    assert torch.isfinite(s0).all()
+    # λ=0 결과 = z^pref 점수만 z-score 정규화한 것과 동일해야 함
+    s_rel = U @ I.T
+    expect = (s_rel - s_rel.mean(dim=1, keepdim=True)) / (s_rel.std(dim=1, keepdim=True) + 1e-8)
+    torch.testing.assert_close(s0, expect)
