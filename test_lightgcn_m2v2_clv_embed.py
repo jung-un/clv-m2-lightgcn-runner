@@ -226,3 +226,24 @@ def test_regen_grid_summary_flag_exists():
     ns = _load_module_upto_cfg()
     assert "REGEN_GRID_SUMMARY" in ns["CFG"]
     assert "regen_grid_summaries" in ns
+
+
+def test_run_flags_set_for_m2_rerun():
+    """이번 run 설정: M2 전체 파이프라인 + 시드 캐시 무시(그래야 Stage B가 다시 돌아
+    전체 지표 요약이 새로 쓰인다). M1은 재학습 불필요(2026-08-04 재현성 확인 완료)."""
+    ns = _load_module_upto_cfg()
+    cfg = ns["CFG"]
+    assert cfg["DATASET"] == "dunnhumby" and cfg["WINDOW_DAYS"] is None
+    assert cfg["PHASE"] == 2
+    assert cfg["BASELINE_ONLY"] is False
+    assert cfg["REGEN_GRID_SUMMARY"] is False
+    assert cfg["FORCE_M1_RETRAIN"] is False   # 켜두면 매번 14분씩 헛돎
+    assert cfg["FORCE_SEED_RECOMPUTE"] is True
+
+
+def test_seed_cache_is_bypassed_when_forced():
+    """load_or_run_seed가 FORCE_SEED_RECOMPUTE를 실제로 본다(문자열 검사로 충분 —
+    실행하려면 모델/데이터가 필요)."""
+    src = SCRIPT_PATH.read_text(encoding="utf-8")
+    body = src.split("def load_or_run_seed")[1].split("\ndef ")[0]
+    assert 'not cfg.get("FORCE_SEED_RECOMPUTE")' in body

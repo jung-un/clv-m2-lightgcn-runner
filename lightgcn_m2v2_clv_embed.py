@@ -72,14 +72,18 @@ CFG = {
     # value tower·그리드 탐색은 아예 돌지 않는다. multiseed json에는 Recall@10/PWGain@10/
     # 정렬도 3개만 저장돼서 나머지(Precision/NDCG/MAP/V-NDCG/Novelty/Coverage/Gini/@20/@50)를
     # 확인할 방법이 없었기 때문에 만든 경로다.
-    "BASELINE_ONLY": True,
+    "BASELINE_ONLY": False,
     # True면 기존 grid_partial_*.pt에서 전체 지표 요약 json만 다시 쓰고 끝낸다(계산 없음).
     # M1/VT/그리드 모두 안 건드리므로 GPU 런타임도 필요 없다.
     "REGEN_GRID_SUMMARY": False,
     # True면 기존 M1 체크포인트가 있어도 무시하고 처음부터 다시 학습한다. 평소에는 지문이
     # 같으면 재사용하는 게 맞지만, "이 체크포인트가 정말 이 설정으로 학습된 게 맞나"를
     # 확인하려면 강제 재학습이 필요하다(Drive에서 .pt를 직접 지울 수단이 없어 플래그로 둠).
-    "FORCE_M1_RETRAIN": True,
+    "FORCE_M1_RETRAIN": False,
+    # True면 이미 끝난 시드의 result_*.json이 있어도 무시하고 다시 계산한다. 이 캐시는
+    # 재개 체인의 가장 바깥이라, 켜지 않으면 Stage B까지 통째로 건너뛰어 요약 파일이
+    # 갱신되지 않는다(지표 저장 범위를 넓힌 뒤 기존 실험을 다시 기록할 때 필요).
+    "FORCE_SEED_RECOMPUTE": True,
 
     # ── 데이터 필터링/기간 ──
     "OUT_DIR": None,          # 아래에서 DATASET 확정 후 채움
@@ -1532,7 +1536,7 @@ def load_or_run_seed(seed, out_dir, model_label, dataset, cfg, dcfg, run_one_see
     되살아난다."""
     path = Path(out_dir) / (f"result_{model_label}_{dataset}_s{seed}_"
                              f"{seed_result_fingerprint(cfg, dcfg, seed)}.json")
-    if path.exists():
+    if path.exists() and not cfg.get("FORCE_SEED_RECOMPUTE"):
         print(f"[시드 RESUME] seed {seed}는 이미 완료됨 ({path}) — 재계산 없이 로드")
         with open(path) as f:
             eps_rows = json.load(f)["eps_rows"]
@@ -1614,23 +1618,12 @@ def run_dualspace():
         r = seed_res[0]
         row = {
             "seed": r["seed"], "phase": r["phase"],
-            "test_base_recall10": r["test_base"]["overall"][10]["recall"],
-            "test_best_recall10": r["test_best"]["overall"][10]["recall"],
-            "test_base_pwgain10": r["test_base"]["overall"][10]["revenue"],
-            "test_best_pwgain10": r["test_best"]["overall"][10]["revenue"],
-            "test_base_value_alignment": r["test_base"]["value_alignment_spearman"],
-            "test_best_value_alignment": r["test_best"]["value_alignment_spearman"],
             "ci": {k: {"mean": v[0], "lo": v[1], "hi": v[2]} for k, v in r["ci"].items()},
-            "segment": {
-                sg: {
-                    "base_recall10": r["test_base"]["seg"][10][sg]["recall"],
-                    "best_recall10": r["test_best"]["seg"][10][sg]["recall"],
-                    "base_pwgain10": r["test_base"]["seg"][10][sg]["revenue"],
-                    "best_pwgain10": r["test_best"]["seg"][10][sg]["revenue"],
-                    "base_arp": r["test_base"]["seg"][10][sg]["arp"],
-                    "best_arp": r["test_best"]["seg"][10][sg]["arp"],
-                } for sg in ["저CLV", "고CLV"]
-            },
+            # 2026-08-04: 예전엔 Recall@10/PWGain@10/정렬도 + 세그먼트 6개만 남겨서
+            # baseline 대비 나머지 지표를 볼 수가 없었다. 이미 계산돼 있는 전체 지표를
+            # 그대로 평탄화해 넣는다(추가 계산 없음).
+            "test_base": _flatten_metrics(r["test_base"]),
+            "test_best": _flatten_metrics(r["test_best"]),
         }
         if r["phase"] == 1:
             row.update(vt_best_epoch=r["vt_best_epoch"], lam=r["lam"])
@@ -1652,7 +1645,15 @@ def run_dualspace():
     }
     with open(out_path, "w") as f:
         json.dump({"meta": meta, "results": payload}, f, indent=2, default=float, ensure_ascii=False)
-    print(f"\n저장 → {out_path}")
+
+    # baseline(base)과 선택된 조합(best)을 한 줄씩, baseline csv와 같은 열 규칙으로 남긴다.
+    csv_rows = [{"seed": row["seed"], "which": which.replace("test_", ""),
+                 "best_lam": row.get("best_lam", row.get("lam")), "best_ep": row.get("best_ep"),
+                 **row[which]}
+                for row in payload for which in ("test_base", "test_best")]
+    csv_path = Path(str(out_path).replace(".json", ".csv"))
+    pd.DataFrame(csv_rows).to_csv(csv_path, index=False, float_format="%.6f")
+    print(f"\n저장 → {out_path}\n저장 → {csv_path}")
     return all_results
 
 
