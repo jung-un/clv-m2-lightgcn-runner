@@ -1,33 +1,45 @@
-"""LightGCN + CLV 이중공간(v3) — 처음부터 다시 쓴 버전.
+"""LightGCN + CLV 이중공간(v3).
 
-설계 원칙: **"임베딩을 분리하고 CLV에 따라 반영 정도를 조정한다" 외에는 아무 조건도 넣지 않는다.**
-
-    S(u,i) = <z_u^pref, z_i^pref> + λ · gate(u) · <z_u^value, z_i^value>
-    gate(u) = percentile_rank(CLV_u)            # 0~1, 선형
+    S(u,i) = <z_u^pref, z_i^pref> + λ · gate(u) · <z_u^value, z_i^value>     (raw dot product)
+    gate(u) = percentile_rank(CLV_u)            # 선형, 제곱 아님
     CLV_u   = N̂_u × V̂_u
     N̂_u     = mean(F_p, T_p, R_p)                # 전부 백분위
     V̂_u     = mean(AOV_p, Prem_p)                # 축소추정 없음
 
-v2(lightgcn_m2v2_clv_embed.py)에서 **제거한 것** — 전부 이전 담당자가 임의로 넣었던 장치다:
-  - 가드레일 4종(Recall@10 무손실 / Recall@50 / HR / Diversity 허용손실)
-  - 목적함수(가드레일 통과 조합 중 가격가중 적중값 최대인 것을 선택)
-  - Stage A epoch 스크리닝(대표 λ로 VT epoch을 5개로 추림)
-  - 후보가 없을 때 λ=0으로 떨어지는 fallback
-  - AOV/Prem 축소추정(shrinkage)
-  - gate의 제곱(power=2.0)
-  - hard negative 샘플링(50%)
-→ λ는 고르지 않고 **스윕 전체를 결과로 보고**한다. λ=0이 곧 baseline이므로 비교도 자동이다.
+"임베딩을 분리하고 CLV에 따라 반영 정도를 조정한다" 외의 조건은 넣지 않는다.
+v2에 있던 가드레일 4종·목적함수·epoch 스크리닝·λ=0 fallback·축소추정·gate 제곱·
+hard negative는 전부 없다.
 
-v2에서 **그대로 가져온 것** — 이미 검증·디버깅이 끝난 부분이다:
-  - 데이터 처리(완전중복 제거, 구매 건=BASKET_ID/(고객,날짜), 단가=금액÷수량,
-    train 구간 기준 필터, 재구매쌍 제거)
-  - 지표 계산(score_topk 계열, Recall/Precision/NDCG/HR/MAP/가격가중적중값/
-    V-NDCG/평균가격백분위/Novelty/Diversity/Coverage/Gini/정렬도)
+═══ 아키텍처 3종 ═══
+  pref_only  : 순수 LightGCN. λ=0으로 선호 블록만 학습. **공통 baseline**이며
+               two_stage의 stage2 초기값으로 재사용된다(시드당 한 번만 학습).
+  two_stage  : pref_only 체크포인트를 불러 동결 → 가치 블록만 학습.
+  joint      : 별도 random init에서 선호·가치 블록을 처음부터 함께 학습.
 
-두 아키텍처를 CFG["ARCH"] 하나로 전환해 비교한다. 차이는 **학습 절차 하나뿐**이다:
-  - "joint"     : LightGCN 1회 학습. 선호·가치 블록이 같은 BPR 손실로 동시에 학습됨.
-  - "two_stage" : 선호 블록만 먼저 학습(=순수 LightGCN) → 동결 → 가치 블록만 학습.
-가치 임베딩의 정체(CLV 변수 MLP), gate, λ, 입력 특징은 두 안이 완전히 동일하다.
+⚠ joint의 λ_eval=0은 baseline이 아니다. 선호 임베딩이 이미 가치항의 존재에 맞춰
+  학습됐으므로 "joint-ablation"이며, 결과 표기에서도 그렇게 부른다. 두 아키텍처의
+  공통 비교 기준은 언제나 pref_only다.
+
+═══ 점수식 통일 ═══
+  학습(BPR)과 평가가 combined_score_* 한 쌍만 쓴다. 둘 다 raw dot product이므로
+  λ_train=1과 λ_eval=1이 정확히 같은 점수를 만든다. v2의 유저별 z-score 정규화는
+  제거했다 — 그건 z^pref가 별도 모델에서 동결돼 와 상대 스케일이 임의였던 v2의
+  사정 때문이었고, v3에서는 모델이 스케일을 직접 학습하므로 평가에서 지우면
+  학습 결과를 버리는 셈이 된다. 대신 학습된 상대 스케일을 진단값으로 저장한다.
+
+═══ λ 절차 ═══
+  LAMBDA_TRAIN      : 학습 중 결합 강도(BPR loss 안에 들어간다 = 학습된 파라미터에 영향)
+  LAMBDA_EVAL_SWEEP : 채점 시점 스윕. 실험 전에 고정하며 실행 중 바꾸지 않는다.
+
+  주 결과(primary)   : validation 3시드 평균으로 **아키텍처별 공통 λ 하나**를 고르고
+                      (select_lambda의 규칙은 코드에 사전 고정), 그 λ 하나만 test에서
+                      baseline 대비 통계 검정한다. 시드별 λ 선택은 하지 않는다.
+  민감도(secondary)  : test의 λ 전체 곡선은 사전 선언된 descriptive 분석으로만 보고한다.
+                      "최적 λ"라 부르지 않고 λ별 유의 라벨도 붙이지 않는다.
+
+═══ 최종 확증용 홀드아웃 ═══
+  기존 test 구간은 개발 과정에서 여러 번 확인됐다. 마지막 HOLDOUT_DAYS 구간은
+  EVAL_HOLDOUT=True로 명시적으로 켜기 전까지 **계산조차 하지 않는다**.
 """
 import os, json, math, time, random, hashlib
 from pathlib import Path
@@ -36,15 +48,14 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.stats import spearmanr
 
+CODE_VERSION = "v3.1"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ═══════════════════════════════════════════════════════════════════
-# SCHEMA: 데이터셋의 "고정 사실"만 (경로/컬럼명/날짜형여부)
-# ═══════════════════════════════════════════════════════════════════
 SCHEMA = {
     "hm": {
         "tx_path": ("/content/drive/MyDrive/논문/data/raw/hm/transactions_train.parquet" if IN_COLAB
@@ -54,10 +65,9 @@ SCHEMA = {
         "user_col": "customer_id", "item_col": "article_id",
         "time_col": "t_dat", "value_col": "price",
         "item_key_col": "article_id", "category_col": "product_group_name",
-        # 주문 식별자가 없고 시간 해상도가 날짜뿐이라 (고객, 날짜)를 구매 1건으로 본다.
+        # 주문 식별자가 없고 시간 해상도가 날짜뿐 → (고객, 날짜)를 구매 1건으로 본다.
         # price가 이미 상품 1개당 단가라 나눌 수량이 없다.
-        "basket_col": None, "qty_col": None,
-        "is_date": True,
+        "basket_col": None, "qty_col": None, "is_date": True,
     },
     "dunnhumby": {
         "tx_path": ("/content/drive/MyDrive/논문/data/raw/dunnhumby/transaction_data.csv" if IN_COLAB
@@ -67,61 +77,58 @@ SCHEMA = {
         "user_col": "household_key", "item_col": "PRODUCT_ID",
         "time_col": "DAY", "value_col": "SALES_VALUE",
         "item_key_col": "PRODUCT_ID", "category_col": "COMMODITY_DESC",
-        # 한 행 = BASKET_ID × PRODUCT_ID 구매 라인(라인이 장바구니의 약 9.4배).
+        # 한 행 = BASKET_ID × PRODUCT_ID 라인(라인이 장바구니의 약 9.4배).
         # QUANTITY≠1인 행이 약 21%라 SALES_VALUE는 단가가 아니다.
-        "basket_col": "BASKET_ID", "qty_col": "QUANTITY",
-        "is_date": False,
+        "basket_col": "BASKET_ID", "qty_col": "QUANTITY", "is_date": False,
     },
 }
 
-
 # ═══════════════════════════════════════════════════════════════════
-# CFG
-#   [기본]  = LightGCN 원논문/기존 실험에서 그대로 가져온 값
-#   [선택]  = 이번 설계에서 사용자가 명시적으로 정한 값
-#   [임의]  = 정하지 않으면 코드가 안 돌아가서 부득이 고른 값 (바꾸려면 여기만 수정)
+# CFG   [기본]=LightGCN/기존 실험값  [선택]=사용자가 정함  [임의]=부득이 고른 값
 # ═══════════════════════════════════════════════════════════════════
 CFG = {
-    # ── 실행 대상 ──
-    "DATASET": "hm",              # [선택] "hm" | "dunnhumby"
-    "ARCH": "joint",              # [선택] "joint" | "two_stage" — 이 둘을 비교하는 게 목적
-    "MODEL_LABEL": "v3",
-    "SEED_LIST": [42, 43, 44],    # [기본] 3시드
+    "DATASET": "hm",                  # [선택] "hm" | "dunnhumby"
+    "ARCH": "pref_only",              # [선택] "pref_only" | "two_stage" | "joint"
+    "SEED_LIST": [42, 43, 44],        # [기본]
 
-    # ── 데이터 ──
-    "OUT_DIR": None,              # 아래에서 DATASET 확정 후 채움
-    "WINDOW_DAYS": 60,            # [선택] hm=60(2개월), dunnhumby=None(전체 ~2년)
-    "VAL_DAYS": 7, "TEST_DAYS": 7,          # [기본]
-    "MIN_USER_INTER": 1, "MIN_ITEM_INTER": 1,  # [기본] 필터 없음
+    # ── 데이터 (시간순: train | val | test | holdout) ──
+    "OUT_DIR": None,
+    "WINDOW_DAYS": 60,                # [선택] hm=60, dunnhumby=None(전체)
+    "VAL_DAYS": 7, "TEST_DAYS": 7,    # [기본]
+    "HOLDOUT_DAYS": 7,                # [선택] 최종 확증 전용. 아래 플래그 전엔 계산 안 함
+    "EVAL_HOLDOUT": False,            # ⚠ 논문 최종 확증 때 딱 한 번만 True
+    "MIN_USER_INTER": 1, "MIN_ITEM_INTER": 1,   # [기본]
 
-    # ── 선호 임베딩(z^pref) = 표준 LightGCN ──
-    "DIM": 64, "N_LAYERS": 2,     # [기본] 기존 실험값 유지
+    # ── 임베딩 ──
+    "DIM": 64, "N_LAYERS": 2,         # [기본] z^pref = 표준 LightGCN
+    "D_VALUE": 16,                    # [임의] 가치 임베딩 차원
+    "MLP_HIDDEN": 32,                 # [임의] MLP 은닉
+    "CAT_EMB_DIM": 16,                # [임의] 카테고리 임베딩(원핫 대신)
 
-    # ── 가치 임베딩(z^value) = CLV 변수 MLP, 그래프 전파 없음 ──
-    "D_VALUE": 16,                # [임의] 가치 임베딩 차원
-    "MLP_HIDDEN": 32,             # [임의] MLP 은닉 차원
-    "CAT_EMB_DIM": 16,            # [임의] 카테고리 ID 임베딩 차원(원핫 대신)
+    # ── 학습 ──
+    "BATCH_SIZE": 8192, "LR": 5e-4, "WD": 1e-3,   # [기본]
+    "EPOCHS": 100, "EARLY_STOP": 20,              # [기본] 단계별 상한 100, 수렴은 조기종료가 결정
+    "SELECT_METRIC": "recall",                    # [기본] 조기종료 기준 지표
+    "SELECT_K": 10,                               # [기본] 그 지표의 K
+    "EVAL_BATCH": 1024,                           # [기본]
+    # negative 샘플링 = 균등 무작위(LightGCN 원논문). v2의 hard negative는 제거.
 
-    # ── 학습 (LightGCN 관례 + 기존 실험값) ──
-    "BATCH_SIZE": 8192, "LR": 5e-4, "WD": 1e-3,   # [기본] 기존값 유지
-    "EPOCHS": 100, "EARLY_STOP": 20,              # [기본]
-    "SELECT_METRIC": "recall@10",                 # [기본] 학습 조기종료 기준
-    "EVAL_BATCH": 1024,                           # [기본] 평가 시 유저 배치
-    # negative 샘플링은 **균등 무작위**(LightGCN 원논문). v2의 hard negative 50%는 제거.
-    "LAMBDA_TRAIN": 1.0,          # [임의] 학습 중 결합 강도. λ는 채점 시점 파라미터라
-                                  # 학습은 한 번만 하고 아래 LAMBDA_SWEEP으로 채점한다.
+    # ── λ ──
+    "LAMBDA_TRAIN": 1.0,                            # [임의] BPR loss 안에 들어감
+    "LAMBDA_EVAL_SWEEP": [0.0, 0.1, 0.5, 1.0, 2.0], # [임의] 실험 전 고정, 실행 중 변경 금지
+    # 비열등 허용폭: CI_lower(ΔRecall@10) >= -δ × baseline_recall@10 (상대값).
+    # ⚠ 결과를 보기 전에 확정해야 하는 값 — 실행 전 반드시 확인할 것.
+    "NONINFERIORITY_DELTA": 0.01,                   # [임의] 1%
 
-    # ── CLV 파생 변수 ──
-    "PREMIUM_THR": 0.8,           # [임의] 단가 상위 20%를 "고가 상품"으로 판정
-    # 축소추정(shrinkage) 없음 — 지도교수님 자료 정의 그대로
-
-    # ── λ 스윕: 고르지 않고 전부 보고한다 ──
-    "LAMBDA_SWEEP": [0.0, 0.1, 0.5, 1.0, 2.0],   # [임의] 값 목록
+    # ── CLV ──
+    "PREMIUM_THR": 0.8,               # [임의] 단가 상위 20%를 고가 상품으로
+    # 축소추정 없음 — 지도교수님 자료 정의 그대로
 
     # ── 평가 ──
-    "K_LIST": [10, 20, 50],       # [기본]
-    "N_BOOT": 2000,               # [기본] 부트스트랩 반복
-    "SEG_EDGES": (0.2, 0.8),      # [선택] 하위20% / 중위60% / 상위20%
+    "K_LIST": [10, 20, 50],           # [기본]
+    "N_BOOT": 2000,                   # [기본]
+    "SEG_EDGES": (0.2, 0.8),          # [선택] 하위20%/중위60%/상위20%
+                                      #        임계값은 train 전체 고객에서 한 번 계산해 고정
 }
 CFG["OUT_DIR"] = (f"/content/drive/MyDrive/논문/data/results_v3_{CFG['DATASET']}" if IN_COLAB
                   else f"/Users/jungun/Workspace/논문준비/data/results_v3_{CFG['DATASET']}")
@@ -129,6 +136,8 @@ DCFG = SCHEMA[CFG["DATASET"]]
 
 _METS = ["recall", "precision", "ndcg", "hr", "map", "revenue", "vndcg", "arp", "novelty", "diversity"]
 SEG_NAMES = ["저CLV", "중CLV", "고CLV"]
+ARCH_LABEL = {"pref_only": "LightGCN baseline", "two_stage": "two-stage",
+              "joint": "joint (λ=0은 ablation, baseline 아님)"}
 
 
 def set_seed(seed):
@@ -136,25 +145,24 @@ def set_seed(seed):
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
 
-def run_tag(cfg, dcfg, seed):
-    """설정이 바뀌면 체크포인트 파일명이 달라지게 하는 해시."""
-    keys = ["DATASET", "ARCH", "DIM", "N_LAYERS", "D_VALUE", "MLP_HIDDEN", "CAT_EMB_DIM",
-            "BATCH_SIZE", "LR", "WD", "EPOCHS", "EARLY_STOP", "WINDOW_DAYS",
-            "VAL_DAYS", "TEST_DAYS", "MIN_USER_INTER", "MIN_ITEM_INTER",
-            "PREMIUM_THR", "LAMBDA_TRAIN"]
+def cfg_hash(cfg, dcfg, arch, seed):
+    """학습 결과에 영향을 주는 설정만 해시. 결과 파일명·체크포인트명에 함께 넣어
+    기간/λ_train/차원을 바꿨을 때 이전 결과를 덮어쓰지 않게 한다."""
+    keys = ["DATASET", "DIM", "N_LAYERS", "D_VALUE", "MLP_HIDDEN", "CAT_EMB_DIM",
+            "BATCH_SIZE", "LR", "WD", "EPOCHS", "EARLY_STOP", "SELECT_METRIC", "SELECT_K",
+            "WINDOW_DAYS", "VAL_DAYS", "TEST_DAYS", "HOLDOUT_DAYS",
+            "MIN_USER_INTER", "MIN_ITEM_INTER", "PREMIUM_THR", "LAMBDA_TRAIN"]
     payload = {k: cfg[k] for k in keys}
-    payload.update(category_col=dcfg["category_col"], seed=seed)
-    h = hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:8]
-    return f"v3_{cfg['ARCH']}_{cfg['DATASET']}_s{seed}_{h}"
+    payload.update(category_col=dcfg["category_col"], arch=arch, seed=seed, code=CODE_VERSION)
+    return hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:8]
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 데이터 — v2에서 그대로 이식 (검증 완료)
+# 데이터
 # ═══════════════════════════════════════════════════════════════════
 def load_transactions(dcfg):
-    """원본 로드 + 파생 컬럼 2개.
-    b_raw = 구매 건(장바구니) 식별자. 없으면 만들지 않고 이후 (u_idx, t)로 묶는다.
-    up    = 상품 1개당 단가 = 라인 금액 / 수량(0 이하는 1로 간주)."""
+    """b_raw = 구매 건(장바구니) 식별자(없으면 만들지 않고 이후 (u_idx,t)로 묶음).
+    up = 상품 1개당 단가 = 라인 금액 / 수량(0 이하는 1로 간주)."""
     tx = pd.read_parquet(dcfg["tx_path"]) if dcfg["tx_path"].endswith(".parquet") else pd.read_csv(dcfg["tx_path"])
     ren = {dcfg["user_col"]: "u_raw", dcfg["item_col"]: "i_raw",
            dcfg["time_col"]: "t", dcfg["value_col"]: "v"}
@@ -162,8 +170,7 @@ def load_transactions(dcfg):
         ren[dcfg["basket_col"]] = "b_raw"
     tx = tx.rename(columns=ren)
     if dcfg["is_date"]:
-        tx["t"] = pd.to_datetime(tx["t"])
-        tx["i_raw"] = tx["i_raw"].astype(str)
+        tx["t"] = pd.to_datetime(tx["t"]); tx["i_raw"] = tx["i_raw"].astype(str)
     tx = tx.drop_duplicates()
     q = dcfg["qty_col"]
     tx["up"] = (tx["v"] / tx[q].clip(lower=1) if q else tx["v"]).astype(np.float32)
@@ -173,11 +180,13 @@ def load_transactions(dcfg):
 
 
 def prepare_data(cfg, dcfg):
+    """시간순 분할: train | val | test | holdout(가장 최근).
+    holdout은 EVAL_HOLDOUT=True일 때만 평가에 쓰인다(그 전엔 정답조차 만들지 않음)."""
     tx = load_transactions(dcfg)
     if cfg["WINDOW_DAYS"]:
-        t_max = tx["t"].max()
+        t_max0 = tx["t"].max()
         delta = pd.Timedelta(days=cfg["WINDOW_DAYS"]) if dcfg["is_date"] else cfg["WINDOW_DAYS"]
-        tx = tx[tx["t"] >= t_max - delta].copy()
+        tx = tx[tx["t"] >= t_max0 - delta].copy()
         print(f"최근 {cfg['WINDOW_DAYS']}일 사용: {len(tx):,}건")
 
     meta = pd.read_csv(dcfg["item_meta_path"], dtype={dcfg["item_key_col"]: str} if dcfg["is_date"] else None)
@@ -187,10 +196,11 @@ def prepare_data(cfg, dcfg):
 
     t_max = tx["t"].max()
     day = lambda n: (pd.Timedelta(days=n) if dcfg["is_date"] else n)
-    test_start = t_max - day(cfg["TEST_DAYS"])
+    hold_start = t_max - day(cfg["HOLDOUT_DAYS"])
+    test_start = hold_start - day(cfg["TEST_DAYS"])
     val_start = test_start - day(cfg["VAL_DAYS"])
+    print(f"분할 경계: train ≤ {val_start} < val ≤ {test_start} < test ≤ {hold_start} < holdout")
 
-    # 필터는 train 구간만 기준으로 — val/test까지 세면 미래 정보로 cold-start를 살리는 누수
     tp = tx[tx["t"] <= val_start]
     uc, ic = tp["u_raw"].value_counts(), tp["i_raw"].value_counts()
     keep_u = set(uc[uc >= cfg["MIN_USER_INTER"]].index)
@@ -207,9 +217,6 @@ def prepare_data(cfg, dcfg):
     print(f"유저 {n_users:,} | 아이템 {n_items:,} | 카테고리({dcfg['category_col']}) {n_cat:,}")
 
     train = tx[tx["t"] <= val_start].copy()
-    val = tx[(tx["t"] > val_start) & (tx["t"] <= test_start)].copy()
-    test = tx[tx["t"] > test_start].copy()
-
     train_users = set(train.u_idx.unique()); train_items = set(train.i_idx.unique())
     train_pair_key = np.unique(train.u_idx.values.astype(np.int64) * n_items + train.i_idx.values)
 
@@ -217,7 +224,7 @@ def prepare_data(cfg, dcfg):
         d = df[df.u_idx.isin(train_users) & df.i_idx.isin(train_items)]
         key = d.u_idx.values.astype(np.int64) * n_items + d.i_idx.values
         pos = np.clip(np.searchsorted(train_pair_key, key), 0, len(train_pair_key) - 1)
-        d = d[train_pair_key[pos] != key]          # 재구매쌍 제거 (교수님 지침)
+        d = d[train_pair_key[pos] != key]           # 재구매쌍 제거 (교수님 지침)
         agg = d.groupby(["u_idx", "i_idx"], sort=False)["v"].sum().reset_index()
         gt, rev = {}, {}
         for u, g in agg.groupby("u_idx", sort=False):
@@ -225,10 +232,13 @@ def prepare_data(cfg, dcfg):
         print(f"  {name}: 평가유저 {len(gt):,}명, 정답 {len(agg):,}쌍")
         return gt, rev
 
-    val_gt, val_rev = build_eval(val, "Val ")
-    test_gt, test_rev = build_eval(test, "Test")
+    splits = {"val": build_eval(tx[(tx.t > val_start) & (tx.t <= test_start)], "Val    "),
+              "test": build_eval(tx[(tx.t > test_start) & (tx.t <= hold_start)], "Test   ")}
+    if cfg["EVAL_HOLDOUT"]:
+        splits["holdout"] = build_eval(tx[tx.t > hold_start], "Holdout")
+    else:
+        print("  Holdout: 계산 안 함 (EVAL_HOLDOUT=False — 최종 확증 때만 켤 것)")
 
-    # 그래프(선호 임베딩 전파용) — 표준 LightGCN 정규화 인접행렬
     tu = train.u_idx.values.astype(np.int64); ti = train.i_idx.values.astype(np.int64)
     edge_key = np.unique(tu * n_items + ti)
     eu = (edge_key // n_items).astype(np.int64); ei = (edge_key % n_items).astype(np.int64)
@@ -239,27 +249,22 @@ def prepare_data(cfg, dcfg):
     vals = (dinv[rows] * dinv[cols]).astype(np.float32)
     adj = torch.sparse_coo_tensor(torch.from_numpy(np.stack([rows, cols])),
                                    torch.from_numpy(vals), size=(n, n)).coalesce().to(DEVICE)
-
     order = np.argsort(eu, kind="stable")
     csr_items = ei[order].astype(np.int32)
     csr_ptr = np.zeros(n_users + 1, dtype=np.int64)
     np.cumsum(np.bincount(eu, minlength=n_users), out=csr_ptr[1:])
 
-    return dict(train=train, val_gt=val_gt, val_rev=val_rev, test_gt=test_gt, test_rev=test_rev,
-                adj=adj, pos_key=edge_key, tr_u=tu, tr_i=ti, csr_ptr=csr_ptr, csr_items=csr_items,
+    return dict(train=train, splits=splits, adj=adj, pos_key=edge_key, tr_u=tu, tr_i=ti,
+                csr_ptr=csr_ptr, csr_items=csr_items,
                 n_users=n_users, n_items=n_items, n_cat=n_cat)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# CLV — 지도교수님 자료 정의 그대로 (축소추정 없음)
+# CLV
 # ═══════════════════════════════════════════════════════════════════
 def clv_features(train, n_users, cfg, is_date):
-    """반환: x_val_u [n_users, 5] (F_p,T_p,R_p,AOV_p,Prem_p), clv [n_users] (=N̂×V̂).
-
-    F/AOV는 **구매 건(장바구니) 단위**다. 한 행은 주문이 아니라 상품 라인이므로
-    행 수를 세면 F가 '구매 횟수'가 아니라 '산 상품 개수'가 된다.
-    Prem은 **단가** 기준 — 라인 금액으로 재면 대량구매가 고가구매로 오인된다.
-    """
+    """반환: x_val_u [n_users,5] = (F_p,T_p,R_p,AOV_p,Prem_p), clv [n_users] = N̂×V̂.
+    F/AOV는 구매 건(장바구니) 단위, Prem은 단가 기준. 축소추정 없음."""
     win_end = train["t"].max()
     span = win_end - train["t"].min()
     win_days = max((span.days if is_date else span), 1)
@@ -269,10 +274,9 @@ def clv_features(train, n_users, cfg, is_date):
     gb = basket.groupby(level="u_idx", sort=False)
     g = pd.DataFrame({"F": gb.size(), "first": gb["btime"].min(),
                       "last": gb["btime"].max(), "AOV": gb["bval"].mean()})
-
     prem_flag = (train["up"].rank(pct=True) > cfg["PREMIUM_THR"]).astype("int8")
     g = g.join(train.assign(_p=prem_flag).groupby("u_idx")["_p"].agg(prem="sum", n_line="count"))
-    g["Prem"] = g["prem"] / g["n_line"]          # 축소추정 없이 관측 비율 그대로
+    g["Prem"] = g["prem"] / g["n_line"]
 
     if is_date:
         T = (g["last"] - g["first"]).dt.days
@@ -291,40 +295,44 @@ def clv_features(train, n_users, cfg, is_date):
     x[g.index.values] = g[["F_p", "T_p", "R_p", "AOV_p", "Prem_p"]].values.astype(np.float32)
     clv = np.full(n_users, np.nan)
     clv[g.index.values] = g["CLV"].values
-    print(f"  유저 가치 입력: [F_p,T_p,R_p,AOV_p,Prem_p] {x.shape} (축소추정 없음)")
+    print(f"  유저 가치 입력 [F_p,T_p,R_p,AOV_p,Prem_p] {x.shape} (축소추정 없음)")
     return x, clv
 
 
 def clv_gate(clv):
-    """gate(u) = percentile_rank(CLV_u). 선형 0~1. CLV가 없는 유저(train 이력 없음)는 0."""
-    s = pd.Series(clv)
-    gate = s.rank(pct=True).to_numpy(np.float32)
+    """gate(u) = percentile_rank(CLV_u). 선형 0~1. CLV 없는 유저는 0."""
+    gate = pd.Series(clv).rank(pct=True).to_numpy(np.float32)
     gate[np.isnan(clv)] = 0.0
     return gate
 
 
+def segment_thresholds(clv, edges):
+    """train 전체 고객 기준으로 한 번 계산해 고정. val/test/holdout·모든 λ가 같은 임계값을
+    쓴다 — 평가 집단마다 다시 계산하면 val의 고CLV와 test의 고CLV가 다른 고객군이 된다."""
+    valid = clv[~np.isnan(clv)]
+    lo, hi = np.quantile(valid, edges[0]), np.quantile(valid, edges[1])
+    print(f"  세그먼트 임계값(train 전체 {len(valid):,}명 고정): 저≤{lo:.4f} < 중 < 고≥{hi:.4f}")
+    return float(lo), float(hi)
+
+
 def item_value_features(train, n_items):
-    """아이템 가치 입력 = [가격백분위, 카테고리내 가격순위] + 카테고리 ID(임베딩용).
-    가격은 라인 금액이 아니라 **단가(up)** 중앙값 기준."""
+    """[가격백분위, 카테고리내 가격순위] + 카테고리 ID. 가격은 단가(up) 중앙값 기준."""
     g = train.groupby("i_idx").agg(med=("up", "median"))
     price_pct = np.full(n_items, 0.5, np.float32)
     price_pct[g.index.values] = g["med"].rank(pct=True).to_numpy(np.float32)
-
     cat_of = train.groupby("i_idx")["cat_idx"].agg(lambda s: s.mode().iat[0])
     within = np.full(n_items, 0.5, np.float32)
     joined = g.join(cat_of.rename("cat_idx"))
     for c, sub in joined.groupby("cat_idx"):
         within[sub.index.values] = sub["med"].rank(pct=True).to_numpy(np.float32)
-
     cat_arr = np.zeros(n_items, dtype=np.int64)
     cat_arr[cat_of.index.values] = cat_of.values
-    x = np.stack([price_pct, within], axis=1)
-    print(f"  아이템 가치 입력: [가격백분위, 카테고리내 가격순위] {x.shape} + 카테고리 임베딩")
-    return x.astype(np.float32), cat_arr
+    x = np.stack([price_pct, within], axis=1).astype(np.float32)
+    print(f"  아이템 가치 입력 [가격백분위, 카테고리내 가격순위] {x.shape} + 카테고리 임베딩")
+    return x, cat_arr
 
 
 def item_meta(train, n_items):
-    """평가용 아이템 부가정보 (가격백분위/인기도/카테고리)."""
     pop = np.bincount(train["i_idx"].values.astype(np.int64), minlength=n_items).astype(np.float64)
     med = train.groupby("i_idx")["up"].median()
     price_pct = np.full(n_items, 0.5, np.float64)
@@ -336,8 +344,18 @@ def item_meta(train, n_items):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 모델
+# 모델 — 점수식은 combined_score_* 한 쌍만 쓴다 (학습·평가 동일)
 # ═══════════════════════════════════════════════════════════════════
+def combined_score_pairs(Up, Ip, Uv, Iv, gate, lam, u, i):
+    """(u,i) 쌍의 점수. BPR 학습용. raw dot product."""
+    return (Up[u] * Ip[i]).sum(1) + lam * gate[u] * (Uv[u] * Iv[i]).sum(1)
+
+
+def combined_score_all(Up, Ip, Uv, Iv, gate, lam, u):
+    """유저 배치 × 전체 아이템 점수 [B, n_items]. 평가용. 위와 같은 정의여야 한다."""
+    return Up[u] @ Ip.T + (lam * gate[u]).unsqueeze(1) * (Uv[u] @ Iv.T)
+
+
 class MLP(nn.Module):
     def __init__(self, in_dim, hidden, out_dim):
         super().__init__()
@@ -349,32 +367,27 @@ class MLP(nn.Module):
 
 
 class DualSpaceLightGCN(nn.Module):
-    """선호 공간과 가치 공간을 분리한 LightGCN.
+    """z^pref: 자유 임베딩 + 표준 LightGCN 전파(협업 공간).
+    z^value: CLV 변수/가격 속성 MLP 출력, **전파 없음**(속성 공간).
 
-    z^pref : 자유 임베딩 + **표준 LightGCN 전파**(협업 공간)
-    z^value: CLV 변수/가격 속성 MLP 출력, **전파 없음**(속성 공간)
+    가치 블록에 전파를 태우지 않는 이유: (1) 태우면 유저 가치 임베딩이 "산 물건들의
+    평균"이 되는데 그건 z^pref가 이미 하는 일이라 같은 협업 신호를 중복 학습한다.
+    (2) two_stage 쪽은 구조상 MLP라 전파가 없어, joint만 태우면 두 아키텍처가 두 가지
+    점에서 달라져 비교가 해석되지 않는다."""
 
-    가치 블록에 전파를 태우지 않는 이유는 두 가지다. (1) 전파를 태우면 유저의 가치
-    임베딩이 "이 유저가 산 물건들의 평균"이 되는데 그건 z^pref가 이미 하는 일이라
-    같은 협업 신호를 두 번 학습하게 된다. (2) two_stage 쪽 가치 블록은 구조상 MLP라
-    전파가 없으므로, joint만 태우면 두 아키텍처가 두 가지 점에서 달라져 비교가
-    해석되지 않는다.
-    """
     def __init__(self, n_users, n_items, n_cat, x_val_u, x_item, item_cat, cfg, adj):
         super().__init__()
         self.n_users, self.n_items, self.cfg, self.adj = n_users, n_items, cfg, adj
-        self.E_u = nn.Embedding(n_users, cfg["DIM"])
-        self.E_i = nn.Embedding(n_items, cfg["DIM"])
+        self.E_u = nn.Embedding(n_users, cfg["DIM"]); self.E_i = nn.Embedding(n_items, cfg["DIM"])
         nn.init.normal_(self.E_u.weight, std=0.1); nn.init.normal_(self.E_i.weight, std=0.1)
-
         self.cat_emb = nn.Embedding(n_cat, cfg["CAT_EMB_DIM"])
         nn.init.normal_(self.cat_emb.weight, std=0.1)
         self.mlp_u = MLP(x_val_u.shape[1], cfg["MLP_HIDDEN"], cfg["D_VALUE"])
         self.mlp_i = MLP(x_item.shape[1] + cfg["CAT_EMB_DIM"], cfg["MLP_HIDDEN"], cfg["D_VALUE"])
-
         self.register_buffer("x_val_u", torch.from_numpy(x_val_u))
         self.register_buffer("x_item", torch.from_numpy(x_item))
         self.register_buffer("item_cat", torch.from_numpy(item_cat))
+        self._pref_cache = None          # 동결 학습(stage2) 중 전파 재계산을 피하기 위한 캐시
 
     def pref_params(self):
         return list(self.E_u.parameters()) + list(self.E_i.parameters())
@@ -384,7 +397,6 @@ class DualSpaceLightGCN(nn.Module):
                 + list(self.mlp_i.parameters()))
 
     def propagate_pref(self):
-        """표준 LightGCN: 층별 임베딩의 평균."""
         x = torch.cat([self.E_u.weight, self.E_i.weight], dim=0)
         out = x
         for _ in range(self.cfg["N_LAYERS"]):
@@ -393,27 +405,57 @@ class DualSpaceLightGCN(nn.Module):
         out = out / (self.cfg["N_LAYERS"] + 1)
         return out[:self.n_users], out[self.n_users:]
 
+    def freeze_pref_and_cache(self):
+        """선호 블록을 동결하고 전파 결과를 한 번만 계산해 둔다. stage2가 매 배치
+        희소행렬 곱을 다시 하지 않도록 하는 것 — 동결됐으므로 값이 변하지 않는다."""
+        for p in self.pref_params():
+            p.requires_grad_(False)
+        with torch.no_grad():
+            self._pref_cache = tuple(t.detach() for t in self.propagate_pref())
+
+    def pref_emb(self):
+        return self._pref_cache if self._pref_cache is not None else self.propagate_pref()
+
     def value_emb(self):
         zu = self.mlp_u(self.x_val_u)
         zi = self.mlp_i(torch.cat([self.x_item, self.cat_emb(self.item_cat)], dim=1))
         return zu, zi
 
-    def embeddings(self):
-        Up, Ip = self.propagate_pref()
+    def embeddings(self, need_value=True):
+        Up, Ip = self.pref_emb()
+        if not need_value:      # stage1은 λ=0이라 가치항이 점수에 기여하지 않는다
+            return Up, Ip, None, None
         Uv, Iv = self.value_emb()
         return Up, Ip, Uv, Iv
 
-    def bpr_loss(self, u, i, j, gate_t, lam):
+    def bpr_loss(self, u, i, j, gate, lam):
+        need_value = lam != 0.0
+        Up, Ip, Uv, Iv = self.embeddings(need_value=need_value)
+        if not need_value:
+            pos = (Up[u] * Ip[i]).sum(1); neg = (Up[u] * Ip[j]).sum(1)
+        else:
+            pos = combined_score_pairs(Up, Ip, Uv, Iv, gate, lam, u, i)
+            neg = combined_score_pairs(Up, Ip, Uv, Iv, gate, lam, u, j)
+        return -F.logsigmoid(pos - neg).mean()
+
+    @torch.no_grad()
+    def score_diagnostics(self, gate, n_sample=512, seed=0):
+        """학습된 상대 스케일 진단 — λ=1이 실제로 어느 정도의 개입인지 확인용."""
         Up, Ip, Uv, Iv = self.embeddings()
-        gu = gate_t[u].unsqueeze(1)
-        su = Up[u]; sv = Uv[u] * (lam * gu)
-        pos = (su * Ip[i]).sum(1) + (sv * Iv[i]).sum(1)
-        neg = (su * Ip[j]).sum(1) + (sv * Iv[j]).sum(1)
-        return -torch.log(torch.sigmoid(pos - neg) + 1e-10).mean()
+        rng = np.random.default_rng(seed)
+        us = torch.as_tensor(rng.choice(self.n_users, min(n_sample, self.n_users), replace=False),
+                             dtype=torch.long, device=Up.device)
+        sp = (Up[us] @ Ip.T); sv = (Uv[us] @ Iv.T)
+        return {"std_s_pref": float(sp.std()), "std_s_value": float(sv.std()),
+                "ratio_value_over_pref": float(sv.std() / (sp.std() + 1e-12)),
+                "mean_norm_U_pref": float(Up.norm(dim=1).mean()),
+                "mean_norm_I_pref": float(Ip.norm(dim=1).mean()),
+                "mean_norm_U_value": float(Uv.norm(dim=1).mean()),
+                "mean_norm_I_value": float(Iv.norm(dim=1).mean())}
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 지표 계산 — v2에서 그대로 이식
+# 지표
 # ═══════════════════════════════════════════════════════════════════
 def _gini(x):
     x = np.sort(np.asarray(x, dtype=np.float64)); n = len(x)
@@ -439,21 +481,18 @@ def build_pos_lookup(gt, rev, n_items):
 def build_ideal_rev_cumsum(gt, rev):
     out = {}
     for u in gt:
-        sorted_rev = np.sort(rev[u])[::-1]
-        disc = 1.0 / np.log2(np.arange(2, len(sorted_rev) + 2))
-        out[u] = np.cumsum(sorted_rev * disc)
+        sr = np.sort(rev[u])[::-1]
+        out[u] = np.cumsum(sr * (1.0 / np.log2(np.arange(2, len(sr) + 2))))
     return out
 
 
 def score_topk(topk, bu, ks, pos_key_sorted, pos_rev_sorted, n_items,
                P_arr, price_pct, item_nov, cat_arr, ideal_rev_cumsum):
-    """배치 전체를 numpy 벡터 연산으로 채점. 반환 {k: {metric: [batch]}}."""
     batch, max_k = topk.shape
     keys = bu[:, None].astype(np.int64) * n_items + topk.astype(np.int64)
     idx = np.clip(np.searchsorted(pos_key_sorted, keys), 0, len(pos_key_sorted) - 1)
     is_hit = pos_key_sorted[idx] == keys
     gain = np.where(is_hit, pos_rev_sorted[idx], 0.0)
-
     disc_full = 1.0 / np.log2(np.arange(2, max_k + 2))
     P_batch = P_arr[bu]
     price_row = price_pct[topk]; nov_row = item_nov[topk]; cat_row = cat_arr[topk]
@@ -461,53 +500,50 @@ def score_topk(topk, bu, ks, pos_key_sorted, pos_rev_sorted, n_items,
     out = {}
     for k in ks:
         hit_k = is_hit[:, :k]; gain_k = gain[:, :k]; disc_k = disc_full[:k]
-        nh = hit_k.sum(axis=1)
-        Pk = np.minimum(P_batch, k)
+        nh = hit_k.sum(axis=1); Pk = np.minimum(P_batch, k)
         idcg = np.where(Pk > 0, np.cumsum(disc_k)[np.maximum(Pk, 1) - 1], 0.0)
         dcg = (hit_k * disc_k).sum(axis=1)
-        cum_hits = np.cumsum(hit_k, axis=1)
-        map_num = (cum_hits * hit_k / np.arange(1, k + 1)).sum(axis=1)
+        map_num = (np.cumsum(hit_k, axis=1) * hit_k / np.arange(1, k + 1)).sum(axis=1)
         idcgv = np.array([ideal_rev_cumsum[u][min(len(ideal_rev_cumsum[u]), k) - 1]
                            if len(ideal_rev_cumsum[u]) > 0 else 0.0 for u in bu])
         dcgv = (gain_k * disc_k).sum(axis=1)
-        cat_k = cat_row[:, :k]
-        div = np.array([len(np.unique(row)) / k for row in cat_k])
-        out[k] = {
-            "recall": np.where(P_batch > 0, nh / np.maximum(P_batch, 1), 0.0),
-            "precision": nh / k,
-            "ndcg": np.where(idcg > 0, dcg / np.maximum(idcg, 1e-12), 0.0),
-            "hr": (nh > 0).astype(np.float64),
-            "map": np.where(Pk > 0, map_num / np.maximum(Pk, 1), 0.0),
-            "revenue": gain_k.sum(axis=1),
-            "vndcg": np.where(idcgv > 0, dcgv / np.maximum(idcgv, 1e-12), 0.0),
-            "arp": price_row[:, :k].mean(axis=1),
-            "novelty": nov_row[:, :k].mean(axis=1),
-            "diversity": div,
-        }
+        div = np.array([len(np.unique(r)) / k for r in cat_row[:, :k]])
+        out[k] = {"recall": np.where(P_batch > 0, nh / np.maximum(P_batch, 1), 0.0),
+                  "precision": nh / k,
+                  "ndcg": np.where(idcg > 0, dcg / np.maximum(idcg, 1e-12), 0.0),
+                  "hr": (nh > 0).astype(np.float64),
+                  "map": np.where(Pk > 0, map_num / np.maximum(Pk, 1), 0.0),
+                  "revenue": gain_k.sum(axis=1),
+                  "vndcg": np.where(idcgv > 0, dcgv / np.maximum(idcgv, 1e-12), 0.0),
+                  "arp": price_row[:, :k].mean(axis=1),
+                  "novelty": nov_row[:, :k].mean(axis=1),
+                  "diversity": div}
     return out
 
 
+class EvalCache:
+    """split 하나에 대해 재사용되는 조회표. λ마다·epoch마다 다시 만들지 않는다."""
+    def __init__(self, gt, rev, clv, seg_th, n_items):
+        self.gt, self.rev = gt, rev
+        self.users = np.array(list(gt.keys()))
+        self.pos_key, self.pos_rev = build_pos_lookup(gt, rev, n_items)
+        self.ideal = build_ideal_rev_cumsum(gt, rev)
+        self.P_arr = np.zeros(int(self.users.max()) + 1, dtype=np.int64)
+        for u in gt: self.P_arr[u] = len(gt[u])
+        med = np.nanmedian(clv)
+        uclv = np.array([clv[u] if not np.isnan(clv[u]) else med for u in self.users])
+        lo, hi = seg_th
+        self.uclv = uclv
+        self.seg = np.where(uclv <= lo, "저CLV", np.where(uclv >= hi, "고CLV", "중CLV"))
+        self.seg_cnt = {s: int((self.seg == s).sum()) for s in SEG_NAMES}
+
+
 @torch.no_grad()
-def evaluate(model, lam, gate_t, gt, rev, meta, clv, ks, csr_ptr, csr_items, cfg,
-             seg_edges, per_user=False):
-    """λ 하나로 채점. per_user=True면 부트스트랩용 유저별 배열도 함께 반환."""
+def evaluate(model, lam, gate_t, cache, meta, ks, csr_ptr, csr_items, cfg, per_user=False):
     Up, Ip, Uv, Iv = model.embeddings()
     n_items = Ip.shape[0]
     price_pct, pop_prob, cat = meta["price_pct"], meta["pop_prob"], meta["cat"]
     item_nov = -np.log2(pop_prob + 1e-12)
-
-    users = list(gt.keys())
-    users_arr = np.array(users)
-    med_clv = np.nanmedian(clv)
-    uclv = np.array([clv[u] if not np.isnan(clv[u]) else med_clv for u in users])
-    lo, hi = np.nanquantile(uclv, seg_edges[0]), np.nanquantile(uclv, seg_edges[1])
-    seg_arr = np.where(uclv <= lo, "저CLV", np.where(uclv >= hi, "고CLV", "중CLV"))
-    seg_cnt = {s: int((seg_arr == s).sum()) for s in SEG_NAMES}
-
-    pos_key_sorted, pos_rev_sorted = build_pos_lookup(gt, rev, n_items)
-    ideal = build_ideal_rev_cumsum(gt, rev)
-    P_arr = np.zeros(int(users_arr.max()) + 1, dtype=np.int64)
-    for u in users: P_arr[u] = len(gt[u])
 
     overall = {k: {m: 0.0 for m in _METS} for k in ks}
     seg_acc = {k: {s: {m: 0.0 for m in _METS} for s in SEG_NAMES} for k in ks}
@@ -516,39 +552,35 @@ def evaluate(model, lam, gate_t, gt, rev, meta, clv, ks, csr_ptr, csr_items, cfg
     pu = {m: [] for m in _METS} if per_user else None
     max_k, k0 = max(ks), ks[0]
 
-    for s0 in range(0, len(users), cfg["EVAL_BATCH"]):
-        bu = users_arr[s0:s0 + cfg["EVAL_BATCH"]]
+    for s0 in range(0, len(cache.users), cfg["EVAL_BATCH"]):
+        bu = cache.users[s0:s0 + cfg["EVAL_BATCH"]]
         ut = torch.as_tensor(bu, dtype=torch.long, device=DEVICE)
-        s_rel = Up[ut] @ Ip.T
-        s_val = Uv[ut] @ Iv.T
-        s_rel = (s_rel - s_rel.mean(1, keepdim=True)) / (s_rel.std(1, keepdim=True) + 1e-8)
-        s_val = (s_val - s_val.mean(1, keepdim=True)) / (s_val.std(1, keepdim=True) + 1e-8)
-        scores = s_rel + lam * gate_t[ut].unsqueeze(1) * s_val
+        scores = combined_score_all(Up, Ip, Uv, Iv, gate_t, lam, ut)
         for bi, u in enumerate(bu):
             a, b = csr_ptr[u], csr_ptr[u + 1]
             if b > a: scores[bi, csr_items[a:b]] = -1e9
         topk = scores.topk(max_k, dim=1).indices.cpu().numpy()
-        res = score_topk(topk, bu, ks, pos_key_sorted, pos_rev_sorted, n_items,
-                         P_arr, price_pct, item_nov, cat, ideal)
-        bseg = seg_arr[s0:s0 + cfg["EVAL_BATCH"]]
+        res = score_topk(topk, bu, ks, cache.pos_key, cache.pos_rev, n_items,
+                         cache.P_arr, price_pct, item_nov, cat, cache.ideal)
+        bseg = cache.seg[s0:s0 + cfg["EVAL_BATCH"]]
         for k in ks:
             for m in _METS:
                 overall[k][m] += res[k][m].sum()
                 for sg in SEG_NAMES:
-                    mask = bseg == sg
-                    if mask.any(): seg_acc[k][sg][m] += res[k][m][mask].sum()
+                    msk = bseg == sg
+                    if msk.any(): seg_acc[k][sg][m] += res[k][m][msk].sum()
             for bi in range(len(bu)): expo[k][topk[bi, :k]] += 1
         if per_user:
             for m in _METS: pu[m].append(res[k0][m])
-        cal_v.extend(uclv[s0:s0 + cfg["EVAL_BATCH"]]); cal_p.extend(res[k0]["arp"].tolist())
+        cal_v.extend(cache.uclv[s0:s0 + cfg["EVAL_BATCH"]]); cal_p.extend(res[k0]["arp"].tolist())
 
-    n = len(users)
+    n = len(cache.users)
     for k in ks:
         for m in _METS:
             overall[k][m] /= n
             for sg in SEG_NAMES:
-                if seg_cnt[sg]: seg_acc[k][sg][m] /= seg_cnt[sg]
-    out = dict(overall=overall, seg=seg_acc, seg_cnt=seg_cnt, n_eval=n,
+                if cache.seg_cnt[sg]: seg_acc[k][sg][m] /= cache.seg_cnt[sg]
+    out = dict(overall=overall, seg=seg_acc, seg_cnt=cache.seg_cnt, n_eval=n,
                coverage={k: float((expo[k] > 0).sum()) / n_items for k in ks},
                gini={k: _gini(expo[k]) for k in ks},
                value_alignment=_spearman(cal_v, cal_p))
@@ -561,9 +593,8 @@ def evaluate(model, lam, gate_t, gt, rev, meta, clv, ks, csr_ptr, csr_items, cfg
 # 학습
 # ═══════════════════════════════════════════════════════════════════
 def sample_negatives(u_arr, n_items, pos_key, rng, max_try=50):
-    """균등 무작위 negative 샘플링 (LightGCN 원논문). v2의 hard negative는 제거."""
-    n = len(u_arr)
-    neg = rng.integers(0, n_items, size=n)
+    """균등 무작위 (LightGCN 원논문)."""
+    neg = rng.integers(0, n_items, size=len(u_arr))
     u64 = u_arr.astype(np.int64)
     for _ in range(max_try):
         key = u64 * n_items + neg
@@ -574,15 +605,15 @@ def sample_negatives(u_arr, n_items, pos_key, rng, max_try=50):
     return neg
 
 
-def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, meta, clv):
-    """BPR로 params만 학습. val recall@10(λ=lam_train 기준)로 조기종료."""
-    if not params:
-        return model
+def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, meta):
+    """BPR로 params만 학습. 조기종료가 수렴점을 결정한다(상한 EPOCHS).
+    학습량(업데이트 수·샘플 수·시간)을 함께 기록해 아키텍처 간 비교에 쓴다."""
     opt = torch.optim.Adam(params, lr=cfg["LR"], weight_decay=cfg["WD"])
     rng = np.random.default_rng(seed)
     tr_u, tr_i, pos_key = d["tr_u"], d["tr_i"], d["pos_key"]
     n_train = len(tr_u); n_batch = math.ceil(n_train / cfg["BATCH_SIZE"])
     best, best_ep, best_state, bad = -1.0, -1, None, 0
+    updates, samples, t_start = 0, 0, time.time()
 
     for ep in range(1, cfg["EPOCHS"] + 1):
         model.train(); t0 = time.time()
@@ -596,11 +627,11 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, meta, clv):
                                   torch.as_tensor(bj, dtype=torch.long, device=DEVICE),
                                   gate_t, lam_train)
             opt.zero_grad(); loss.backward(); opt.step()
-            tot += loss.item()
+            tot += loss.item(); updates += 1; samples += len(idx)
         model.eval()
-        r = evaluate(model, lam_train, gate_t, d["val_gt"], d["val_rev"], meta, clv,
-                     [10], d["csr_ptr"], d["csr_items"], cfg, CFG["SEG_EDGES"])
-        score = r["overall"][10]["recall"]
+        r = evaluate(model, lam_train, gate_t, val_cache, meta, [cfg["SELECT_K"]],
+                     d["csr_ptr"], d["csr_items"], cfg)
+        score = r["overall"][cfg["SELECT_K"]][cfg["SELECT_METRIC"]]
         star = ""
         if score > best:
             best, best_ep, bad = score, ep, 0
@@ -608,52 +639,115 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, meta, clv):
             star = " ★"
         else:
             bad += 1
-        print(f"  [{tag}] ep {ep:3d} | loss {tot/n_batch:.4f} | val recall@10 {score:.5f} "
-              f"| {time.time()-t0:.0f}s{star}")
+        print(f"  [{tag}] ep {ep:3d} | loss {tot/n_batch:.4f} | "
+              f"val {cfg['SELECT_METRIC']}@{cfg['SELECT_K']} {score:.5f} | {time.time()-t0:.0f}s{star}")
         if bad >= cfg["EARLY_STOP"]:
             print(f"  [{tag}] early stop"); break
+
     if best_state is not None:
         model.load_state_dict(best_state)
-    print(f"  [{tag}] 완료 — best epoch {best_ep}, val recall@10 {best:.5f}")
-    return model
+    # 값은 전부 순수 파이썬 타입으로 — numpy 스칼라가 섞이면 체크포인트를
+    # torch.load(weights_only=True)로 되읽을 수 없다.
+    stats = {"phase": tag, "best_epoch": int(best_ep), "epochs_run": int(ep),
+             f"best_val_{cfg['SELECT_METRIC']}@{cfg['SELECT_K']}": float(best),
+             "updates": int(updates), "samples": int(samples),
+             "wall_clock_sec": round(time.time() - t_start, 1)}
+    print(f"  [{tag}] 완료 — best ep {best_ep}/{ep}, val {best:.5f}, "
+          f"업데이트 {updates:,}회, 샘플 {samples:,}건, {stats['wall_clock_sec']:.0f}s")
+    return stats
 
 
-def train_model(d, gate_t, x_val_u, x_item, item_cat, meta, clv, cfg, seed):
-    """ARCH에 따라 학습 절차만 달라진다. 모델 구조·입력·gate·λ는 완전히 동일."""
+def build_model(d, x_val_u, x_item, item_cat, cfg):
+    return DualSpaceLightGCN(d["n_users"], d["n_items"], d["n_cat"],
+                             x_val_u, x_item, item_cat, cfg, d["adj"]).to(DEVICE)
+
+
+def get_or_train(arch, seed, d, gate_t, x_val_u, x_item, item_cat, meta, val_cache, cfg):
+    """arch별 학습. pref_only 체크포인트는 two_stage가 stage2 초기값으로 재사용한다."""
+    out = Path(cfg["OUT_DIR"]); out.mkdir(parents=True, exist_ok=True)
+    ck = out / f"ckpt_{arch}_{cfg['DATASET']}_s{seed}_{cfg_hash(cfg, DCFG, arch, seed)}.pt"
+    if ck.exists():
+        model = build_model(d, x_val_u, x_item, item_cat, cfg)
+        blob = torch.load(ck, map_location=DEVICE)
+        model.load_state_dict(blob["state"])
+        print(f"[{arch} s{seed}] 체크포인트 로드 ({ck.name})")
+        return model, blob["train_stats"]
+
     set_seed(seed)
-    model = DualSpaceLightGCN(d["n_users"], d["n_items"], d["n_cat"],
-                              x_val_u, x_item, item_cat, cfg, d["adj"]).to(DEVICE)
-    if cfg["ARCH"] == "joint":
-        # 선호·가치 블록을 같은 BPR 손실로 동시에 학습 (LightGCN 1회 학습)
-        train_phase(model, list(model.parameters()), d, gate_t, cfg["LAMBDA_TRAIN"],
-                    cfg, seed, "joint", meta, clv)
-    elif cfg["ARCH"] == "two_stage":
-        # 1단계: 선호 블록만 (λ=0 → 순수 LightGCN). 가치 블록은 점수에 관여하지 않는다.
-        train_phase(model, model.pref_params(), d, gate_t, 0.0, cfg, seed, "stage1-pref", meta, clv)
-        # 2단계: 선호 블록 동결, 가치 블록만
-        for p in model.pref_params(): p.requires_grad_(False)
-        train_phase(model, model.value_params(), d, gate_t, cfg["LAMBDA_TRAIN"],
-                    cfg, seed, "stage2-value", meta, clv)
+    if arch == "pref_only":
+        model = build_model(d, x_val_u, x_item, item_cat, cfg)
+        stats = [train_phase(model, model.pref_params(), d, gate_t, 0.0, cfg, seed,
+                             "pref_only", val_cache, meta)]
+    elif arch == "two_stage":
+        # stage1 = pref_only 체크포인트를 그대로 재사용 (없으면 여기서 학습됨)
+        base, base_stats = get_or_train("pref_only", seed, d, gate_t, x_val_u, x_item,
+                                        item_cat, meta, val_cache, cfg)
+        model = build_model(d, x_val_u, x_item, item_cat, cfg)
+        model.load_state_dict(base.state_dict())
+        model.freeze_pref_and_cache()
+        stats = list(base_stats) + [train_phase(model, model.value_params(), d, gate_t,
+                                                cfg["LAMBDA_TRAIN"], cfg, seed,
+                                                "two_stage-value", val_cache, meta)]
+    elif arch == "joint":
+        model = build_model(d, x_val_u, x_item, item_cat, cfg)   # 별도 random init
+        stats = [train_phase(model, list(model.parameters()), d, gate_t,
+                             cfg["LAMBDA_TRAIN"], cfg, seed, "joint", val_cache, meta)]
     else:
-        raise ValueError(f"ARCH는 'joint' 또는 'two_stage'만 가능: {cfg['ARCH']}")
-    return model
+        raise ValueError(f"ARCH: {arch}")
+
+    torch.save({"state": model.state_dict(), "train_stats": stats}, ck)
+    print(f"[{arch} s{seed}] 저장 → {ck}")
+    return model, stats
 
 
 # ═══════════════════════════════════════════════════════════════════
-# λ 스윕 + 부트스트랩
+# λ 선택 (validation) — 규칙을 코드에 사전 고정
 # ═══════════════════════════════════════════════════════════════════
-def bootstrap_ci(base_pu, lam_pu, n_boot, seed):
-    """λ=0 대비 차이의 95% 신뢰구간 (유저 단위 부트스트랩)."""
+def paired_bootstrap(base_pu, lam_pu, n_boot, seed):
+    """유저 단위 paired bootstrap. 반환 (평균차, CI하한, CI상한)."""
     rng = np.random.default_rng(seed)
-    n = len(base_pu)
     diff = lam_pu - base_pu
-    idx = rng.integers(0, n, size=(n_boot, n))
+    idx = rng.integers(0, len(diff), size=(n_boot, len(diff)))
     means = diff[idx].mean(axis=1)
     return float(diff.mean()), float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
 
+def select_lambda(val_per_seed, cfg):
+    """아키텍처별 공통 λ 하나를 validation에서 고른다. **시드별 선택은 하지 않는다.**
+
+    규칙 (실행 전 고정):
+      1. Recall@10 비열등 — 세 시드 유저를 이어붙인 paired bootstrap의 CI 하한이
+         -δ × baseline Recall@10 이상인 λ만 남긴다.
+      2. 남은 것 중 validation PWGain@10(시드 평균)이 최대인 λ.
+      3. 동률이면 더 작은 λ.
+    """
+    lams = sorted(next(iter(val_per_seed.values())).keys())
+    base_recall = np.mean([val_per_seed[s][0.0]["agg"]["overall"][10]["recall"] for s in val_per_seed])
+    delta_abs = cfg["NONINFERIORITY_DELTA"] * base_recall
+    rows = []
+    for lam in lams:
+        d_rec = np.concatenate([val_per_seed[s][lam]["pu"]["recall"] - val_per_seed[s][0.0]["pu"]["recall"]
+                                for s in val_per_seed])
+        rng = np.random.default_rng(0)
+        idx = rng.integers(0, len(d_rec), size=(cfg["N_BOOT"], len(d_rec)))
+        ci_lo = float(np.percentile(d_rec[idx].mean(axis=1), 2.5))
+        pw = np.mean([val_per_seed[s][lam]["agg"]["overall"][10]["revenue"] for s in val_per_seed])
+        rows.append({"lambda": lam, "d_recall_mean": float(d_rec.mean()), "d_recall_ci_lo": ci_lo,
+                     "passes_noninferiority": ci_lo >= -delta_abs, "val_pwgain10": float(pw)})
+    df = pd.DataFrame(rows)
+    print(f"\n[λ 선택] 비열등 기준: CI하한(ΔRecall@10) ≥ -{delta_abs:.6f} "
+          f"(= -{cfg['NONINFERIORITY_DELTA']:.1%} × baseline {base_recall:.6f})")
+    print(df.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+    ok = df[df.passes_noninferiority]
+    if ok.empty:
+        print("  → 비열등을 만족하는 λ가 없음. λ=0(개입 없음) 선택.")
+        return 0.0, df
+    best = ok.sort_values(["val_pwgain10", "lambda"], ascending=[False, True]).iloc[0]
+    print(f"  → 선택 λ = {best['lambda']} (통과 {len(ok)}/{len(df)}개 중 val PWGain@10 최대)")
+    return float(best["lambda"]), df
+
+
 def flatten(res):
-    """중첩 결과를 recall@10 / 고CLV_revenue@10 식 열로 평탄화."""
     out = {}
     for k, mets in res["overall"].items():
         for m, v in mets.items(): out[f"{m}@{k}"] = v
@@ -666,76 +760,102 @@ def flatten(res):
     return out
 
 
-def run_seed(seed, d, gate_t, x_val_u, x_item, item_cat, meta, clv, cfg):
-    tag = run_tag(cfg, DCFG, seed)
-    ckpt = Path(cfg["OUT_DIR"]) / f"ckpt_{tag}.pt"
-    model = DualSpaceLightGCN(d["n_users"], d["n_items"], d["n_cat"],
-                              x_val_u, x_item, item_cat, cfg, d["adj"]).to(DEVICE)
-    if ckpt.exists():
-        model.load_state_dict(torch.load(ckpt, map_location=DEVICE))
-        print(f"[seed {seed}] 체크포인트 로드 ({ckpt.name})")
-    else:
-        model = train_model(d, gate_t, x_val_u, x_item, item_cat, meta, clv, cfg, seed)
-        ckpt.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), ckpt)
-        print(f"[seed {seed}] 저장 → {ckpt}")
-    model.eval()
-
-    rows, base_pu = [], None
-    for lam in cfg["LAMBDA_SWEEP"]:
-        r = evaluate(model, lam, gate_t, d["test_gt"], d["test_rev"], meta, clv,
-                     cfg["K_LIST"], d["csr_ptr"], d["csr_items"], cfg,
-                     cfg["SEG_EDGES"], per_user=True)
-        pu = r.pop("per_user")
-        if lam == 0.0:
-            base_pu = pu
-        row = {"seed": seed, "arch": cfg["ARCH"], "lambda": lam, **flatten(r)}
-        if base_pu is not None:
-            for m in ["recall", "ndcg", "revenue", "arp"]:
-                mean, lo, hi = bootstrap_ci(base_pu[m], pu[m], cfg["N_BOOT"], seed)
-                row[f"d_{m}_mean"], row[f"d_{m}_lo"], row[f"d_{m}_hi"] = mean, lo, hi
-        rows.append(row)
-        sig = ""
-        if base_pu is not None and lam > 0:
-            mean, lo, hi = bootstrap_ci(base_pu["revenue"], pu["revenue"], cfg["N_BOOT"], seed)
-            sig = f" | Δ가격가중적중값 {mean:+.5f} [{lo:+.5f}, {hi:+.5f}]" + \
-                  ("  ← 유의" if lo > 0 or hi < 0 else "")
-        print(f"  λ={lam:<5} recall@10 {r['overall'][10]['recall']:.6f} "
-              f"| 가격가중적중값@10 {r['overall'][10]['revenue']:.6f} "
-              f"| 정렬도 {r['value_alignment']:+.4f}{sig}")
-    return rows
-
-
+# ═══════════════════════════════════════════════════════════════════
 def main():
-    print(f"DATASET={CFG['DATASET']} | ARCH={CFG['ARCH']} | DEVICE={DEVICE}")
-    d = prepare_data(CFG, DCFG)
-    x_val_u, clv = clv_features(d["train"], d["n_users"], CFG, DCFG["is_date"])
+    cfg, arch = CFG, CFG["ARCH"]
+    print(f"DATASET={cfg['DATASET']} | ARCH={arch} ({ARCH_LABEL[arch]}) | "
+          f"DEVICE={DEVICE} | CODE={CODE_VERSION}")
+    d = prepare_data(cfg, DCFG)
+    x_val_u, clv = clv_features(d["train"], d["n_users"], cfg, DCFG["is_date"])
     x_item, item_cat = item_value_features(d["train"], d["n_items"])
     meta = item_meta(d["train"], d["n_items"])
-    gate = clv_gate(clv)
-    gate_t = torch.from_numpy(gate).to(DEVICE)
-    print(f"  gate(u)=percentile_rank(CLV): 평균 {gate.mean():.3f}, "
-          f"하위20% 평균 {gate[gate <= np.quantile(gate, .2)].mean():.3f}")
+    gate = clv_gate(clv); gate_t = torch.from_numpy(gate).to(DEVICE)
+    seg_th = segment_thresholds(clv, cfg["SEG_EDGES"])
+    caches = {name: EvalCache(gt, rev, clv, seg_th, d["n_items"])
+              for name, (gt, rev) in d["splits"].items()}
 
-    all_rows = []
-    for seed in CFG["SEED_LIST"]:
-        print(f"\n{'='*80}\nseed {seed} | ARCH={CFG['ARCH']}\n{'='*80}")
-        all_rows += run_seed(seed, d, gate_t, x_val_u, x_item, item_cat, meta, clv, CFG)
+    # pref_only는 가치 블록이 학습되지 않는다(λ=0이라 기울기가 0). 그 상태로 λ>0을
+    # 채점하면 **무작위 초기화된** 가치 임베딩을 주입하는 셈이라 의미가 없다.
+    # baseline은 λ=0 하나만 평가한다.
+    sweep = [0.0] if arch == "pref_only" else cfg["LAMBDA_EVAL_SWEEP"]
+    if arch == "pref_only":
+        print("  (pref_only는 가치 블록이 미학습이므로 λ=0만 평가한다)")
 
-    out = Path(CFG["OUT_DIR"]); out.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(all_rows)
-    csv_path = out / f"result_v3_{CFG['ARCH']}_{CFG['DATASET']}.csv"
-    df.to_csv(csv_path, index=False, float_format="%.6f")
-    with open(str(csv_path).replace(".csv", ".json"), "w") as f:
-        json.dump({"cfg": {k: v for k, v in CFG.items() if k != "OUT_DIR"},
-                   "note_revenue": "revenue = 가격가중 추천 적중값(price-weighted gain proxy), 실제 매출 아님",
-                   "note_arp": "arp = 추천 상품의 평균 가격 백분위(인기도 기반 ARP와 다른 지표)",
-                   "rows": all_rows}, f, indent=2, default=float, ensure_ascii=False)
-    print(f"\n저장 → {csv_path}")
+    train_stats, diagnostics = {}, {}
+    val_per_seed, test_rows = {}, []
+    for seed in cfg["SEED_LIST"]:
+        print(f"\n{'='*84}\nseed {seed} | ARCH={arch}\n{'='*84}")
+        model, stats = get_or_train(arch, seed, d, gate_t, x_val_u, x_item, item_cat,
+                                    meta, caches["val"], cfg)
+        model.eval()
+        train_stats[seed] = stats
+        diagnostics[seed] = model.score_diagnostics(gate_t)
+        rat = diagnostics[seed]["ratio_value_over_pref"]
+        warn = ""
+        if arch != "pref_only" and not (0.1 <= rat <= 10):
+            warn = ("  ⚠ 두 점수의 스케일 차가 큽니다 — λ=1이 의도보다 훨씬 강한(또는 약한) "
+                    "개입일 수 있으니 LAMBDA_EVAL_SWEEP 범위를 이 비율에 맞춰 재검토할 것")
+        print(f"  진단: std(s_pref)={diagnostics[seed]['std_s_pref']:.4f} "
+              f"std(s_value)={diagnostics[seed]['std_s_value']:.4f} 비율={rat:.4f}{warn}")
 
-    print(f"\n{'='*80}\nλ 스윕 요약 (3시드 평균, test @10)\n{'='*80}")
-    g = df.groupby("lambda")[["recall@10", "ndcg@10", "revenue@10", "arp@10",
-                              "diversity@10", "coverage@10", "value_alignment"]].mean()
+        val_per_seed[seed] = {}
+        for lam in sweep:
+            r = evaluate(model, lam, gate_t, caches["val"], meta, cfg["K_LIST"],
+                         d["csr_ptr"], d["csr_items"], cfg, per_user=True)
+            val_per_seed[seed][lam] = {"pu": r.pop("per_user"), "agg": r}
+        for split in [s for s in ("test", "holdout") if s in caches]:
+            base_pu = None
+            for lam in sweep:
+                r = evaluate(model, lam, gate_t, caches[split], meta, cfg["K_LIST"],
+                             d["csr_ptr"], d["csr_items"], cfg, per_user=True)
+                pu = r.pop("per_user")
+                if lam == 0.0: base_pu = pu
+                row = {"seed": seed, "arch": arch, "split": split, "lambda": lam, **flatten(r)}
+                for m in ("recall", "ndcg", "revenue", "arp"):
+                    mean, lo, hi = paired_bootstrap(base_pu[m], pu[m], cfg["N_BOOT"], seed)
+                    row[f"d_{m}_mean"], row[f"d_{m}_lo"], row[f"d_{m}_hi"] = mean, lo, hi
+                test_rows.append(row)
+
+    sel_lambda, sel_table = select_lambda(val_per_seed, cfg)
+
+    out = Path(cfg["OUT_DIR"]); out.mkdir(parents=True, exist_ok=True)
+    stem = f"result_{arch}_{cfg['DATASET']}_{cfg_hash(cfg, DCFG, arch, cfg['SEED_LIST'][0])}"
+    df = pd.DataFrame(test_rows)
+    df.to_csv(out / f"{stem}.csv", index=False, float_format="%.6f")
+    val_rows = [{"seed": s, "arch": arch, "split": "val", "lambda": lam,
+                 **flatten(v["agg"])} for s in val_per_seed for lam, v in val_per_seed[s].items()]
+    pd.DataFrame(val_rows).to_csv(out / f"{stem}_val.csv", index=False, float_format="%.6f")
+    with open(out / f"{stem}.json", "w") as f:
+        json.dump({"code_version": CODE_VERSION,
+                   "cfg": {k: v for k, v in cfg.items() if k != "OUT_DIR"},
+                   "arch_label": ARCH_LABEL[arch],
+                   "selected_lambda_from_validation": sel_lambda,
+                   "lambda_selection_table": sel_table.to_dict("records"),
+                   "train_stats": train_stats, "score_diagnostics": diagnostics,
+                   "segment_thresholds": {"low": seg_th[0], "high": seg_th[1],
+                                          "note": "train 전체 고객 기준 고정"},
+                   "note_primary": "주 검정은 validation에서 선택된 λ 하나에만 적용한다.",
+                   "note_secondary": "test의 λ 곡선은 사전 선언된 민감도 분석이며 "
+                                     "'최적 λ'가 아니고 λ별 유의 라벨을 붙이지 않는다.",
+                   "note_revenue": "revenue = 가격가중 추천 적중값, 실제 매출 아님",
+                   "note_arp": "arp = 추천 상품의 평균 가격 백분위(인기도 기반 ARP와 다름)",
+                   }, f, indent=2, default=float, ensure_ascii=False)
+    print(f"\n저장 → {out / (stem + '.csv')}\n     → {out / (stem + '_val.csv')}")
+
+    print(f"\n{'='*84}\n[주 결과] validation 선택 λ = {sel_lambda} — test, 3시드 평균\n{'='*84}")
+    prim = df[(df.split == "test") & (df["lambda"] == sel_lambda)]
+    base = df[(df.split == "test") & (df["lambda"] == 0.0)]
+    for m in ("recall@10", "ndcg@10", "revenue@10", "arp@10", "value_alignment"):
+        print(f"  {m:<18} baseline {base[m].mean():.6f} → 선택 {prim[m].mean():.6f}")
+    for m in ("recall", "ndcg", "revenue", "arp"):
+        if f"d_{m}_mean" in prim:
+            print(f"  Δ{m:<8} {prim[f'd_{m}_mean'].mean():+.6f} "
+                  f"[{prim[f'd_{m}_lo'].mean():+.6f}, {prim[f'd_{m}_hi'].mean():+.6f}]")
+
+    print(f"\n{'='*84}\n[민감도] test λ 곡선 — 사전 선언된 descriptive 분석 (유의 라벨 없음)\n{'='*84}")
+    g = df[df.split == "test"].groupby("lambda")[
+        ["recall@10", "ndcg@10", "revenue@10", "arp@10", "diversity@10",
+         "coverage@10", "value_alignment"]].mean()
     print(g.to_string(float_format=lambda x: f"{x:.6f}"))
     return df
 
