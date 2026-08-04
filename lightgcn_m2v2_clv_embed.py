@@ -83,7 +83,7 @@ CFG = {
     # True면 이미 끝난 시드의 result_*.json이 있어도 무시하고 다시 계산한다. 이 캐시는
     # 재개 체인의 가장 바깥이라, 켜지 않으면 Stage B까지 통째로 건너뛰어 요약 파일이
     # 갱신되지 않는다(지표 저장 범위를 넓힌 뒤 기존 실험을 다시 기록할 때 필요).
-    "FORCE_SEED_RECOMPUTE": True,
+    "FORCE_SEED_RECOMPUTE": False,
 
     # ── 데이터 필터링/기간 ──
     "OUT_DIR": None,          # 아래에서 DATASET 확정 후 채움
@@ -139,7 +139,11 @@ CFG = {
 
     # ── 가드레일 (전체 종합 성과 기준 — 세그먼트별 무손실 요구는 2026-08-01 제거함) ──
     # RECALL50/HR/DIVERSITY를 0.0으로 되돌리지 말 것 — CLAUDE.md §4, λ>0 전체 탈락 버그 재현됨
-    "ACCURACY_EPSILON": 0.0,
+    # None = Recall@10 제약을 아예 걸지 않음. 0.0이면 "무손실"(baseline 이상 요구).
+    # 2026-08-04 None으로 전환 — Dunnhumby에서 ε=0이 λ>0인 50개 조합을 전부 탈락시켜
+    # 개입이 원천 봉쇄됐다(검증유저 1,149명 규모에서는 정답 1개 손실이 0.73%라 사실상
+    # 만족 불가능). 정확도 손실 자체는 아래 Recall@50/HR/Diversity가 계속 제한한다.
+    "ACCURACY_EPSILON": None,
     "RECALL50_EPSILON": 0.01,
     "HR_EPSILON": 0.01,
     "DIVERSITY_EPSILON": 0.03,
@@ -1470,7 +1474,13 @@ def run_dualspace_one_seed_phase2(seed, train, val_gt, val_rev, test_gt, test_re
         라고 명시적으로 방향을 정함 — 이전에는 저CLV Recall/PWGain 완전 무손실을 요구했었다."""
         r = res["overall"][10]["recall"]
         r50 = res["overall"][50]["recall"]; hr10 = res["overall"][10]["hr"]; div10 = res["overall"][10]["diversity"]
-        return (r >= base_val_recall * (1 - eps) - tol and
+        # eps=None이면 Recall@10 제약 자체를 걸지 않는다(2026-08-04). ε=0(무손실)은 검증유저가
+        # 적은 데이터셋에서 사실상 "아무것도 건드리지 말라"와 같아 λ>0을 전부 탈락시켰다
+        # (Dunnhumby: 정답 1개 손실이 Recall을 0.73% 움직여 λ=0.01조차 탈락).
+        # 나머지 셋(Recall@50/HR/Diversity)은 유지 — 다 빼면 정확도가 아무리 떨어져도
+        # 비싼 것만 올리면 통과가 되어 결과를 방어할 수 없다.
+        ok_r10 = True if eps is None else (r >= base_val_recall * (1 - eps) - tol)
+        return (ok_r10 and
                 r50 >= base_val_recall50 * (1 - eps_r50) - tol and
                 hr10 >= base_val_hr10 * (1 - eps_hr) - tol and
                 div10 >= base_val_div10 * (1 - eps_div) - tol)

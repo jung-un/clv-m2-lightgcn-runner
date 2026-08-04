@@ -229,8 +229,9 @@ def test_regen_grid_summary_flag_exists():
 
 
 def test_run_flags_set_for_m2_rerun():
-    """이번 run 설정: M2 전체 파이프라인 + 시드 캐시 무시(그래야 Stage B가 다시 돌아
-    전체 지표 요약이 새로 쓰인다). M1은 재학습 불필요(2026-08-04 재현성 확인 완료)."""
+    """이번 run 설정: M2 전체 파이프라인, Recall@10 가드레일 해제.
+    FORCE_SEED_RECOMPUTE는 불필요 — ACCURACY_EPSILON이 seed_result_fingerprint에
+    들어 있어 None으로 바꾸는 순간 이전(ε=0) 시드 캐시가 자동 무효화된다."""
     ns = _load_module_upto_cfg()
     cfg = ns["CFG"]
     assert cfg["DATASET"] == "dunnhumby" and cfg["WINDOW_DAYS"] is None
@@ -238,7 +239,8 @@ def test_run_flags_set_for_m2_rerun():
     assert cfg["BASELINE_ONLY"] is False
     assert cfg["REGEN_GRID_SUMMARY"] is False
     assert cfg["FORCE_M1_RETRAIN"] is False   # 켜두면 매번 14분씩 헛돎
-    assert cfg["FORCE_SEED_RECOMPUTE"] is True
+    assert cfg["FORCE_SEED_RECOMPUTE"] is False
+    assert cfg["ACCURACY_EPSILON"] is None
 
 
 def test_seed_cache_is_bypassed_when_forced():
@@ -247,3 +249,23 @@ def test_seed_cache_is_bypassed_when_forced():
     src = SCRIPT_PATH.read_text(encoding="utf-8")
     body = src.split("def load_or_run_seed")[1].split("\ndef ")[0]
     assert 'not cfg.get("FORCE_SEED_RECOMPUTE")' in body
+
+
+def test_accuracy_guardrail_can_be_disabled():
+    """ACCURACY_EPSILON=None이면 Recall@10 제약을 걸지 않는다. 나머지 세 가드레일
+    (Recall@50/HR/Diversity)은 그대로 유지돼야 한다 — 다 빼면 정확도가 아무리 떨어져도
+    비싼 것만 올리면 통과가 된다(2026-08-04)."""
+    src = SCRIPT_PATH.read_text(encoding="utf-8")
+    body = src.split("def _passes")[1].split("vt_topk_epochs")[0]
+    assert "True if eps is None else" in body
+    for kept in ("RECALL50_EPSILON", "HR_EPSILON", "DIVERSITY_EPSILON"):
+        assert kept in src
+    for kept in ("base_val_recall50", "base_val_hr10", "base_val_div10"):
+        assert kept in body, f"{kept} 가드레일이 사라졌음"
+    ns = _load_module_upto_cfg()
+    assert ns["CFG"]["ACCURACY_EPSILON"] is None
+    assert ns["CFG"]["RECALL50_EPSILON"] == 0.01
+    assert ns["CFG"]["HR_EPSILON"] == 0.01
+    assert ns["CFG"]["DIVERSITY_EPSILON"] == 0.03
+    # 지문에 들어 있어야 이전(ε=0) 시드 캐시가 자동 무효화된다
+    assert "ACCURACY_EPSILON" in src.split("def seed_result_fingerprint")[1].split("\ndef ")[0]
