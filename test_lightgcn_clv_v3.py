@@ -103,7 +103,8 @@ def test_select_lambda_picks_smallest_on_tie():
         return {"pu": {"recall": pu}, "agg": {"overall": {10: {"recall": pu.mean(), "revenue": pw}}}}
     # λ=0.5와 1.0이 PWGain 동률 → 더 작은 0.5가 뽑혀야 한다
     per_seed = {s: {0.0: mk(base, 1.0), 0.5: mk(base, 2.0), 1.0: mk(base, 2.0)} for s in (42, 43)}
-    lam, tbl = V3.select_lambda(per_seed, cfg)
+    base_per_seed = {s: mk(base, 1.0) for s in (42, 43)}      # 외부 pref_only 기준
+    lam, tbl = V3.select_lambda(per_seed, base_per_seed, cfg)
     assert lam == 0.5
 
 
@@ -251,3 +252,51 @@ def test_2x2_diagnostic_exists():
     assert "run_2x2_diagnostic" in dir(V3)
     body = _fn_ns("run_2x2_diagnostic")
     assert '"batch_l2","global_wd"' in body and '"uniform","hard50"' in body
+
+
+# ── 코드리뷰 2차(2026-08-04) 지적 반영 확인 ──────────────────────────────
+def test_comparison_baseline_is_external_pref_only():
+    """joint의 λ=0(ablation)이 아니라 외부 pref_only와 비교해야 한다."""
+    body = _fn_ns("select_lambda")
+    assert "base_per_seed[s]" in body
+    assert 'val_per_seed[s][0.0]' not in body          # 자기 λ=0 참조가 남아있으면 안 됨
+    m = _fn_ns("main")
+    assert 'get_or_train("pref_only"' in m and "base_model" in m
+    assert '"role"' in m or "role" in m                # joint λ=0을 ablation으로 표기
+
+
+def test_bootstrap_treats_seeds_as_repeated_measures():
+    """시드를 이어붙이면 같은 유저가 중복돼 CI가 좁아진다. 유저별 시드 평균 후 재표집."""
+    body = _fn_ns("paired_bootstrap")
+    assert "np.stack(diffs_per_seed)" in body
+    assert "d.mean(axis=0)" in body                    # 유저별 시드 평균이 먼저
+    assert "per_seed_sd" in body
+    # 실제 동작: 동일 diff를 3시드로 주면 1시드일 때와 CI 폭이 비슷해야 한다
+    rng = np.random.default_rng(0)
+    d = rng.normal(0.01, 0.05, 500)
+    one = V3.paired_bootstrap([d], 500)
+    three = V3.paired_bootstrap([d, d, d], 500)
+    w1 = one["hi"] - one["lo"]; w3 = three["hi"] - three["lo"]
+    assert abs(w1 - w3) / w1 < 0.15                    # 표본이 3배로 부풀지 않음
+
+
+def test_value_mlp_has_no_output_layernorm():
+    """출력 LayerNorm이 있으면 가치 점수 크기가 학습과 무관하게 고정돼
+    joint에서 학습 시작부터 선호항을 압도한다."""
+    m = V3.MLP(5, 8, 4, out_scale=0.01)
+    assert isinstance(m.net[-1], torch.nn.Linear)      # 마지막은 Linear로 끝남
+    assert not any(isinstance(l, torch.nn.LayerNorm) for l in list(m.net)[3:])
+    out = m(torch.randn(64, 5))
+    assert out.std() < 0.2                             # 초기 출력이 작아야 함
+    assert "VALUE_OUT_SCALE" in V3.CFG
+
+
+def test_result_hash_covers_evaluation_rules():
+    """시드 목록·λ 스윕·δ·K만 바꿔도 결과 파일이 덮어써지면 안 된다."""
+    import copy
+    c = copy.deepcopy(V3.CFG)
+    h0 = V3.result_hash(c, V3.DCFG, "joint")
+    for key, val in [("SEED_LIST", [1, 2]), ("LAMBDA_EVAL_SWEEP", [0.0, 9.0]),
+                     ("NONINFERIORITY_DELTA", 0.05), ("K_LIST", [5]), ("N_BOOT", 7)]:
+        c2 = copy.deepcopy(V3.CFG); c2[key] = val
+        assert V3.result_hash(c2, V3.DCFG, "joint") != h0, f"{key}가 해시에 없음"

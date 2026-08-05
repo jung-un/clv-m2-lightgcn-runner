@@ -51,7 +51,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
-CODE_VERSION = "v3.2"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.3"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -104,6 +104,10 @@ CFG = {
     "D_VALUE": 16,                    # [임의] 가치 임베딩 차원
     "MLP_HIDDEN": 32,                 # [임의] MLP 은닉
     "CAT_EMB_DIM": 16,                # [임의] 카테고리 임베딩(원핫 대신)
+    # 가치 MLP 마지막 Linear의 초기화 스케일. 출력 LayerNorm을 없앤 뒤 이 값으로
+    # 초기 가치 점수를 작게 눌러둔다 — 학습 시작부터 가치항이 선호항을 압도하면
+    # joint에서 선호공간이 학습되지 못한다(epoch 0 비율을 로그로 확인할 것).
+    "VALUE_OUT_SCALE": 0.01,          # [임의]
 
     # ── 학습 ──
     "BATCH_SIZE": 8192, "LR": 5e-4,               # [기본]
@@ -165,6 +169,18 @@ def cfg_hash(cfg, dcfg, arch, seed):
     payload = {k: cfg[k] for k in keys}
     payload.update(category_col=dcfg["category_col"], arch=arch, seed=seed, code=CODE_VERSION)
     return hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:8]
+
+
+def result_hash(cfg, dcfg, arch):
+    """**결과 파일명** 전용 해시. 학습 설정(cfg_hash)뿐 아니라 시드 목록·λ 스윕·
+    비열등 δ·평가 K·부트스트랩 횟수·세그먼트 경계까지 넣는다. v3.2까지는 첫 시드의
+    학습 해시만 써서, 시드 목록이나 평가 규칙만 바꾸면 이전 결과를 덮어썼다."""
+    payload = {"train": cfg_hash(cfg, dcfg, arch, cfg["SEED_LIST"][0]),
+               "seeds": cfg["SEED_LIST"], "lambda_eval": cfg["LAMBDA_EVAL_SWEEP"],
+               "delta": cfg["NONINFERIORITY_DELTA"], "k_list": cfg["K_LIST"],
+               "n_boot": cfg["N_BOOT"], "seg_edges": list(cfg["SEG_EDGES"]),
+               "eval_holdout": cfg["EVAL_HOLDOUT"], "code": CODE_VERSION}
+    return hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:10]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -374,11 +390,20 @@ def combined_score_all(Up, Ip, Uv, Iv, gate, lam, u):
 
 
 class MLP(nn.Module):
-    def __init__(self, in_dim, hidden, out_dim):
+    """마지막 층은 LayerNorm/활성화 없이 Linear로 끝내고 작게 초기화한다.
+
+    v3.1~3.2는 출력에 LayerNorm이 있어 가치 임베딩의 크기가 학습과 무관하게 단위
+    스케일로 고정됐다. 그 결과 학습 시작 시점부터 가치 점수가 선호 점수보다 약 100배
+    커서, λ_train=1로 함께 학습하는 joint에서는 BPR이 처음부터 가치공간에 지배되고
+    선호공간이 학습될 기회를 잃는다. 학습 후 진단으로는 늦으므로 구조에서 막는다.
+    작게 시작해두면 필요할 때 모델이 스스로 키울 수 있다."""
+    def __init__(self, in_dim, hidden, out_dim, out_scale=0.01):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden), nn.LayerNorm(hidden), nn.LeakyReLU(0.2),
-            nn.Linear(hidden, out_dim), nn.LayerNorm(out_dim), nn.LeakyReLU(0.2))
+            nn.Linear(hidden, out_dim))
+        nn.init.normal_(self.net[-1].weight, std=out_scale)
+        nn.init.zeros_(self.net[-1].bias)
     def forward(self, x):
         return self.net(x)
 
@@ -399,8 +424,9 @@ class DualSpaceLightGCN(nn.Module):
         nn.init.normal_(self.E_u.weight, std=0.1); nn.init.normal_(self.E_i.weight, std=0.1)
         self.cat_emb = nn.Embedding(n_cat, cfg["CAT_EMB_DIM"])
         nn.init.normal_(self.cat_emb.weight, std=0.1)
-        self.mlp_u = MLP(x_val_u.shape[1], cfg["MLP_HIDDEN"], cfg["D_VALUE"])
-        self.mlp_i = MLP(x_item.shape[1] + cfg["CAT_EMB_DIM"], cfg["MLP_HIDDEN"], cfg["D_VALUE"])
+        self.mlp_u = MLP(x_val_u.shape[1], cfg["MLP_HIDDEN"], cfg["D_VALUE"], cfg["VALUE_OUT_SCALE"])
+        self.mlp_i = MLP(x_item.shape[1] + cfg["CAT_EMB_DIM"], cfg["MLP_HIDDEN"],
+                         cfg["D_VALUE"], cfg["VALUE_OUT_SCALE"])
         self.register_buffer("x_val_u", torch.from_numpy(x_val_u))
         self.register_buffer("x_item", torch.from_numpy(x_item))
         self.register_buffer("item_cat", torch.from_numpy(item_cat))
@@ -774,16 +800,26 @@ def get_or_train(arch, seed, d, gate_t, x_val_u, x_item, item_cat, meta, val_cac
 # ═══════════════════════════════════════════════════════════════════
 # λ 선택 (validation) — 규칙을 코드에 사전 고정
 # ═══════════════════════════════════════════════════════════════════
-def paired_bootstrap(base_pu, lam_pu, n_boot, seed):
-    """유저 단위 paired bootstrap. 반환 (평균차, CI하한, CI상한)."""
+def paired_bootstrap(diffs_per_seed, n_boot, seed=0):
+    """유저 단위 paired bootstrap. **시드는 독립 표본이 아니다.**
+
+    diffs_per_seed: [n_seeds][n_users] — 시드별 (모델 − baseline) 유저별 차이.
+    같은 유저가 시드마다 반복되므로 이어붙여 재표집하면 표본 수가 부풀어 신뢰구간이
+    실제보다 좁아진다(v3.2까지의 버그). 유저별로 시드 평균을 먼저 낸 뒤 **유저를**
+    재표집한다. 시드 간 변동은 per_seed_mean/sd로 따로 보고한다."""
+    d = np.stack(diffs_per_seed)                 # [S, U] — 같은 split이면 유저 순서 동일
+    dbar = d.mean(axis=0)
     rng = np.random.default_rng(seed)
-    diff = lam_pu - base_pu
-    idx = rng.integers(0, len(diff), size=(n_boot, len(diff)))
-    means = diff[idx].mean(axis=1)
-    return float(diff.mean()), float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
+    idx = rng.integers(0, len(dbar), size=(n_boot, len(dbar)))
+    means = dbar[idx].mean(axis=1)
+    return {"mean": float(dbar.mean()),
+            "lo": float(np.percentile(means, 2.5)),
+            "hi": float(np.percentile(means, 97.5)),
+            "per_seed_mean": [float(x) for x in d.mean(axis=1)],
+            "per_seed_sd": float(d.mean(axis=1).std(ddof=1)) if len(d) > 1 else 0.0}
 
 
-def select_lambda(val_per_seed, cfg):
+def select_lambda(val_per_seed, base_per_seed, cfg):
     """아키텍처별 공통 λ 하나를 validation에서 고른다. **시드별 선택은 하지 않는다.**
 
     규칙 (실행 전 고정):
@@ -793,18 +829,18 @@ def select_lambda(val_per_seed, cfg):
       3. 동률이면 더 작은 λ.
     """
     lams = sorted(next(iter(val_per_seed.values())).keys())
-    base_recall = np.mean([val_per_seed[s][0.0]["agg"]["overall"][10]["recall"] for s in val_per_seed])
+    # 비교 기준은 **언제나 외부 pref_only**다. joint의 λ=0은 선호 임베딩이 이미 가치항에
+    # 적응한 ablation이라 baseline이 아니다(v3.2까지 자기 λ=0과 비교하던 것을 고침).
+    base_recall = np.mean([base_per_seed[s]["agg"]["overall"][10]["recall"] for s in base_per_seed])
     delta_abs = cfg["NONINFERIORITY_DELTA"] * base_recall
     rows = []
     for lam in lams:
-        d_rec = np.concatenate([val_per_seed[s][lam]["pu"]["recall"] - val_per_seed[s][0.0]["pu"]["recall"]
-                                for s in val_per_seed])
-        rng = np.random.default_rng(0)
-        idx = rng.integers(0, len(d_rec), size=(cfg["N_BOOT"], len(d_rec)))
-        ci_lo = float(np.percentile(d_rec[idx].mean(axis=1), 2.5))
+        ci = paired_bootstrap([val_per_seed[s][lam]["pu"]["recall"] - base_per_seed[s]["pu"]["recall"]
+                               for s in val_per_seed], cfg["N_BOOT"])
         pw = np.mean([val_per_seed[s][lam]["agg"]["overall"][10]["revenue"] for s in val_per_seed])
-        rows.append({"lambda": lam, "d_recall_mean": float(d_rec.mean()), "d_recall_ci_lo": ci_lo,
-                     "passes_noninferiority": ci_lo >= -delta_abs, "val_pwgain10": float(pw)})
+        rows.append({"lambda": lam, "d_recall_mean": ci["mean"], "d_recall_ci_lo": ci["lo"],
+                     "d_recall_seed_sd": ci["per_seed_sd"],
+                     "passes_noninferiority": ci["lo"] >= -delta_abs, "val_pwgain10": float(pw)})
     df = pd.DataFrame(rows)
     print(f"\n[λ 선택] 비열등 기준: CI하한(ΔRecall@10) ≥ -{delta_abs:.6f} "
           f"(= -{cfg['NONINFERIORITY_DELTA']:.1%} × baseline {base_recall:.6f})")
@@ -880,7 +916,8 @@ def main():
         print("  (pref_only는 가치 블록이 미학습이므로 λ=0만 평가한다)")
 
     train_stats, diagnostics = {}, {}
-    val_per_seed, test_rows = {}, []
+    val_per_seed, base_per_seed, test_rows = {}, {}, []
+    pu_split, base_pu_split = {}, {}       # split → λ → seed → 유저별 지표
     for seed in cfg["SEED_LIST"]:
         print(f"\n{'='*84}\nseed {seed} | ARCH={arch}\n{'='*84}")
         model, stats = get_or_train(arch, seed, d, gate_t, x_val_u, x_item, item_cat,
@@ -904,30 +941,55 @@ def main():
         if warn:
             print(f"      {warn.strip()}")
 
+        # 비교 기준 = **외부 pref_only(같은 시드)**. arch가 pref_only면 자기 자신.
+        if arch == "pref_only":
+            base_model = model
+        else:
+            base_model, _ = get_or_train("pref_only", seed, d, gate_t, x_val_u, x_item,
+                                         item_cat, meta, caches["val"], cfg)
+            base_model.eval()
+
         val_per_seed[seed] = {}
         for lam in sweep:
             r = evaluate(model, lam, gate_t, caches["val"], meta, cfg["K_LIST"],
                          d["csr_ptr"], d["csr_items"], cfg, per_user=True)
             val_per_seed[seed][lam] = {"pu": r.pop("per_user"), "agg": r}
+        rb = evaluate(base_model, 0.0, gate_t, caches["val"], meta, cfg["K_LIST"],
+                      d["csr_ptr"], d["csr_items"], cfg, per_user=True)
+        base_per_seed[seed] = {"pu": rb.pop("per_user"), "agg": rb}
+
         for split in [s for s in ("test", "holdout") if s in caches]:
-            base_pu = None
+            rb2 = evaluate(base_model, 0.0, gate_t, caches[split], meta, cfg["K_LIST"],
+                           d["csr_ptr"], d["csr_items"], cfg, per_user=True)
+            base_pu_split.setdefault(split, {})[seed] = rb2.pop("per_user")
             for lam in sweep:
                 r = evaluate(model, lam, gate_t, caches[split], meta, cfg["K_LIST"],
                              d["csr_ptr"], d["csr_items"], cfg, per_user=True)
-                pu = r.pop("per_user")
-                if lam == 0.0: base_pu = pu
-                row = {"seed": seed, "arch": arch, "split": split, "lambda": lam, **flatten(r)}
-                for m in ("recall", "ndcg", "revenue", "arp"):
-                    mean, lo, hi = paired_bootstrap(base_pu[m], pu[m], cfg["N_BOOT"], seed)
-                    row[f"d_{m}_mean"], row[f"d_{m}_lo"], row[f"d_{m}_hi"] = mean, lo, hi
-                test_rows.append(row)
+                pu_split.setdefault(split, {}).setdefault(lam, {})[seed] = r.pop("per_user")
+                label = "ablation" if (arch == "joint" and lam == 0.0) else "model"
+                test_rows.append({"seed": seed, "arch": arch, "split": split,
+                                  "lambda": lam, "role": label, **flatten(r)})
 
-    sel_lambda, sel_table = select_lambda(val_per_seed, cfg)
+    # Δ는 **모든 시드를 모아** 유저 단위로 한 번에 계산한다(시드는 독립 표본이 아님).
+    delta_rows = []
+    for split, per_lam in pu_split.items():
+        for lam, per_seed in per_lam.items():
+            row = {"arch": arch, "split": split, "lambda": lam}
+            for m in ("recall", "ndcg", "revenue", "arp"):
+                ci = paired_bootstrap([per_seed[s][m] - base_pu_split[split][s][m]
+                                       for s in sorted(per_seed)], cfg["N_BOOT"])
+                row[f"d_{m}_mean"], row[f"d_{m}_lo"], row[f"d_{m}_hi"] = ci["mean"], ci["lo"], ci["hi"]
+                row[f"d_{m}_seed_sd"] = ci["per_seed_sd"]
+            delta_rows.append(row)
+    delta_df = pd.DataFrame(delta_rows)
+
+    sel_lambda, sel_table = select_lambda(val_per_seed, base_per_seed, cfg)
 
     out = Path(cfg["OUT_DIR"]); out.mkdir(parents=True, exist_ok=True)
-    stem = f"result_{arch}_{cfg['DATASET']}_{cfg_hash(cfg, DCFG, arch, cfg['SEED_LIST'][0])}"
+    stem = f"result_{arch}_{cfg['DATASET']}_{result_hash(cfg, DCFG, arch)}"
     df = pd.DataFrame(test_rows)
     df.to_csv(out / f"{stem}.csv", index=False, float_format="%.6f")
+    delta_df.to_csv(out / f"{stem}_delta.csv", index=False, float_format="%.6f")
     val_rows = [{"seed": s, "arch": arch, "split": "val", "lambda": lam,
                  **flatten(v["agg"])} for s in val_per_seed for lam, v in val_per_seed[s].items()]
     pd.DataFrame(val_rows).to_csv(out / f"{stem}_val.csv", index=False, float_format="%.6f")
@@ -936,6 +998,8 @@ def main():
                    "cfg": {k: v for k, v in cfg.items() if k != "OUT_DIR"},
                    "arch_label": ARCH_LABEL[arch],
                    "selected_lambda_from_validation": sel_lambda,
+                   "baseline_for_comparison": "pref_only (same seed)",
+                   "delta_table": delta_df.to_dict("records"),
                    "lambda_selection_table": sel_table.to_dict("records"),
                    "train_stats": train_stats, "score_diagnostics": diagnostics,
                    "segment_thresholds": {"low": seg_th[0], "high": seg_th[1],
@@ -948,15 +1012,23 @@ def main():
                    }, f, indent=2, default=float, ensure_ascii=False)
     print(f"\n저장 → {out / (stem + '.csv')}\n     → {out / (stem + '_val.csv')}")
 
-    print(f"\n{'='*84}\n[주 결과] validation 선택 λ = {sel_lambda} — test, 3시드 평균\n{'='*84}")
+    print(f"\n{'='*84}\n[주 결과] validation 선택 λ = {sel_lambda} — test\n"
+          f"  비교 기준: 외부 pref_only(같은 시드). joint의 λ=0은 ablation으로 별도 보고.\n{'='*84}")
     prim = df[(df.split == "test") & (df["lambda"] == sel_lambda)]
-    base = df[(df.split == "test") & (df["lambda"] == 0.0)]
+    bl = np.mean([base_pu_split["test"][s]["recall"].mean() for s in base_pu_split["test"]])
+    print(f"  pref_only Recall@10 (3시드 평균) {bl:.6f}")
     for m in ("recall@10", "ndcg@10", "revenue@10", "arp@10", "value_alignment"):
-        print(f"  {m:<18} baseline {base[m].mean():.6f} → 선택 {prim[m].mean():.6f}")
-    for m in ("recall", "ndcg", "revenue", "arp"):
-        if f"d_{m}_mean" in prim:
-            print(f"  Δ{m:<8} {prim[f'd_{m}_mean'].mean():+.6f} "
-                  f"[{prim[f'd_{m}_lo'].mean():+.6f}, {prim[f'd_{m}_hi'].mean():+.6f}]")
+        print(f"  {m:<18} 선택 λ에서 {prim[m].mean():.6f}")
+    dsel = delta_df[(delta_df.split == "test") & (delta_df["lambda"] == sel_lambda)]
+    if len(dsel):
+        r = dsel.iloc[0]
+        for m in ("recall", "ndcg", "revenue", "arp"):
+            print(f"  Δ{m:<8} {r[f'd_{m}_mean']:+.6f} [{r[f'd_{m}_lo']:+.6f}, {r[f'd_{m}_hi']:+.6f}]"
+                  f"  (시드 간 sd {r[f'd_{m}_seed_sd']:.6f})")
+    if arch == "joint":
+        abl = df[(df.split == "test") & (df["lambda"] == 0.0)]
+        print(f"\n  [참고] joint λ=0 ablation Recall@10 {abl['recall@10'].mean():.6f} "
+              f"— baseline이 아니라 가치항을 끈 joint 자신")
 
     print(f"\n{'='*84}\n[민감도] test λ 곡선 — 사전 선언된 descriptive 분석 (유의 라벨 없음)\n{'='*84}")
     g = df[df.split == "test"].groupby("lambda")[
