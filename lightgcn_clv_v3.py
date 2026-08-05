@@ -51,7 +51,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
-CODE_VERSION = "v3.1"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.2"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -106,7 +106,16 @@ CFG = {
     "CAT_EMB_DIM": 16,                # [임의] 카테고리 임베딩(원핫 대신)
 
     # ── 학습 ──
-    "BATCH_SIZE": 8192, "LR": 5e-4, "WD": 1e-3,   # [기본]
+    "BATCH_SIZE": 8192, "LR": 5e-4,               # [기본]
+    # 정규화 — v2와 **같은 방식**으로 되돌린 것. v2는 optimizer에 weight_decay를 주지 않고
+    # BPR loss 안에서 배치에 등장한 layer-0 임베딩만 L2했다(LightGCN 공식 구현도 동일).
+    # v3.1에서 숫자(1e-3)만 가져와 Adam(weight_decay=)에 꽂은 것이 붕괴의 원인이었다 —
+    # 전역 감쇠는 배치에 안 들어간 30만 개 행까지 매 스텝 깎아 선호 임베딩을 0으로 만든다.
+    "REG_MODE": "batch_l2",       # [선택] "batch_l2"(기본) | "global_wd"(진단용 재현)
+    "PREF_REG": 1e-3,             # [기본] 배치 layer-0 L2 계수. v2와 동일한 값
+    "VALUE_REG": 0.0,             # [선택] 가치 파라미터 L2. 첫 복구는 0으로 두고 해석
+    "WD": 1e-3,                   # REG_MODE="global_wd"일 때만 쓰임(붕괴 재현 진단용)
+    "NEG_MODE": "uniform",        # [선택] "uniform"(LightGCN 기본) | "hard50"(v2 방식, ablation)
     "EPOCHS": 100, "EARLY_STOP": 20,              # [기본] 단계별 상한 100, 수렴은 조기종료가 결정
     "SELECT_METRIC": "recall",                    # [기본] 조기종료 기준 지표
     "SELECT_K": 10,                               # [기본] 그 지표의 K
@@ -149,7 +158,8 @@ def cfg_hash(cfg, dcfg, arch, seed):
     """학습 결과에 영향을 주는 설정만 해시. 결과 파일명·체크포인트명에 함께 넣어
     기간/λ_train/차원을 바꿨을 때 이전 결과를 덮어쓰지 않게 한다."""
     keys = ["DATASET", "DIM", "N_LAYERS", "D_VALUE", "MLP_HIDDEN", "CAT_EMB_DIM",
-            "BATCH_SIZE", "LR", "WD", "EPOCHS", "EARLY_STOP", "SELECT_METRIC", "SELECT_K",
+            "BATCH_SIZE", "LR", "REG_MODE", "PREF_REG", "VALUE_REG", "WD", "NEG_MODE",
+            "EPOCHS", "EARLY_STOP", "SELECT_METRIC", "SELECT_K",
             "WINDOW_DAYS", "VAL_DAYS", "TEST_DAYS", "HOLDOUT_DAYS",
             "MIN_USER_INTER", "MIN_ITEM_INTER", "PREMIUM_THR", "LAMBDA_TRAIN"]
     payload = {k: cfg[k] for k in keys}
@@ -254,8 +264,15 @@ def prepare_data(cfg, dcfg):
     csr_ptr = np.zeros(n_users + 1, dtype=np.int64)
     np.cumsum(np.bincount(eu, minlength=n_users), out=csr_ptr[1:])
 
+    # NEG_MODE="hard50" ablation에서만 쓰이는 카테고리 인덱스
+    _cm = train.drop_duplicates("i_idx").set_index("i_idx")["cat_idx"]
+    item_cat_arr = np.zeros(n_items, dtype=np.int64)
+    item_cat_arr[_cm.index.values] = _cm.values
+    cat_items = {int(c): g.to_numpy() for c, g in
+                 train.drop_duplicates("i_idx").groupby("cat_idx")["i_idx"]}
+
     return dict(train=train, splits=splits, adj=adj, pos_key=edge_key, tr_u=tu, tr_i=ti,
-                csr_ptr=csr_ptr, csr_items=csr_items,
+                csr_ptr=csr_ptr, csr_items=csr_items, item_cat=item_cat_arr, cat_items=cat_items,
                 n_users=n_users, n_items=n_items, n_cat=n_cat)
 
 
@@ -428,7 +445,28 @@ class DualSpaceLightGCN(nn.Module):
         Uv, Iv = self.value_emb()
         return Up, Ip, Uv, Iv
 
+    def batch_l2(self, u, i, j, need_value):
+        """배치에 등장한 **layer-0** 선호 임베딩만 L2 (v2·LightGCN 공식 구현과 동일).
+        전역 weight decay와 달리 배치에 안 들어온 행은 건드리지 않는다 — 30만 유저
+        규모에서 전역 감쇠를 걸면 선호 임베딩이 통째로 0으로 수축한다(v3.1의 붕괴 원인).
+
+        선호 블록이 동결된 단계(two_stage의 stage2)에서는 기울기가 없으므로 건너뛴다.
+        가치 쪽은 layer-0 임베딩이라는 게 없는 MLP라 파라미터 L2로 따로 둔다(기본 0)."""
+        cfg = self.cfg
+        reg = torch.zeros((), device=self.E_u.weight.device)
+        if cfg["PREF_REG"] > 0 and self.E_u.weight.requires_grad:
+            reg = reg + cfg["PREF_REG"] * (
+                self.E_u.weight[u].pow(2).sum()
+                + self.E_i.weight[i].pow(2).sum()
+                + self.E_i.weight[j].pow(2).sum()) / len(u)
+        if need_value and cfg["VALUE_REG"] > 0:
+            vp = [q for q in self.value_params() if q.requires_grad]
+            if vp:
+                reg = reg + cfg["VALUE_REG"] * sum(q.pow(2).sum() for q in vp)
+        return reg
+
     def bpr_loss(self, u, i, j, gate, lam):
+        """반환 (loss, 진단값). 진단값은 붕괴를 매 epoch 눈으로 확인하기 위한 것."""
         need_value = lam != 0.0
         Up, Ip, Uv, Iv = self.embeddings(need_value=need_value)
         if not need_value:
@@ -436,7 +474,12 @@ class DualSpaceLightGCN(nn.Module):
         else:
             pos = combined_score_pairs(Up, Ip, Uv, Iv, gate, lam, u, i)
             neg = combined_score_pairs(Up, Ip, Uv, Iv, gate, lam, u, j)
-        return -F.logsigmoid(pos - neg).mean()
+        bpr = -F.logsigmoid(pos - neg).mean()
+        loss = bpr + (self.batch_l2(u, i, j, need_value)
+                      if self.cfg["REG_MODE"] == "batch_l2" else 0.0)
+        with torch.no_grad():
+            diag = {"bpr": float(bpr), "p_correct": float((pos > neg).float().mean())}
+        return loss, diag
 
     @torch.no_grad()
     def score_diagnostics(self, gate, n_sample=512, seed=0):
@@ -445,9 +488,12 @@ class DualSpaceLightGCN(nn.Module):
         rng = np.random.default_rng(seed)
         us = torch.as_tensor(rng.choice(self.n_users, min(n_sample, self.n_users), replace=False),
                              dtype=torch.long, device=Up.device)
-        sp = (Up[us] @ Ip.T); sv = (Uv[us] @ Iv.T)
-        return {"std_s_pref": float(sp.std()), "std_s_value": float(sv.std()),
-                "ratio_value_over_pref": float(sv.std() / (sp.std() + 1e-12)),
+        sp = (Up[us] @ Ip.T)
+        # gate를 곱한 **실효** 가치 점수로 비교해야 λ=1이 실제로 어느 정도의 개입인지 알 수 있다.
+        # v3.1에서는 gate를 인자로 받고도 쓰지 않아 비율이 과대평가됐다.
+        sv_eff = gate[us].unsqueeze(1) * (Uv[us] @ Iv.T)
+        return {"std_s_pref": float(sp.std()), "std_s_value": float(sv_eff.std()),
+                "ratio_value_over_pref": float(sv_eff.std() / (sp.std() + 1e-12)),
                 "mean_norm_U_pref": float(Up.norm(dim=1).mean()),
                 "mean_norm_I_pref": float(Ip.norm(dim=1).mean()),
                 "mean_norm_U_value": float(Uv.norm(dim=1).mean()),
@@ -592,23 +638,40 @@ def evaluate(model, lam, gate_t, cache, meta, ks, csr_ptr, csr_items, cfg, per_u
 # ═══════════════════════════════════════════════════════════════════
 # 학습
 # ═══════════════════════════════════════════════════════════════════
-def sample_negatives(u_arr, n_items, pos_key, rng, max_try=50):
-    """균등 무작위 (LightGCN 원논문)."""
-    neg = rng.integers(0, n_items, size=len(u_arr))
+def sample_negatives(u_arr, pos_arr, n_items, pos_key, rng, mode="uniform",
+                     item_cat=None, cat_items=None, max_try=50):
+    """negative 샘플링. 기본은 **균등 무작위**(LightGCN 원논문).
+
+    mode="hard50"은 v2가 쓰던 방식으로, 절반을 양성 아이템과 같은 카테고리에서 뽑는다.
+    기본값이 아니라 **ablation 전용**이다 — 정규화 수정과 동시에 바꾸면 무엇이 효과를
+    냈는지 가릴 수 없어, 정상 baseline 복구를 확인한 뒤 따로 비교한다."""
+    n = len(u_arr)
+    neg = rng.integers(0, n_items, size=n)
+    if mode == "hard50":
+        hard = rng.random(n) < 0.5
+        for k in np.where(hard)[0]:
+            cand = cat_items.get(int(item_cat[pos_arr[k]]))
+            if cand is not None and len(cand) > 1:
+                neg[k] = cand[rng.integers(0, len(cand))]
+    elif mode != "uniform":
+        raise ValueError(f"NEG_MODE: {mode}")
+
     u64 = u_arr.astype(np.int64)
     for _ in range(max_try):
         key = u64 * n_items + neg
         pos = np.clip(np.searchsorted(pos_key, key), 0, len(pos_key) - 1)
         bad = pos_key[pos] == key
         if not bad.any(): break
-        neg[bad] = rng.integers(0, n_items, size=int(bad.sum()))
+        neg[bad] = rng.integers(0, n_items, size=int(bad.sum()))   # 재추첨은 균등으로
     return neg
 
 
 def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, meta):
     """BPR로 params만 학습. 조기종료가 수렴점을 결정한다(상한 EPOCHS).
     학습량(업데이트 수·샘플 수·시간)을 함께 기록해 아키텍처 간 비교에 쓴다."""
-    opt = torch.optim.Adam(params, lr=cfg["LR"], weight_decay=cfg["WD"])
+    # REG_MODE="batch_l2"면 optimizer에 감쇠를 주지 않는다(정규화는 loss 안에서).
+    wd = cfg["WD"] if cfg["REG_MODE"] == "global_wd" else 0.0
+    opt = torch.optim.Adam(params, lr=cfg["LR"], weight_decay=wd)
     rng = np.random.default_rng(seed)
     tr_u, tr_i, pos_key = d["tr_u"], d["tr_i"], d["pos_key"]
     n_train = len(tr_u); n_batch = math.ceil(n_train / cfg["BATCH_SIZE"])
@@ -617,17 +680,19 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, 
 
     for ep in range(1, cfg["EPOCHS"] + 1):
         model.train(); t0 = time.time()
-        perm = rng.permutation(n_train); tot = 0.0
+        perm = rng.permutation(n_train); tot = tot_bpr = tot_pc = 0.0
         for b in range(n_batch):
             idx = perm[b * cfg["BATCH_SIZE"]:(b + 1) * cfg["BATCH_SIZE"]]
             bu, bi = tr_u[idx], tr_i[idx]
-            bj = sample_negatives(bu, d["n_items"], pos_key, rng)
-            loss = model.bpr_loss(torch.as_tensor(bu, dtype=torch.long, device=DEVICE),
-                                  torch.as_tensor(bi, dtype=torch.long, device=DEVICE),
-                                  torch.as_tensor(bj, dtype=torch.long, device=DEVICE),
-                                  gate_t, lam_train)
+            bj = sample_negatives(bu, bi, d["n_items"], pos_key, rng, cfg["NEG_MODE"],
+                                  d["item_cat"], d["cat_items"])
+            loss, dg = model.bpr_loss(torch.as_tensor(bu, dtype=torch.long, device=DEVICE),
+                                      torch.as_tensor(bi, dtype=torch.long, device=DEVICE),
+                                      torch.as_tensor(bj, dtype=torch.long, device=DEVICE),
+                                      gate_t, lam_train)
             opt.zero_grad(); loss.backward(); opt.step()
-            tot += loss.item(); updates += 1; samples += len(idx)
+            tot += loss.item(); tot_bpr += dg["bpr"]; tot_pc += dg["p_correct"]
+            updates += 1; samples += len(idx)
         model.eval()
         r = evaluate(model, lam_train, gate_t, val_cache, meta, [cfg["SELECT_K"]],
                      d["csr_ptr"], d["csr_items"], cfg)
@@ -639,7 +704,13 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, 
             star = " ★"
         else:
             bad += 1
-        print(f"  [{tag}] ep {ep:3d} | loss {tot/n_batch:.4f} | "
+        # 붕괴를 매 epoch 눈으로 확인 — BPR은 0.693에서 시작해 내려가야 하고,
+        # P(pos>neg)는 0.5에서 올라가야 하며, layer-0 norm이 0으로 수축하면 안 된다.
+        with torch.no_grad():
+            nu = float(model.E_u.weight.norm(dim=1).mean())
+            ni = float(model.E_i.weight.norm(dim=1).mean())
+        print(f"  [{tag}] ep {ep:3d} | loss {tot/n_batch:.4f} bpr {tot_bpr/n_batch:.4f} "
+              f"P(pos>neg) {tot_pc/n_batch:.3f} | ‖E_u‖ {nu:.4f} ‖E_i‖ {ni:.4f} | "
               f"val {cfg['SELECT_METRIC']}@{cfg['SELECT_K']} {score:.5f} | {time.time()-t0:.0f}s{star}")
         if bad >= cfg["EARLY_STOP"]:
             print(f"  [{tag}] early stop"); break
@@ -761,6 +832,33 @@ def flatten(res):
 
 
 # ═══════════════════════════════════════════════════════════════════
+def run_2x2_diagnostic():
+    """정규화 × negative 샘플링 2×2를 pref_only·시드 1개로 돌려 붕괴 원인을 분리한다.
+
+      배치L2 + uniform  : 정상 복구 여부 확인 (기대되는 정상 조건)
+      전역WD + uniform  : v3.1의 실패 재현
+      전역WD + hard50   : hard negative가 붕괴를 가리는지
+      배치L2 + hard50   : v2에 가장 가까운 조건
+
+    네 조합의 차이가 정규화 축에서 나오면 원인이 정규화라는 뜻이다."""
+    base = dict(CFG)
+    rows = []
+    for reg in ("batch_l2", "global_wd"):
+        for neg in ("uniform", "hard50"):
+            CFG.update(base); CFG.update(ARCH="pref_only", REG_MODE=reg, NEG_MODE=neg,
+                                         SEED_LIST=[base["SEED_LIST"][0]])
+            print(f"\n{'#'*84}\n#  진단: REG_MODE={reg} | NEG_MODE={neg}\n{'#'*84}")
+            df = main()
+            r = df[(df.split == "test") & (df["lambda"] == 0.0)].iloc[0]
+            rows.append({"reg": reg, "neg": neg, "recall@10": r["recall@10"],
+                         "ndcg@10": r["ndcg@10"], "coverage@10": r["coverage@10"]})
+    CFG.update(base)
+    out = pd.DataFrame(rows)
+    print(f"\n{'='*84}\n2×2 진단 요약 (pref_only, test @10)\n{'='*84}")
+    print(out.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+    return out
+
+
 def main():
     cfg, arch = CFG, CFG["ARCH"]
     print(f"DATASET={cfg['DATASET']} | ARCH={arch} ({ARCH_LABEL[arch]}) | "
@@ -795,8 +893,16 @@ def main():
         if arch != "pref_only" and not (0.1 <= rat <= 10):
             warn = ("  ⚠ 두 점수의 스케일 차가 큽니다 — λ=1이 의도보다 훨씬 강한(또는 약한) "
                     "개입일 수 있으니 LAMBDA_EVAL_SWEEP 범위를 이 비율에 맞춰 재검토할 것")
-        print(f"  진단: std(s_pref)={diagnostics[seed]['std_s_pref']:.4f} "
-              f"std(s_value)={diagnostics[seed]['std_s_value']:.4f} 비율={rat:.4f}{warn}")
+        dg = diagnostics[seed]
+        print(f"  진단: std(s_pref)={dg['std_s_pref']:.4f} "
+              f"std(gate·s_value)={dg['std_s_value']:.4f} 비율={rat:.4f}")
+        print(f"        layer-0 평균 norm: ‖U_pref‖={dg['mean_norm_U_pref']:.4f} "
+              f"‖I_pref‖={dg['mean_norm_I_pref']:.4f} | "
+              f"‖U_value‖={dg['mean_norm_U_value']:.4f} ‖I_value‖={dg['mean_norm_I_value']:.4f}")
+        if dg["std_s_pref"] < 1e-3:
+            print("        ⚠ std(s_pref)가 0에 가깝습니다 — 선호 임베딩 붕괴 의심")
+        if warn:
+            print(f"      {warn.strip()}")
 
         val_per_seed[seed] = {}
         for lam in sweep:

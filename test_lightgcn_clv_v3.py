@@ -175,14 +175,6 @@ def test_clv_has_no_shrinkage():
     assert "SHRINKAGE" not in SRC and "shrink" not in SRC.lower()
 
 
-def test_negative_sampling_is_uniform():
-    pos = np.sort(np.array([0 * 50 + 3, 0 * 50 + 7, 1 * 50 + 3], dtype=np.int64))
-    neg = V3.sample_negatives(np.zeros(300, dtype=np.int64), 50, pos, np.random.default_rng(0))
-    assert not np.isin(neg, [3, 7]).any() and len(np.unique(neg)) > 20
-    body = _fn("sample_negatives")
-    assert "cat_items" not in body and "hard" not in body.lower()
-
-
 def test_value_block_does_not_propagate():
     body = _fn("value_emb")
     assert "sparse" not in body and "adj" not in body
@@ -208,3 +200,54 @@ def test_train_stats_are_plain_python_scalars():
     assert '"best_epoch":int(best_ep)' in body
     assert '"updates":int(updates)' in body and '"samples":int(samples)' in body
     assert "float(best)" in body
+
+
+# ── 코드리뷰(2026-08-04) 지적: 정규화 구현이 v2와 달라 선호 임베딩이 붕괴 ────────
+def test_regularization_is_batch_l2_not_global_weight_decay():
+    """v2는 optimizer에 weight_decay를 주지 않고 BPR loss 안에서 배치 layer-0만 L2했다.
+    v3.1이 숫자만 가져와 Adam(weight_decay=)에 꽂은 것이 붕괴 원인이었다."""
+    assert V3.CFG["REG_MODE"] == "batch_l2"
+    assert V3.CFG["PREF_REG"] == 1e-3        # v2와 같은 값
+    assert V3.CFG["VALUE_REG"] == 0.0        # 첫 복구는 가치 정규화 없이
+    body = _fn_ns("train_phase")
+    # batch_l2 모드에서는 optimizer 감쇠가 0이어야 한다
+    assert 'wd=cfg["WD"]ifcfg["REG_MODE"]=="global_wd"else0.0' in body
+    assert "weight_decay=wd" in body
+
+
+def test_batch_l2_only_touches_batch_rows_and_skips_frozen_pref():
+    ns_body = _fn_ns("batch_l2")
+    assert "self.E_u.weight[u]" in ns_body and "self.E_i.weight[i]" in ns_body
+    assert "self.E_i.weight[j]" in ns_body
+    assert "self.E_u.weight.requires_grad" in ns_body      # 동결 단계에서는 건너뜀
+    assert "VALUE_REG" in ns_body                          # 가치 정규화는 별도 계수
+
+
+def test_bpr_loss_returns_training_diagnostics():
+    """붕괴를 매 epoch 확인할 수 있도록 BPR과 P(pos>neg)를 함께 반환해야 한다."""
+    torch.manual_seed(0)
+    n_u, n_i, n_c = 8, 12, 3
+    x_val = np.random.rand(n_u, 5).astype(np.float32)
+    x_it = np.random.rand(n_i, 2).astype(np.float32)
+    cat = np.random.randint(0, n_c, n_i).astype(np.int64)
+    n = n_u + n_i
+    adj = torch.sparse_coo_tensor(torch.tensor([[0, n_u], [n_u, 0]]),
+                                  torch.tensor([0.5, 0.5]), size=(n, n)).coalesce()
+    m = V3.DualSpaceLightGCN(n_u, n_i, n_c, x_val, x_it, cat, dict(V3.CFG), adj)
+    loss, dg = m.bpr_loss(torch.tensor([0, 1]), torch.tensor([2, 3]), torch.tensor([4, 5]),
+                          torch.rand(n_u), 1.0)
+    assert torch.isfinite(loss) and loss.requires_grad
+    assert set(dg) == {"bpr", "p_correct"} and 0.0 <= dg["p_correct"] <= 1.0
+    assert abs(dg["bpr"] - 0.693) < 0.6          # 초기값이 ln2 근처
+
+
+def test_score_diagnostics_applies_gate():
+    """v3.1은 gate를 인자로 받고도 쓰지 않아 실효 비율을 과대평가했다."""
+    body = _fn_ns("score_diagnostics")
+    assert "gate[us]" in body and "sv_eff" in body
+
+
+def test_2x2_diagnostic_exists():
+    assert "run_2x2_diagnostic" in dir(V3)
+    body = _fn_ns("run_2x2_diagnostic")
+    assert '"batch_l2","global_wd"' in body and '"uniform","hard50"' in body
