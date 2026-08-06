@@ -334,3 +334,30 @@ def test_joint_warm_has_own_checkpoint():
     h_j = V3.cfg_hash(V3.CFG, V3.DCFG, "joint", 42)
     h_ts = V3.cfg_hash(V3.CFG, V3.DCFG, "two_stage", 42)
     assert len({h_jw, h_j, h_ts}) == 3
+
+
+def test_checkpoint_hash_is_stable_across_code_versions():
+    """cfg_hash(체크포인트용)는 CODE_VERSION이 바뀌어도 같아야 한다. v3.4에서
+    여기 CODE_VERSION을 넣었다가, 학습과 무관한 코드 변경만으로 이미 있는
+    pref_only 체크포인트를 못 찾고 48분짜리 재학습이 세 시드 도는 낭비가 났다."""
+    h_before = V3.cfg_hash(V3.CFG, V3.DCFG, "pref_only", 42)
+    old_version = V3.CODE_VERSION
+    try:
+        V3.CODE_VERSION = "vX.Y-fake"
+        h_after = V3.cfg_hash(V3.CFG, V3.DCFG, "pref_only", 42)
+    finally:
+        V3.CODE_VERSION = old_version
+    assert h_before == h_after
+
+
+def test_result_hash_still_changes_with_code_version():
+    """result_hash(결과 파일용)는 CODE_VERSION이 바뀌면 여전히 달라져야 한다 —
+    코드 버전 추적 자체가 필요 없어진 게 아니라 체크포인트에서만 뺀 것이다."""
+    h_before = V3.result_hash(V3.CFG, V3.DCFG, "pref_only")
+    old_version = V3.CODE_VERSION
+    try:
+        V3.CODE_VERSION = "vX.Y-fake"
+        h_after = V3.result_hash(V3.CFG, V3.DCFG, "pref_only")
+    finally:
+        V3.CODE_VERSION = old_version
+    assert h_before != h_after

@@ -58,7 +58,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
-CODE_VERSION = "v3.4"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.5"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -169,15 +169,21 @@ def set_seed(seed):
 
 
 def cfg_hash(cfg, dcfg, arch, seed):
-    """학습 결과에 영향을 주는 설정만 해시. 결과 파일명·체크포인트명에 함께 넣어
-    기간/λ_train/차원을 바꿨을 때 이전 결과를 덮어쓰지 않게 한다."""
+    """**체크포인트 파일명** 전용 해시 — 학습 결과(가중치)에 실제로 영향을 주는
+    설정만 넣는다. 기간/λ_train/차원을 바꿨을 때 이전 체크포인트를 덮어쓰지 않게 한다.
+
+    ⚠ CODE_VERSION은 넣지 않는다. v3.4에서 여기에 CODE_VERSION을 넣었다가, 학습과
+    무관한 변경(joint_warm 아키텍처 추가)만으로도 pref_only 해시가 바뀌어 이미 있는
+    체크포인트를 못 찾고 48분짜리 학습을 세 시드 다시 돌리는 낭비가 났다. 코드 버전
+    추적은 result_hash()에서 결과 파일명으로만 한다 — 체크포인트는 가중치가 실제로
+    달라질 때만 새 파일이 되어야 한다."""
     keys = ["DATASET", "DIM", "N_LAYERS", "D_VALUE", "MLP_HIDDEN", "CAT_EMB_DIM",
             "BATCH_SIZE", "LR", "REG_MODE", "PREF_REG", "VALUE_REG", "WD", "NEG_MODE",
             "EPOCHS", "EARLY_STOP", "SELECT_METRIC", "SELECT_K",
             "WINDOW_DAYS", "VAL_DAYS", "TEST_DAYS", "HOLDOUT_DAYS",
             "MIN_USER_INTER", "MIN_ITEM_INTER", "PREMIUM_THR", "LAMBDA_TRAIN"]
     payload = {k: cfg[k] for k in keys}
-    payload.update(category_col=dcfg["category_col"], arch=arch, seed=seed, code=CODE_VERSION)
+    payload.update(category_col=dcfg["category_col"], arch=arch, seed=seed)
     return hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:8]
 
 
