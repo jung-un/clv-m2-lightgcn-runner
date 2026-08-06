@@ -12,9 +12,16 @@ hard negative는 전부 없다.
 
 ═══ 아키텍처 3종 ═══
   pref_only  : 순수 LightGCN. λ=0으로 선호 블록만 학습. **공통 baseline**이며
-               two_stage의 stage2 초기값으로 재사용된다(시드당 한 번만 학습).
-  two_stage  : pref_only 체크포인트를 불러 동결 → 가치 블록만 학습.
+               two_stage·joint_warm의 출발점으로 재사용된다(시드당 한 번만 학습).
+  two_stage  : pref_only 체크포인트를 불러 선호 블록 **동결** → 가치 블록만 학습.
+  joint_warm : pref_only 체크포인트에서 출발하되 **동결하지 않고** 둘 다 학습.
+               two_stage와의 차이는 "동결하느냐" 하나뿐이다.
   joint      : 별도 random init에서 선호·가치 블록을 처음부터 함께 학습.
+
+  ⚠ joint_warm/joint은 총 학습량이 다르다 — joint_warm은 pref_only 학습분을 물려받는다.
+    warm start는 표준 관행(사전학습→미세조정)이며 그 자체가 연구 기여는 아니다.
+    joint이 학습 상한(95~99/100)에서 잘려 진 것인지 구조적으로 진 것인지 가르기 위한
+    진단 목적으로 추가했다.
 
 ⚠ joint의 λ_eval=0은 baseline이 아니다. 선호 임베딩이 이미 가치항의 존재에 맞춰
   학습됐으므로 "joint-ablation"이며, 결과 표기에서도 그렇게 부른다. 두 아키텍처의
@@ -51,7 +58,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
-CODE_VERSION = "v3.3"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.4"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -88,7 +95,7 @@ SCHEMA = {
 # ═══════════════════════════════════════════════════════════════════
 CFG = {
     "DATASET": "hm",                  # [선택] "hm" | "dunnhumby"
-    "ARCH": "pref_only",              # [선택] "pref_only" | "two_stage" | "joint"
+    "ARCH": "pref_only",              # [선택] "pref_only" | "two_stage" | "joint_warm" | "joint"
     "SEED_LIST": [42, 43, 44],        # [기본]
 
     # ── 데이터 (시간순: train | val | test | holdout) ──
@@ -150,7 +157,10 @@ DCFG = SCHEMA[CFG["DATASET"]]
 _METS = ["recall", "precision", "ndcg", "hr", "map", "revenue", "vndcg", "arp", "novelty", "diversity"]
 SEG_NAMES = ["저CLV", "중CLV", "고CLV"]
 ARCH_LABEL = {"pref_only": "LightGCN baseline", "two_stage": "two-stage",
-              "joint": "joint (λ=0은 ablation, baseline 아님)"}
+              "joint_warm": "joint warm-start (λ=0은 ablation, baseline 아님)",
+              "joint": "joint from scratch (λ=0은 ablation, baseline 아님)"}
+# λ=0이 baseline이 아닌 아키텍처 — 선호 블록이 가치항과 함께 학습돼 이미 적응했다.
+ABLATION_ARCHS = {"joint", "joint_warm"}
 
 
 def set_seed(seed):
@@ -785,6 +795,15 @@ def get_or_train(arch, seed, d, gate_t, x_val_u, x_item, item_cat, meta, val_cac
         stats = list(base_stats) + [train_phase(model, model.value_params(), d, gate_t,
                                                 cfg["LAMBDA_TRAIN"], cfg, seed,
                                                 "two_stage-value", val_cache, meta)]
+    elif arch == "joint_warm":
+        # two_stage와 같은 출발점이지만 **동결하지 않는다**. 차이는 freeze 한 줄뿐.
+        base, base_stats = get_or_train("pref_only", seed, d, gate_t, x_val_u, x_item,
+                                        item_cat, meta, val_cache, cfg)
+        model = build_model(d, x_val_u, x_item, item_cat, cfg)
+        model.load_state_dict(base.state_dict())
+        stats = list(base_stats) + [train_phase(model, list(model.parameters()), d, gate_t,
+                                                cfg["LAMBDA_TRAIN"], cfg, seed,
+                                                "joint_warm", val_cache, meta)]
     elif arch == "joint":
         model = build_model(d, x_val_u, x_item, item_cat, cfg)   # 별도 random init
         stats = [train_phase(model, list(model.parameters()), d, gate_t,
@@ -966,7 +985,7 @@ def main():
                 r = evaluate(model, lam, gate_t, caches[split], meta, cfg["K_LIST"],
                              d["csr_ptr"], d["csr_items"], cfg, per_user=True)
                 pu_split.setdefault(split, {}).setdefault(lam, {})[seed] = r.pop("per_user")
-                label = "ablation" if (arch == "joint" and lam == 0.0) else "model"
+                label = "ablation" if (arch in ABLATION_ARCHS and lam == 0.0) else "model"
                 test_rows.append({"seed": seed, "arch": arch, "split": split,
                                   "lambda": lam, "role": label, **flatten(r)})
 
@@ -1025,10 +1044,10 @@ def main():
         for m in ("recall", "ndcg", "revenue", "arp"):
             print(f"  Δ{m:<8} {r[f'd_{m}_mean']:+.6f} [{r[f'd_{m}_lo']:+.6f}, {r[f'd_{m}_hi']:+.6f}]"
                   f"  (시드 간 sd {r[f'd_{m}_seed_sd']:.6f})")
-    if arch == "joint":
+    if arch in ABLATION_ARCHS:
         abl = df[(df.split == "test") & (df["lambda"] == 0.0)]
-        print(f"\n  [참고] joint λ=0 ablation Recall@10 {abl['recall@10'].mean():.6f} "
-              f"— baseline이 아니라 가치항을 끈 joint 자신")
+        print(f"\n  [참고] {arch} λ=0 ablation Recall@10 {abl['recall@10'].mean():.6f} "
+              f"— baseline이 아니라 가치항을 끈 {arch} 자신")
 
     print(f"\n{'='*84}\n[민감도] test λ 곡선 — 사전 선언된 descriptive 분석 (유의 라벨 없음)\n{'='*84}")
     g = df[df.split == "test"].groupby("lambda")[

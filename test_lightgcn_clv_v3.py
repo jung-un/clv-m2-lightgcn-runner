@@ -300,3 +300,37 @@ def test_result_hash_covers_evaluation_rules():
                      ("NONINFERIORITY_DELTA", 0.05), ("K_LIST", [5]), ("N_BOOT", 7)]:
         c2 = copy.deepcopy(V3.CFG); c2[key] = val
         assert V3.result_hash(c2, V3.DCFG, "joint") != h0, f"{key}가 해시에 없음"
+
+
+def test_joint_warm_differs_from_two_stage_only_by_freezing():
+    """joint_warm = two_stage와 같은 출발점(pref_only) + 동결 없음.
+    warm start 자체는 연구 기여가 아니라, joint이 학습 상한에서 잘려 진 것인지
+    구조적으로 진 것인지 가르기 위한 진단용이다."""
+    body = _fn_ns("get_or_train")
+    # body는 공백 제거본이므로 'elifarch==' 형태로 잘라야 한다
+    ts = body.split('elifarch=="two_stage"')[1].split("elifarch==")[0]
+    jw = body.split('elifarch=="joint_warm"')[1].split("elifarch==")[0]
+    for blk in (ts, jw):
+        assert 'get_or_train("pref_only"' in blk        # 같은 출발점
+        assert "load_state_dict(base.state_dict())" in blk
+    assert "freeze_pref_and_cache()" in ts              # two_stage만 동결
+    assert "freeze_pref_and_cache()" not in jw
+    assert "model.value_params()" in ts                 # two_stage는 가치만
+    assert "list(model.parameters())" in jw             # joint_warm은 전부
+
+
+def test_ablation_archs_cover_both_joint_variants():
+    """선호 블록이 가치항과 함께 학습된 아키텍처는 λ=0이 baseline이 아니다."""
+    assert V3.ABLATION_ARCHS == {"joint", "joint_warm"}
+    assert "two_stage" not in V3.ABLATION_ARCHS         # 동결이라 λ=0이 곧 pref_only
+    assert "baseline 아님" in V3.ARCH_LABEL["joint_warm"]
+    m = _fn_ns("main")
+    assert "archinABLATION_ARCHS" in m
+
+
+def test_joint_warm_has_own_checkpoint():
+    """arch가 해시에 들어가야 joint과 체크포인트가 안 섞인다."""
+    h_jw = V3.cfg_hash(V3.CFG, V3.DCFG, "joint_warm", 42)
+    h_j = V3.cfg_hash(V3.CFG, V3.DCFG, "joint", 42)
+    h_ts = V3.cfg_hash(V3.CFG, V3.DCFG, "two_stage", 42)
+    assert len({h_jw, h_j, h_ts}) == 3
