@@ -1,10 +1,15 @@
 """LightGCN + CLV 이중공간(v3).
 
     S(u,i) = <z_u^pref, z_i^pref> + λ · gate(u) · <z_u^value, z_i^value>     (raw dot product)
-    gate(u) = percentile_rank(CLV_u)            # 선형, 제곱 아님
     CLV_u   = N̂_u × V̂_u
     N̂_u     = mean(F_p, T_p, R_p)                # 전부 백분위
     V̂_u     = mean(AOV_p, Prem_p)                # 축소추정 없음
+
+    gate(u) = GATE_MODE에 따라 (전부 유효 유저 평균 1로 정규화, 선형·제곱 아님)
+        none : 1                       게이트 없음 대조군
+        clv  : percentile_rank(CLV_u)  기본값
+        vhat : percentile_rank(V̂_u)    거래금액축만 — N̂는 가격 정보를 담지 않는다는
+                                       EDA 근거(build_gate 주석 참고)
 
 "임베딩을 분리하고 CLV에 따라 반영 정도를 조정한다" 외의 조건은 넣지 않는다.
 v2에 있던 가드레일 4종·목적함수·epoch 스크리닝·λ=0 fallback·축소추정·gate 제곱·
@@ -58,7 +63,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
-CODE_VERSION = "v3.7"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.8"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -108,8 +113,14 @@ CFG = {
     # 상호작용 중앙값 3)에서 학습 불가능한 아이템 임베딩을 6만 개 넘게 만들어 baseline이
     # 인기도로 붕괴하는 원인으로 의심된다. 10-core는 LightGCN 원논문 등 표준 관행이고
     # Dunnhumby 기준 아이템 71%를 버려도 상호작용은 93.7%가 남는다. Phase 1에서 1/10/20을
-    # pref_only로 비교해 확정할 것 — 바꾸면 아이템 유니버스가 달라지므로 두 데이터셋에
-    # 반드시 같은 값을 적용해야 한다(전처리 비대칭이면 데이터셋 간 비교가 무효).
+    # pref_only로 비교해 확정할 것.
+    # ⚠ 바꾸면 아이템 유니버스와 평가 정답쌍이 함께 달라져 Recall이 기계적으로 오른다
+    #   (Dunnhumby k=10에서 test 정답 84.4%만 잔존). threshold 간 비교는 반드시
+    #   결과 JSON의 data_stats(정답쌍 수·평가유저 수)와 함께 읽을 것.
+    # 필수 조건은 **한 데이터셋 안에서 M1~M5가 같은 값을 쓰는 것**이다. 두 데이터셋에
+    #   같은 숫자를 강제할지는 별개의 방법론 결정이며(데이터 구조가 다름), 다르게 쓸
+    #   경우 절대 지표를 데이터셋 간 직접 비교하지 말고 각 데이터셋 내 baseline 대비
+    #   변화로만 비교할 것.
     "MIN_USER_INTER": 1, "MIN_ITEM_INTER": 1,   # [기본]
 
     # ── 임베딩 ──
@@ -222,7 +233,11 @@ def result_hash(cfg, dcfg, arch):
     """**결과 파일명** 전용 해시. 학습 설정(cfg_hash)뿐 아니라 시드 목록·λ 스윕·
     비열등 δ·평가 K·부트스트랩 횟수·세그먼트 경계까지 넣는다. v3.2까지는 첫 시드의
     학습 해시만 써서, 시드 목록이나 평가 규칙만 바꾸면 이전 결과를 덮어썼다."""
-    payload = {"train": cfg_hash(cfg, dcfg, arch, cfg["SEED_LIST"][0]),
+    # GATE_MODE는 **모든 아키텍처에서** 결과 해시에 넣는다. cfg_hash는 pref_only에서
+    # GATE_MODE를 빼므로(가중치에 영향 없음), 그대로 두면 pref_only의 none/clv/vhat
+    # 실행이 같은 결과 파일명을 써서 JSON의 CFG·진단값이 서로 덮어써진다.
+    payload = {"gate_mode": cfg["GATE_MODE"],
+               "train": cfg_hash(cfg, dcfg, arch, cfg["SEED_LIST"][0]),
                "seeds": cfg["SEED_LIST"], "lambda_eval": cfg["LAMBDA_EVAL_SWEEP"],
                "delta": cfg["NONINFERIORITY_DELTA"], "k_list": cfg["K_LIST"],
                "n_boot": cfg["N_BOOT"], "seg_edges": list(cfg["SEG_EDGES"]),
@@ -252,6 +267,37 @@ def load_transactions(dcfg):
     return tx
 
 
+def kcore_filter(tp, min_u, min_i, max_iter=20):
+    """train 구간에서 **고유 (유저,아이템) 엣지** 기준 k-core를 수렴할 때까지 적용.
+
+    ① 거래행이 아니라 고유 엣지를 센다.
+       M1 LightGCN 인접행렬은 이진이라, 한 가구가 같은 상품을 20번 사도 그래프
+       degree는 1이다. 거래행을 세면 반복구매가 많은 데이터에서 아이템 연결도를
+       과대평가한다 — Dunnhumby는 엣지당 평균 1.84행이고, 실측으로 MIN_ITEM_INTER=10
+       에서 3,331개 아이템이 구매 가구 10곳 미만인데 통과했다(그중 103개는 구매 가구가
+       단 한 곳). 반복구매 '횟수'를 신호로 쓰는 건 M3(가치그래프)의 역할이고,
+       M1의 아이템 eligibility 필터는 그래프 구조와 같은 기준을 써야 한다.
+
+    ② 한 번만 거르지 않고 번갈아 반복한다.
+       아이템을 지우면 train 이력이 0이 되는 유저가 생긴다. 그 유저는 그래프 degree 0,
+       CLV/V̂ = NaN, 평가에서는 제외되는데 유저 인덱스에는 남아 게이트 정규화에 0으로
+       섞인다. 유저·아이템 조건이 동시에 만족될 때까지 돌려야 진짜 k-core다.
+    """
+    pairs = tp[["u_raw", "i_raw"]].drop_duplicates()
+    it = 0
+    for it in range(1, max_iter + 1):
+        n_before = len(pairs)
+        ic = pairs["i_raw"].value_counts()
+        pairs = pairs[pairs["i_raw"].isin(set(ic.index[ic >= min_i]))]
+        uc = pairs["u_raw"].value_counts()
+        pairs = pairs[pairs["u_raw"].isin(set(uc.index[uc >= min_u]))]
+        if len(pairs) == n_before:
+            break
+    else:
+        print(f"  ⚠ k-core가 {max_iter}회 안에 수렴하지 않음 — 임계값을 확인할 것")
+    return set(pairs["u_raw"].unique()), set(pairs["i_raw"].unique()), len(pairs), it
+
+
 def prepare_data(cfg, dcfg):
     """시간순 분할: train | val | test | holdout(가장 최근).
     holdout은 EVAL_HOLDOUT=True일 때만 평가에 쓰인다(그 전엔 정답조차 만들지 않음)."""
@@ -275,11 +321,25 @@ def prepare_data(cfg, dcfg):
     print(f"분할 경계: train ≤ {val_start} < val ≤ {test_start} < test ≤ {hold_start} < holdout")
 
     tp = tx[tx["t"] <= val_start]
-    uc, ic = tp["u_raw"].value_counts(), tp["i_raw"].value_counts()
-    keep_u = set(uc[uc >= cfg["MIN_USER_INTER"]].index)
-    keep_i = set(ic[ic >= cfg["MIN_ITEM_INTER"]].index)
+    n_row0, n_u0, n_i0 = len(tp), tp["u_raw"].nunique(), tp["i_raw"].nunique()
+    n_edge0 = len(tp[["u_raw", "i_raw"]].drop_duplicates())
+    keep_u, keep_i, n_edge1, n_iter = kcore_filter(
+        tp, cfg["MIN_USER_INTER"], cfg["MIN_ITEM_INTER"])
     tx = tx[tx["u_raw"].isin(keep_u) & tx["i_raw"].isin(keep_i)].copy()
-    print(f"필터(train 구간 기준) 후: {len(tx):,}건")
+    print(f"필터(train 고유엣지 k-core, {n_iter}회 반복 수렴) 후: {len(tx):,}건 | "
+          f"유저 {n_u0:,}→{len(keep_u):,} 아이템 {n_i0:,}→{len(keep_i):,} "
+          f"엣지 {n_edge0:,}→{n_edge1:,}")
+    data_stats = {
+        "min_user_inter": cfg["MIN_USER_INTER"], "min_item_inter": cfg["MIN_ITEM_INTER"],
+        "kcore_iters": n_iter,
+        "train_rows_before": n_row0, "train_edges_before": n_edge0,
+        "train_users_before": n_u0, "train_items_before": n_i0,
+        "train_edges_after": n_edge1,
+        "train_users_after": len(keep_u), "train_items_after": len(keep_i),
+        "user_drop_rate": 1 - len(keep_u) / max(n_u0, 1),
+        "item_drop_rate": 1 - len(keep_i) / max(n_i0, 1),
+        "edge_drop_rate": 1 - n_edge1 / max(n_edge0, 1),
+    }
 
     uids = np.sort(tx["u_raw"].unique()); iids = np.sort(tx["i_raw"].unique())
     cats = sorted(tx["cat_raw"].unique())
@@ -302,15 +362,25 @@ def prepare_data(cfg, dcfg):
         gt, rev = {}, {}
         for u, g in agg.groupby("u_idx", sort=False):
             gt[u] = g.i_idx.values.astype(np.int32); rev[u] = g.v.values.astype(np.float32)
-        print(f"  {name}: 평가유저 {len(gt):,}명, 정답 {len(agg):,}쌍")
+        print(f"  {name}: 평가유저 {len(gt):,}명, 정답 {len(agg):,}쌍 "
+              f"(유저당 {len(agg)/max(len(gt),1):.2f})")
+        # MIN_ITEM_INTER를 올리면 희귀 아이템이 정답에서도 사라져 Recall이 기계적으로
+        # 오른다. 이 분모를 남겨두지 않으면 "모델이 좋아진 것"과 "어려운 정답이 없어진 것"
+        # 을 구분할 수 없다 — threshold 간 비교의 필수 전제다.
+        split_stats[name.strip()] = {
+            "eval_users": len(gt), "gt_pairs": len(agg),
+            "gt_per_user": len(agg) / max(len(gt), 1)}
         return gt, rev
 
+    split_stats = {}
     splits = {"val": build_eval(tx[(tx.t > val_start) & (tx.t <= test_start)], "Val    "),
               "test": build_eval(tx[(tx.t > test_start) & (tx.t <= hold_start)], "Test   ")}
     if cfg["EVAL_HOLDOUT"]:
         splits["holdout"] = build_eval(tx[tx.t > hold_start], "Holdout")
     else:
         print("  Holdout: 계산 안 함 (EVAL_HOLDOUT=False — 최종 확증 때만 켤 것)")
+    data_stats["splits"] = split_stats
+    data_stats.update(n_users=n_users, n_items=n_items, n_categories=n_cat)
 
     tu = train.u_idx.values.astype(np.int64); ti = train.i_idx.values.astype(np.int64)
     edge_key = np.unique(tu * n_items + ti)
@@ -334,9 +404,17 @@ def prepare_data(cfg, dcfg):
     cat_items = {int(c): g.to_numpy() for c, g in
                  train.drop_duplicates("i_idx").groupby("cat_idx")["i_idx"]}
 
+    # 학습 그래프의 아이템 degree 분포 — MIN_ITEM_INTER 효과를 사후 확인하는 근거
+    ideg = np.bincount(ei, minlength=n_items)
+    data_stats["item_degree"] = {
+        "mean": float(ideg.mean()), "median": float(np.median(ideg)),
+        "p10": float(np.percentile(ideg, 10)), "p90": float(np.percentile(ideg, 90)),
+        "min": int(ideg.min()), "max": int(ideg.max()),
+        "n_degree_lt_5": int((ideg < 5).sum()), "n_degree_lt_10": int((ideg < 10).sum())}
+
     return dict(train=train, splits=splits, adj=adj, pos_key=edge_key, tr_u=tu, tr_i=ti,
                 csr_ptr=csr_ptr, csr_items=csr_items, item_cat=item_cat_arr, cat_items=cat_items,
-                n_users=n_users, n_items=n_items, n_cat=n_cat)
+                n_users=n_users, n_items=n_items, n_cat=n_cat, data_stats=data_stats)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -397,21 +475,31 @@ def build_gate(clv, vhat, mode):
     같은 의미를 갖는다.
 
     CLV(또는 V̂)를 못 구한 유저는 0 — 아는 게 없는 유저에게 가치 개입을 하지 않는다.
+
+    ⚠ 정규화는 **유효 유저(개입 대상)만** 기준으로 한다. 전체 배열 평균을 1로 맞추면
+    NaN 유저가 0으로 섞여 유효 유저의 실효 강도가 1/(1-NaN비율)만큼 커진다
+    (NaN 20%면 유효 평균 1.25). mode="none"은 NaN 유저도 1이라 0이 없으므로,
+    전체 평균 기준으로 맞추면 none과 clv/vhat의 실효 강도가 애초에 어긋난다.
     """
     if mode == "none":
         gate = np.ones(len(clv), np.float32)
+        valid = np.ones(len(clv), bool)
     elif mode in ("clv", "vhat"):
         src = clv if mode == "clv" else vhat
+        valid = ~np.isnan(src)
         gate = pd.Series(src).rank(pct=True).to_numpy(np.float32)
-        gate[np.isnan(src)] = 0.0
+        gate[~valid] = 0.0
     else:
         raise ValueError(f"GATE_MODE={mode!r} — none|clv|vhat 중 하나여야 한다")
-    m = float(gate.mean())
+    if not valid.any():
+        raise ValueError("유효 CLV 유저가 없어 게이트를 정규화할 수 없다")
+    m = float(gate[valid].mean())
     if m <= 0:
-        raise ValueError(f"게이트 평균이 {m} — 정규화 불가(유효 CLV 유저가 없음)")
+        raise ValueError(f"유효 유저 게이트 평균이 {m} — 정규화 불가")
     gate = (gate / m).astype(np.float32)
-    print(f"  게이트 mode={mode}: 평균 {gate.mean():.4f}(정규화됨) "
-          f"min {gate.min():.4f} max {gate.max():.4f} 비개입(0) 유저 {int((gate==0).sum()):,}명")
+    print(f"  게이트 mode={mode}: 유효유저 평균 {gate[valid].mean():.4f}(정규화 기준) "
+          f"전체 평균 {gate.mean():.4f} min {gate[valid].min():.4f} max {gate.max():.4f} "
+          f"비개입(0) 유저 {int((~valid).sum()):,}명")
     return gate
 
 
@@ -1091,6 +1179,13 @@ def main():
                    "train_stats": train_stats, "score_diagnostics": diagnostics,
                    "segment_thresholds": {"low": seg_th[0], "high": seg_th[1],
                                           "note": "train 전체 고객 기준 고정"},
+                   # MIN_ITEM_INTER를 바꿔 비교할 때 분모가 함께 변한다(희귀 아이템이
+                   # 정답에서도 빠져 Recall이 기계적으로 오름). 이 블록 없이는 "모델이
+                   # 좋아진 것"과 "어려운 정답이 사라진 것"을 구분할 수 없다.
+                   "data_stats": d["data_stats"],
+                   "gate": {"mode": cfg["GATE_MODE"],
+                            "note": "유효 유저(개입 대상) 평균 1로 정규화. "
+                                    "정규화가 없으면 모드별 평균 차이가 λ의 의미를 바꾼다."},
                    "note_primary": "주 검정은 validation에서 선택된 λ 하나에만 적용한다.",
                    "note_secondary": "test의 λ 곡선은 사전 선언된 민감도 분석이며 "
                                      "'최적 λ'가 아니고 λ별 유의 라벨을 붙이지 않는다.",

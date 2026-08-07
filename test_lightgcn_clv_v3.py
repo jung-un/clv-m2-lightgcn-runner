@@ -167,7 +167,8 @@ def test_gate_is_linear_percentile():
     g = V3.build_gate(clv, clv, "clv")
     assert g[3] == 0.0
     raw = np.array([0.25, 0.5, 0.75, 1.0])
-    np.testing.assert_allclose(np.sort(g[[0, 1, 2, 4]]), raw / (raw.sum() / 5), rtol=1e-6)
+    # 정규화 기준은 **유효 유저 4명**의 평균(0.625)이지 전체 5명이 아니다
+    np.testing.assert_allclose(np.sort(g[[0, 1, 2, 4]]), raw / raw.mean(), rtol=1e-6)
     assert "**" not in _fn("build_gate")
 
 
@@ -220,6 +221,66 @@ def test_gate_mode_in_ckpt_hash_except_pref_only():
     for arch in ("joint_warm", "two_stage", "joint"):
         assert V3.cfg_hash(c1, V3.DCFG, arch, 42) != V3.cfg_hash(c2, V3.DCFG, arch, 42), arch
     assert V3.cfg_hash(c1, V3.DCFG, "pref_only", 42) == V3.cfg_hash(c2, V3.DCFG, "pref_only", 42)
+
+
+def test_kcore_counts_unique_edges_not_rows():
+    """LightGCN 인접행렬은 이진이므로 필터도 고유 엣지를 세야 한다. 반복구매가 많은
+    데이터에서 거래행을 세면 아이템 연결도를 과대평가한다."""
+    # item A: 한 유저가 10번 반복구매 (행 10, 고유엣지 1)
+    # item B: 서로 다른 유저 3명이 1번씩 (행 3, 고유엣지 3)
+    tp = pd.DataFrame({
+        "u_raw": [1] * 10 + [1, 2, 3],
+        "i_raw": ["A"] * 10 + ["B", "B", "B"]})
+    keep_u, keep_i, n_edge, _ = V3.kcore_filter(tp, min_u=1, min_i=3)
+    assert "A" not in keep_i, "반복구매 10회짜리 단일 유저 아이템이 통과하면 안 됨"
+    assert "B" in keep_i
+    body = _fn_ns("kcore_filter")
+    assert 'drop_duplicates()' in body      # 고유 엣지로 환원한 뒤 세는지
+    assert 'tp["i_raw"].value_counts()' not in body   # 거래행을 직접 세면 안 됨
+
+
+def test_kcore_iterates_until_no_orphan_users():
+    """아이템을 지우면 train 이력이 0이 되는 유저가 생긴다 — 한 번만 거르면 남는다."""
+    # u=9는 희귀 아이템 Z만 삼 → Z 제거 시 고아가 됨
+    tp = pd.DataFrame({
+        "u_raw": [1, 2, 3, 1, 2, 3, 9],
+        "i_raw": ["A", "A", "A", "B", "B", "B", "Z"]})
+    keep_u, keep_i, _, n_iter = V3.kcore_filter(tp, min_u=1, min_i=3)
+    assert "Z" not in keep_i
+    assert 9 not in keep_u, "아이템 제거로 이력이 0이 된 유저가 남아있음"
+    assert n_iter >= 1
+
+
+def test_gate_normalized_over_valid_users_only():
+    """NaN 유저를 0으로 섞은 채 전체 평균을 1로 맞추면 유효 유저의 실효 강도가
+    1/(1-NaN비율)만큼 커진다. mode=none은 0이 없으므로 모드 간 강도가 어긋난다."""
+    clv = np.array([1.0, 2.0, 3.0, 4.0, np.nan, np.nan])
+    g = V3.build_gate(clv, clv, "clv")
+    valid = ~np.isnan(clv)
+    assert abs(g[valid].mean() - 1.0) < 1e-5, f"유효유저 평균이 1이 아님: {g[valid].mean()}"
+    assert g[~valid].sum() == 0
+    # none 모드의 유효유저 평균과 같아야 모드 비교가 성립
+    gn = V3.build_gate(clv, clv, "none")
+    assert abs(gn.mean() - g[valid].mean()) < 1e-5
+
+
+def test_result_hash_includes_gate_mode_for_all_archs():
+    """cfg_hash는 pref_only에서 GATE_MODE를 빼므로, result_hash가 따로 넣지 않으면
+    pref_only의 none/clv/vhat 실행이 같은 결과 파일을 덮어쓴다."""
+    import copy
+    c1 = copy.deepcopy(V3.CFG); c1["GATE_MODE"] = "clv"
+    c2 = copy.deepcopy(V3.CFG); c2["GATE_MODE"] = "vhat"
+    for arch in ("pref_only", "two_stage", "joint_warm", "joint"):
+        assert V3.result_hash(c1, V3.DCFG, arch) != V3.result_hash(c2, V3.DCFG, arch), arch
+
+
+def test_data_stats_recorded():
+    """threshold 비교에 필요한 분모(정답쌍·평가유저·degree 분포)가 결과에 남아야 한다."""
+    # gt_pairs/eval_users는 중첩 def build_eval 안에 있어 _fn_ns가 못 잡는다 → 전체 소스로 확인
+    for key in ["train_edges_before", "train_edges_after", "item_drop_rate",
+                "edge_drop_rate", "gt_pairs", "eval_users", "item_degree"]:
+        assert key in NS, f"data_stats에 {key} 없음"
+    assert '"data_stats":d["data_stats"]' in _fn_ns("main")
 
 
 def test_min_item_inter_changes_ckpt_hash():
