@@ -89,8 +89,12 @@ def test_lambda_names_are_separated():
 # ── 리뷰 지적 4: λ 선택은 validation에서, 규칙은 코드에 고정 ──────────
 def test_lambda_selection_is_validation_only_and_rule_fixed():
     body = _fn("select_lambda")
-    assert "passes_noninferiority" in body and "val_pwgain10" in body
+    assert "val_pwgain10" in body
+    # [2026-08-07] 비열등성 가드레일 폐기 — ΔRecall@10 CI는 참고용으로만 계산해
+    # NONINFERIORITY_DELTA가 여전히 등장하지만, 필터링(ok=df[...])에는 더 이상 안 쓴다.
     assert "NONINFERIORITY_DELTA" in body
+    assert "ok=df[df.passes_noninferiority]" not in body.replace(" ", "")
+    assert "ok.empty" not in body
     # 동률이면 더 작은 λ — ascending=[False, True]
     assert "ascending=[False,True]" in body.replace(" ", "")
 

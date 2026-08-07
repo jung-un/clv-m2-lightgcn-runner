@@ -58,7 +58,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
-CODE_VERSION = "v3.5"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.6"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -135,10 +135,13 @@ CFG = {
 
     # ── λ ──
     "LAMBDA_TRAIN": 1.0,                            # [임의] BPR loss 안에 들어감
-    "LAMBDA_EVAL_SWEEP": [0.0, 0.1, 0.5, 1.0, 2.0], # [임의] 실험 전 고정, 실행 중 변경 금지
-    # 비열등 허용폭: CI_lower(ΔRecall@10) >= -δ × baseline_recall@10 (상대값).
-    # ⚠ 결과를 보기 전에 확정해야 하는 값 — 실행 전 반드시 확인할 것.
-    "NONINFERIORITY_DELTA": 0.01,                   # [임의] 1%
+    # [2026-08-07] joint_warm의 PWGain@10이 λ=2.0(스윕 최댓값)까지 계속 단조증가해
+    # 아직 정점을 못 봤음 — 4.0/8.0까지 넓혀서 어디서 꺾이는지 확인한다.
+    "LAMBDA_EVAL_SWEEP": [0.0, 0.1, 0.5, 1.0, 2.0, 4.0, 8.0], # [임의] 실험 전 고정, 실행 중 변경 금지
+    # [2026-08-07] select_lambda()의 비열등성 가드레일 폐기 — Recall@10 하나만 보호하는
+    # 필터라 Recall@20/50 손실을 못 걸렀고, 이 논문에서 Recall 자체가 핵심 지표도 아님.
+    # NONINFERIORITY_DELTA는 이제 선택에 안 쓰이고 참고용 출력(ΔRecall 신뢰구간)에만 남는다.
+    "NONINFERIORITY_DELTA": 0.01,                   # [임의] 1% — 참고용, 선택 기준 아님
 
     # ── CLV ──
     "PREMIUM_THR": 0.8,               # [임의] 단가 상위 20%를 고가 상품으로
@@ -847,11 +850,14 @@ def paired_bootstrap(diffs_per_seed, n_boot, seed=0):
 def select_lambda(val_per_seed, base_per_seed, cfg):
     """아키텍처별 공통 λ 하나를 validation에서 고른다. **시드별 선택은 하지 않는다.**
 
-    규칙 (실행 전 고정):
-      1. Recall@10 비열등 — 세 시드 유저를 이어붙인 paired bootstrap의 CI 하한이
-         -δ × baseline Recall@10 이상인 λ만 남긴다.
-      2. 남은 것 중 validation PWGain@10(시드 평균)이 최대인 λ.
-      3. 동률이면 더 작은 λ.
+    규칙 (2026-08-07 변경 — 비열등성 가드레일 폐기):
+      validation PWGain@10(시드 평균)이 최대인 λ. 동률이면 더 작은 λ.
+
+    v3.5까지는 "CI하한(ΔRecall@10) ≥ -δ × baseline"을 만족하는 λ만 후보로 남긴
+    뒤 그중 PWGain@10을 극대화했다. 하지만 이 가드레일은 Recall@10 하나만 보호할 뿐
+    Recall@20/50 같은 다른 지표 손실은 전혀 못 걸러냈고(joint_warm λ=2.0에서 실측 확인),
+    이 논문은 애초에 Recall 자체를 핵심 지표로 삼지 않는다는 결론이 나서 폐기했다.
+    ΔRecall@10과 그 신뢰구간은 여전히 계산해 참고용으로 출력하되 선택에는 안 쓴다.
     """
     lams = sorted(next(iter(val_per_seed.values())).keys())
     # 비교 기준은 **언제나 외부 pref_only**다. joint의 λ=0은 선호 임베딩이 이미 가치항에
@@ -865,17 +871,13 @@ def select_lambda(val_per_seed, base_per_seed, cfg):
         pw = np.mean([val_per_seed[s][lam]["agg"]["overall"][10]["revenue"] for s in val_per_seed])
         rows.append({"lambda": lam, "d_recall_mean": ci["mean"], "d_recall_ci_lo": ci["lo"],
                      "d_recall_seed_sd": ci["per_seed_sd"],
-                     "passes_noninferiority": ci["lo"] >= -delta_abs, "val_pwgain10": float(pw)})
+                     "ref_would_pass_old_gate": ci["lo"] >= -delta_abs, "val_pwgain10": float(pw)})
     df = pd.DataFrame(rows)
-    print(f"\n[λ 선택] 비열등 기준: CI하한(ΔRecall@10) ≥ -{delta_abs:.6f} "
-          f"(= -{cfg['NONINFERIORITY_DELTA']:.1%} × baseline {base_recall:.6f})")
+    print(f"\n[λ 선택] 가드레일 없음 — val PWGain@10 최대인 λ를 그대로 선택한다. "
+          f"(참고: 구 비열등 기준선 -{delta_abs:.6f} = -{cfg['NONINFERIORITY_DELTA']:.1%} × baseline {base_recall:.6f})")
     print(df.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
-    ok = df[df.passes_noninferiority]
-    if ok.empty:
-        print("  → 비열등을 만족하는 λ가 없음. λ=0(개입 없음) 선택.")
-        return 0.0, df
-    best = ok.sort_values(["val_pwgain10", "lambda"], ascending=[False, True]).iloc[0]
-    print(f"  → 선택 λ = {best['lambda']} (통과 {len(ok)}/{len(df)}개 중 val PWGain@10 최대)")
+    best = df.sort_values(["val_pwgain10", "lambda"], ascending=[False, True]).iloc[0]
+    print(f"  → 선택 λ = {best['lambda']} (val PWGain@10 최대, 후보 {len(df)}개)")
     return float(best["lambda"]), df
 
 
