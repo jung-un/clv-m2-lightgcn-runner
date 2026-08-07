@@ -11,7 +11,9 @@
         vhat : percentile_rank(V̂_u)    거래금액축만 — N̂는 가격 정보를 담지 않는다는
                                        EDA 근거(build_gate 주석 참고)
 
-"임베딩을 분리하고 CLV에 따라 반영 정도를 조정한다" 외의 조건은 넣지 않는다.
+"임베딩을 분리하고 유저 가치 특성에 따라 반영 정도를 조정한다" 외의 조건은 넣지 않는다.
+(무엇을 기준으로 조정할지는 GATE_MODE로 분리 — CLV 전체일 수도, V̂만일 수도, 아예
+조정하지 않을 수도 있다.)
 v2에 있던 가드레일 4종·목적함수·epoch 스크리닝·λ=0 fallback·축소추정·gate 제곱·
 hard negative는 전부 없다.
 
@@ -63,7 +65,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
-CODE_VERSION = "v3.8"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.9"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -282,9 +284,14 @@ def kcore_filter(tp, min_u, min_i, max_iter=20):
        아이템을 지우면 train 이력이 0이 되는 유저가 생긴다. 그 유저는 그래프 degree 0,
        CLV/V̂ = NaN, 평가에서는 제외되는데 유저 인덱스에는 남아 게이트 정규화에 0으로
        섞인다. 유저·아이템 조건이 동시에 만족될 때까지 돌려야 진짜 k-core다.
+
+    ③ 수렴하지 않거나 결과가 비면 **경고가 아니라 예외로 중단**한다.
+       미수렴 상태로 반환하면 마지막 반복에서 유저가 빠지며 일부 아이템 degree가 다시
+       기준 아래로 내려가 있을 수 있다 — 그러면 "k-core를 적용했다"는 전제가 거짓인 채
+       실험이 조용히 진행된다. 임계값이 과해 전부 제거된 경우도 0-user/0-item으로
+       진행하다 한참 뒤 percentile/min에서 엉뚱하게 터진다.
     """
     pairs = tp[["u_raw", "i_raw"]].drop_duplicates()
-    it = 0
     for it in range(1, max_iter + 1):
         n_before = len(pairs)
         ic = pairs["i_raw"].value_counts()
@@ -294,7 +301,20 @@ def kcore_filter(tp, min_u, min_i, max_iter=20):
         if len(pairs) == n_before:
             break
     else:
-        print(f"  ⚠ k-core가 {max_iter}회 안에 수렴하지 않음 — 임계값을 확인할 것")
+        raise RuntimeError(
+            f"k-core가 {max_iter}회 안에 수렴하지 않았다 "
+            f"(MIN_USER_INTER={min_u}, MIN_ITEM_INTER={min_i}). 부분 결과는 k-core가 "
+            f"아니므로 사용하지 않는다 — 임계값을 낮추거나 max_iter를 늘릴 것.")
+    if len(pairs) == 0:
+        raise ValueError(
+            f"k-core 결과가 비었다 (MIN_USER_INTER={min_u}, MIN_ITEM_INTER={min_i}). "
+            f"임계값이 데이터에 비해 과하다 — 낮춰서 다시 실행할 것.")
+    # 반환 직전 실제 degree 조건 검증 — 위 루프가 수렴했어도 불변식을 직접 확인한다
+    ic, uc = pairs["i_raw"].value_counts(), pairs["u_raw"].value_counts()
+    if int(ic.min()) < min_i or int(uc.min()) < min_u:
+        raise RuntimeError(
+            f"k-core 불변식 위반: 최소 아이템 degree={int(ic.min())}(≥{min_i} 필요), "
+            f"최소 유저 degree={int(uc.min())}(≥{min_u} 필요)")
     return set(pairs["u_raw"].unique()), set(pairs["i_raw"].unique()), len(pairs), it
 
 
@@ -353,7 +373,9 @@ def prepare_data(cfg, dcfg):
     train_users = set(train.u_idx.unique()); train_items = set(train.i_idx.unique())
     train_pair_key = np.unique(train.u_idx.values.astype(np.int64) * n_items + train.i_idx.values)
 
-    def build_eval(df, name):
+    def build_eval(df, key, label):
+        """key = JSON/코드용 내부 키(val/test/holdout), label = 사람이 읽는 출력용.
+        출력 문자열을 그대로 키로 쓰면 정렬 공백까지 키에 섞여 깨지기 쉽다."""
         d = df[df.u_idx.isin(train_users) & df.i_idx.isin(train_items)]
         key = d.u_idx.values.astype(np.int64) * n_items + d.i_idx.values
         pos = np.clip(np.searchsorted(train_pair_key, key), 0, len(train_pair_key) - 1)
@@ -362,25 +384,31 @@ def prepare_data(cfg, dcfg):
         gt, rev = {}, {}
         for u, g in agg.groupby("u_idx", sort=False):
             gt[u] = g.i_idx.values.astype(np.int32); rev[u] = g.v.values.astype(np.float32)
-        print(f"  {name}: 평가유저 {len(gt):,}명, 정답 {len(agg):,}쌍 "
+        print(f"  {label}: 평가유저 {len(gt):,}명, 정답 {len(agg):,}쌍 "
               f"(유저당 {len(agg)/max(len(gt),1):.2f})")
         # MIN_ITEM_INTER를 올리면 희귀 아이템이 정답에서도 사라져 Recall이 기계적으로
         # 오른다. 이 분모를 남겨두지 않으면 "모델이 좋아진 것"과 "어려운 정답이 없어진 것"
         # 을 구분할 수 없다 — threshold 간 비교의 필수 전제다.
-        split_stats[name.strip()] = {
+        split_stats[key] = {
             "eval_users": len(gt), "gt_pairs": len(agg),
             "gt_per_user": len(agg) / max(len(gt), 1)}
         return gt, rev
 
     split_stats = {}
-    splits = {"val": build_eval(tx[(tx.t > val_start) & (tx.t <= test_start)], "Val    "),
-              "test": build_eval(tx[(tx.t > test_start) & (tx.t <= hold_start)], "Test   ")}
+    splits = {"val": build_eval(tx[(tx.t > val_start) & (tx.t <= test_start)],
+                                "val", "Val    "),
+              "test": build_eval(tx[(tx.t > test_start) & (tx.t <= hold_start)],
+                                 "test", "Test   ")}
     if cfg["EVAL_HOLDOUT"]:
-        splits["holdout"] = build_eval(tx[tx.t > hold_start], "Holdout")
+        splits["holdout"] = build_eval(tx[tx.t > hold_start], "holdout", "Holdout")
     else:
         print("  Holdout: 계산 안 함 (EVAL_HOLDOUT=False — 최종 확증 때만 켤 것)")
     data_stats["splits"] = split_stats
-    data_stats.update(n_users=n_users, n_items=n_items, n_categories=n_cat)
+    data_stats.update(n_users=n_users, n_items=n_items, n_categories=n_cat,
+                      # 고유엣지 보존율만으로는 부족하다 — 반복구매가 많은 데이터에서는
+                      # 거래행이 얼마나 남았는지도 함께 봐야 필터 영향을 읽을 수 있다.
+                      train_rows_after=len(train),
+                      row_drop_rate=1 - len(train) / max(data_stats["train_rows_before"], 1))
 
     tu = train.u_idx.values.astype(np.int64); ti = train.i_idx.values.astype(np.int64)
     edge_key = np.unique(tu * n_items + ti)
@@ -1183,6 +1211,11 @@ def main():
                    # 정답에서도 빠져 Recall이 기계적으로 오름). 이 블록 없이는 "모델이
                    # 좋아진 것"과 "어려운 정답이 사라진 것"을 구분할 수 없다.
                    "data_stats": d["data_stats"],
+                   "note_min_item_inter": (
+                       "MIN_ITEM_INTER 비교는 민감도 분석이며, 정확도 최대값만으로 "
+                       "threshold를 사후 선택하지 않는다(아이템 유니버스를 결과에 맞춰 "
+                       "고르는 것이 되기 때문). 판단은 validation 정확도 + Coverage/Gini "
+                       "+ 아이템·엣지 보존율 + 평가유저·정답쌍 보존율을 함께 본다."),
                    "gate": {"mode": cfg["GATE_MODE"],
                             "note": "유효 유저(개입 대상) 평균 1로 정규화. "
                                     "정규화가 없으면 모드별 평균 차이가 λ의 의미를 바꾼다."},

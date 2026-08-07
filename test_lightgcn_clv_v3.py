@@ -251,6 +251,54 @@ def test_kcore_iterates_until_no_orphan_users():
     assert n_iter >= 1
 
 
+def test_kcore_raises_when_result_empty():
+    """임계값이 과하면 0-user/0-item으로 진행하다 한참 뒤 엉뚱하게 터진다 — 즉시 중단."""
+    tp = pd.DataFrame({"u_raw": [1, 2], "i_raw": ["A", "B"]})
+    try:
+        V3.kcore_filter(tp, min_u=1, min_i=99)
+        raise AssertionError("빈 k-core 결과를 그대로 반환하면 안 된다")
+    except ValueError as e:
+        assert "비었" in str(e)
+
+
+def test_kcore_raises_on_nonconvergence():
+    """미수렴 부분 결과는 k-core가 아니다 — 경고 후 진행하면 전제가 거짓인 채 실험이 돈다."""
+    rng = np.random.default_rng(0)
+    n = 300
+    tp = pd.DataFrame({"u_raw": rng.integers(0, 40, n), "i_raw": rng.integers(0, 40, n)})
+    try:
+        V3.kcore_filter(tp, min_u=3, min_i=3, max_iter=1)   # 일부러 1회로 제한
+        raise AssertionError("미수렴인데 반환했다")
+    except (RuntimeError, ValueError):
+        pass
+
+
+def test_kcore_result_satisfies_degree_invariant():
+    """수렴했다고 끝이 아니라, 반환값이 실제로 조건을 만족하는지 직접 확인한다."""
+    rng = np.random.default_rng(1)
+    n = 4000
+    tp = pd.DataFrame({"u_raw": rng.integers(0, 120, n), "i_raw": rng.integers(0, 200, n)})
+    keep_u, keep_i, n_edge, _ = V3.kcore_filter(tp, min_u=3, min_i=5)
+    pairs = tp[["u_raw", "i_raw"]].drop_duplicates()
+    pairs = pairs[pairs.u_raw.isin(keep_u) & pairs.i_raw.isin(keep_i)]
+    assert pairs["i_raw"].value_counts().min() >= 5
+    assert pairs["u_raw"].value_counts().min() >= 3
+    assert len(pairs) == n_edge
+
+
+def test_split_stats_use_internal_lowercase_keys():
+    """출력용 라벨('Val    ')을 JSON 키로 쓰면 공백까지 키에 섞인다."""
+    assert 'split_stats[key]=' in NS
+    assert 'split_stats[name.strip()]' not in NS
+    assert 'build_eval(df,key,label)' in NS
+
+
+def test_data_stats_has_row_counts_both_sides():
+    """고유엣지 보존율만으로는 반복구매 많은 데이터의 필터 영향을 못 읽는다."""
+    for key in ("train_rows_before", "train_rows_after", "row_drop_rate"):
+        assert key in NS, f"{key} 없음"
+
+
 def test_gate_normalized_over_valid_users_only():
     """NaN 유저를 0으로 섞은 채 전체 평균을 1로 맞추면 유효 유저의 실효 강도가
     1/(1-NaN비율)만큼 커진다. mode=none은 0이 없으므로 모드 간 강도가 어긋난다."""
