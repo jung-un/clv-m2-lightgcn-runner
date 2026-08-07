@@ -162,11 +162,72 @@ def test_no_v2_machinery():
 
 
 def test_gate_is_linear_percentile():
+    """percentile_rank 선형(제곱 아님) + 평균 1 정규화."""
     clv = np.array([10.0, 20.0, 30.0, np.nan, 40.0])
-    g = V3.clv_gate(clv)
+    g = V3.build_gate(clv, clv, "clv")
     assert g[3] == 0.0
-    np.testing.assert_allclose(np.sort(g[[0, 1, 2, 4]]), [0.25, 0.5, 0.75, 1.0])
-    assert "**" not in _fn("clv_gate")
+    raw = np.array([0.25, 0.5, 0.75, 1.0])
+    np.testing.assert_allclose(np.sort(g[[0, 1, 2, 4]]), raw / (raw.sum() / 5), rtol=1e-6)
+    assert "**" not in _fn("build_gate")
+
+
+# ── 2026-08-07: 게이트 모드 + 평균 1 정규화 ──────────────────────────────
+def test_gate_modes_all_normalized_to_mean_one():
+    """모드마다 평균이 다르면(none=1.0, percentile≈0.5) 같은 λ가 서로 다른 실효
+    개입 강도를 뜻해 모드 비교가 스케일 차이를 재게 된다."""
+    rng = np.random.default_rng(0)
+    clv, vhat = rng.random(500), rng.random(500)
+    for mode in ("none", "clv", "vhat"):
+        g = V3.build_gate(clv, vhat, mode)
+        assert abs(g.mean() - 1.0) < 1e-5, f"{mode} 평균이 1이 아님: {g.mean()}"
+    assert V3.CFG["GATE_MODE"] in ("none", "clv", "vhat")
+
+
+def test_gate_modes_differ_and_use_right_source():
+    rng = np.random.default_rng(1)
+    clv, vhat = rng.random(300), rng.random(300)
+    gn, gc, gv = (V3.build_gate(clv, vhat, m) for m in ("none", "clv", "vhat"))
+    assert np.allclose(gn, 1.0)                      # none은 전원 동일
+    assert not np.allclose(gc, gv)                   # clv와 vhat은 달라야 함
+    # vhat 모드는 vhat 순서를, clv 모드는 clv 순서를 따라야 한다
+    assert np.array_equal(np.argsort(gv), np.argsort(vhat))
+    assert np.array_equal(np.argsort(gc), np.argsort(clv))
+    try:
+        V3.build_gate(clv, vhat, "bogus")
+        raise AssertionError("알 수 없는 GATE_MODE는 거부해야 한다")
+    except ValueError:
+        pass
+
+
+def test_clv_features_returns_vhat():
+    """vhat은 clv와 같은 곳에서 계산돼야 정의가 어긋나지 않는다."""
+    train = pd.DataFrame({
+        "u_idx": [0, 0, 0, 1], "i_idx": [0, 1, 2, 0], "b_raw": [7, 7, 7, 1],
+        "t": [0, 0, 0, 5], "v": [20.0, 20.0, 20.0, 90.0], "up": [20.0, 20.0, 20.0, 90.0],
+        "cat_idx": [0, 0, 1, 1]})
+    x, clv, vhat = V3.clv_features(train, 2, dict(V3.CFG), is_date=False)
+    assert vhat.shape == clv.shape == (2,)
+    assert np.all(np.isfinite(vhat))                 # 두 유저 모두 train 이력 있음
+    assert np.all((vhat >= 0) & (vhat <= 1))         # 백분위 평균이라 0~1
+
+
+def test_gate_mode_in_ckpt_hash_except_pref_only():
+    """GATE_MODE는 가중치를 바꾸므로 해시에 있어야 하지만, pref_only는 λ_train=0이라
+    게이트가 학습에 영향을 못 준다 — 넣으면 v3.4식 낭비 재학습이 재현된다."""
+    import copy
+    c1 = copy.deepcopy(V3.CFG); c1["GATE_MODE"] = "clv"
+    c2 = copy.deepcopy(V3.CFG); c2["GATE_MODE"] = "vhat"
+    for arch in ("joint_warm", "two_stage", "joint"):
+        assert V3.cfg_hash(c1, V3.DCFG, arch, 42) != V3.cfg_hash(c2, V3.DCFG, arch, 42), arch
+    assert V3.cfg_hash(c1, V3.DCFG, "pref_only", 42) == V3.cfg_hash(c2, V3.DCFG, "pref_only", 42)
+
+
+def test_min_item_inter_changes_ckpt_hash():
+    """k-core 필터는 아이템 유니버스를 바꾸므로 체크포인트가 달라야 한다."""
+    import copy
+    c1 = copy.deepcopy(V3.CFG); c1["MIN_ITEM_INTER"] = 1
+    c2 = copy.deepcopy(V3.CFG); c2["MIN_ITEM_INTER"] = 10
+    assert V3.cfg_hash(c1, V3.DCFG, "pref_only", 42) != V3.cfg_hash(c2, V3.DCFG, "pref_only", 42)
 
 
 def test_clv_has_no_shrinkage():
@@ -174,7 +235,7 @@ def test_clv_has_no_shrinkage():
         "u_idx": [0, 0, 0, 1], "i_idx": [0, 1, 2, 0], "b_raw": [7, 7, 7, 1],
         "t": [0, 0, 0, 5], "v": [20.0, 20.0, 20.0, 90.0], "up": [20.0, 20.0, 20.0, 90.0],
         "cat_idx": [0, 0, 0, 1]})
-    x, clv = V3.clv_features(train, 2, dict(V3.CFG), is_date=False)
+    x, clv, vhat = V3.clv_features(train, 2, dict(V3.CFG), is_date=False)
     assert x.shape == (2, 5)
     assert x[1, 3] > x[0, 3]        # 구매 1건 유저의 AOV가 그대로 반영됨
     assert "SHRINKAGE" not in SRC and "shrink" not in SRC.lower()

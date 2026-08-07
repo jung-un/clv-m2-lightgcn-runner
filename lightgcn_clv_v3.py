@@ -58,7 +58,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
-CODE_VERSION = "v3.6"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.7"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -104,6 +104,12 @@ CFG = {
     "VAL_DAYS": 7, "TEST_DAYS": 7,    # [기본]
     "HOLDOUT_DAYS": 7,                # [선택] 최종 확증 전용. 아래 플래그 전엔 계산 안 함
     "EVAL_HOLDOUT": False,            # ⚠ 논문 최종 확증 때 딱 한 번만 True
+    # [2026-08-07] MIN_ITEM_INTER=1은 Dunnhumby(유저 2,500 vs 아이템 90,785, 아이템당
+    # 상호작용 중앙값 3)에서 학습 불가능한 아이템 임베딩을 6만 개 넘게 만들어 baseline이
+    # 인기도로 붕괴하는 원인으로 의심된다. 10-core는 LightGCN 원논문 등 표준 관행이고
+    # Dunnhumby 기준 아이템 71%를 버려도 상호작용은 93.7%가 남는다. Phase 1에서 1/10/20을
+    # pref_only로 비교해 확정할 것 — 바꾸면 아이템 유니버스가 달라지므로 두 데이터셋에
+    # 반드시 같은 값을 적용해야 한다(전처리 비대칭이면 데이터셋 간 비교가 무효).
     "MIN_USER_INTER": 1, "MIN_ITEM_INTER": 1,   # [기본]
 
     # ── 임베딩 ──
@@ -147,6 +153,19 @@ CFG = {
     "PREMIUM_THR": 0.8,               # [임의] 단가 상위 20%를 고가 상품으로
     # 축소추정 없음 — 지도교수님 자료 정의 그대로
 
+    # 게이트 = 유저별 가치항 개입 강도. 모두 유저 평균 1로 정규화된다(build_gate 참고).
+    #   none : g(u)=1        게이트 없음. 개입 강도를 유저별로 조절하지 않는 대조군
+    #   clv  : percentile(CLV = N̂×V̂)   현재 방식
+    #   vhat : percentile(V̂ = mean(AOV_p,Prem_p))  거래금액축만
+    # [2026-08-07 EDA 근거] 유저 가격선호와의 Spearman이 세 조건에서 일관되게
+    #   V̂ > CLV > N̂ 이다 (H&M 60일 .580/.450/.090, H&M 2년 .563/.272/-.058,
+    #   Dunnhumby .789/.501/-.058). N̂는 어디서도 가격 정보를 담지 않으므로
+    #   CLV=N̂×V̂ 를 게이트로 쓰면 가격 신호가 무관한 축에 희석된다. 관측창이 길수록
+    #   N̂ 비중이 커져 희석이 심해진다(2년 H&M에서 V̂와 CLV 격차가 2배).
+    #   → 게이트의 목적(아이템 가격속성과의 매칭 강도)과 지표를 일치시키는 것이지
+    #     데이터셋별로 공식을 맞추는 것이 아니다.
+    "GATE_MODE": "clv",               # [선택] "none" | "clv" | "vhat"
+
     # ── 평가 ──
     "K_LIST": [10, 20, 50],           # [기본]
     "N_BOOT": 2000,                   # [기본]
@@ -184,8 +203,17 @@ def cfg_hash(cfg, dcfg, arch, seed):
             "BATCH_SIZE", "LR", "REG_MODE", "PREF_REG", "VALUE_REG", "WD", "NEG_MODE",
             "EPOCHS", "EARLY_STOP", "SELECT_METRIC", "SELECT_K",
             "WINDOW_DAYS", "VAL_DAYS", "TEST_DAYS", "HOLDOUT_DAYS",
-            "MIN_USER_INTER", "MIN_ITEM_INTER", "PREMIUM_THR", "LAMBDA_TRAIN"]
+            "MIN_USER_INTER", "MIN_ITEM_INTER", "PREMIUM_THR", "LAMBDA_TRAIN",
+            # GATE_MODE는 bpr_loss의 gate를 통해 가중치를 직접 바꾸므로 학습 설정이다.
+            # 빠뜨리면 모드가 다른 실행이 같은 체크포인트를 재사용해 결과가 오염된다.
+            "GATE_MODE"]
     payload = {k: cfg[k] for k in keys}
+    # 단, pref_only는 λ_train=0이라 가치항이 손실에 전혀 들어가지 않는다 → 게이트가
+    # 가중치에 영향을 못 준다. 그런데도 해시에 넣으면 GATE_MODE만 바꿔도 pref_only를
+    # 세 시드 다시 학습하게 되어 v3.4의 낭비가 그대로 재현된다. two_stage/joint_warm이
+    # 이 체크포인트를 warm start로 재사용하므로 영향 범위도 크다.
+    if arch == "pref_only":
+        payload.pop("GATE_MODE")
     payload.update(category_col=dcfg["category_col"], arch=arch, seed=seed)
     return hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:8]
 
@@ -315,8 +343,10 @@ def prepare_data(cfg, dcfg):
 # CLV
 # ═══════════════════════════════════════════════════════════════════
 def clv_features(train, n_users, cfg, is_date):
-    """반환: x_val_u [n_users,5] = (F_p,T_p,R_p,AOV_p,Prem_p), clv [n_users] = N̂×V̂.
-    F/AOV는 구매 건(장바구니) 단위, Prem은 단가 기준. 축소추정 없음."""
+    """반환: x_val_u [n_users,5] = (F_p,T_p,R_p,AOV_p,Prem_p), clv = N̂×V̂, vhat = V̂.
+    F/AOV는 구매 건(장바구니) 단위, Prem은 단가 기준. 축소추정 없음.
+    vhat은 GATE_MODE="vhat"에서만 쓰이지만, clv와 같은 곳에서 계산해야 정의가
+    어긋나지 않으므로 항상 함께 반환한다(train 없는 유저는 둘 다 nan)."""
     win_end = train["t"].max()
     span = win_end - train["t"].min()
     win_days = max((span.days if is_date else span), 1)
@@ -347,14 +377,41 @@ def clv_features(train, n_users, cfg, is_date):
     x[g.index.values] = g[["F_p", "T_p", "R_p", "AOV_p", "Prem_p"]].values.astype(np.float32)
     clv = np.full(n_users, np.nan)
     clv[g.index.values] = g["CLV"].values
+    vhat = np.full(n_users, np.nan)
+    vhat[g.index.values] = g["V_hat"].values
     print(f"  유저 가치 입력 [F_p,T_p,R_p,AOV_p,Prem_p] {x.shape} (축소추정 없음)")
-    return x, clv
+    return x, clv, vhat
 
 
-def clv_gate(clv):
-    """gate(u) = percentile_rank(CLV_u). 선형 0~1. CLV 없는 유저는 0."""
-    gate = pd.Series(clv).rank(pct=True).to_numpy(np.float32)
-    gate[np.isnan(clv)] = 0.0
+def build_gate(clv, vhat, mode):
+    """gate(u) = 유저별 가치항 개입 강도. **모든 모드를 유저 평균 1로 정규화한다.**
+
+      none : 1                        (게이트 없음 대조군)
+      clv  : percentile_rank(CLV_u)   (현재 방식)
+      vhat : percentile_rank(V̂_u)     (거래금액축만)
+
+    정규화가 없으면 모드마다 평균이 달라진다 — none은 1.0인데 percentile_rank는
+    구성상 약 0.5다. 그러면 같은 λ가 모드별로 실효 개입 강도 2배 차이를 뜻하게 되어,
+    모드 비교가 게이트 '구조'가 아니라 '스케일' 차이를 재게 된다. λ 스윕이 일부
+    흡수하지만 그리드가 성겨서 완전히 상쇄되지 않는다. 평균 1로 맞춰야 λ가 모드 간
+    같은 의미를 갖는다.
+
+    CLV(또는 V̂)를 못 구한 유저는 0 — 아는 게 없는 유저에게 가치 개입을 하지 않는다.
+    """
+    if mode == "none":
+        gate = np.ones(len(clv), np.float32)
+    elif mode in ("clv", "vhat"):
+        src = clv if mode == "clv" else vhat
+        gate = pd.Series(src).rank(pct=True).to_numpy(np.float32)
+        gate[np.isnan(src)] = 0.0
+    else:
+        raise ValueError(f"GATE_MODE={mode!r} — none|clv|vhat 중 하나여야 한다")
+    m = float(gate.mean())
+    if m <= 0:
+        raise ValueError(f"게이트 평균이 {m} — 정규화 불가(유효 CLV 유저가 없음)")
+    gate = (gate / m).astype(np.float32)
+    print(f"  게이트 mode={mode}: 평균 {gate.mean():.4f}(정규화됨) "
+          f"min {gate.min():.4f} max {gate.max():.4f} 비개입(0) 유저 {int((gate==0).sum()):,}명")
     return gate
 
 
@@ -927,10 +984,13 @@ def main():
     print(f"DATASET={cfg['DATASET']} | ARCH={arch} ({ARCH_LABEL[arch]}) | "
           f"DEVICE={DEVICE} | CODE={CODE_VERSION}")
     d = prepare_data(cfg, DCFG)
-    x_val_u, clv = clv_features(d["train"], d["n_users"], cfg, DCFG["is_date"])
+    x_val_u, clv, vhat = clv_features(d["train"], d["n_users"], cfg, DCFG["is_date"])
     x_item, item_cat = item_value_features(d["train"], d["n_items"])
     meta = item_meta(d["train"], d["n_items"])
-    gate = clv_gate(clv); gate_t = torch.from_numpy(gate).to(DEVICE)
+    gate = build_gate(clv, vhat, cfg["GATE_MODE"]); gate_t = torch.from_numpy(gate).to(DEVICE)
+    # 세그먼트는 게이트와 무관하게 **항상 CLV 기준**이다 — CLV는 분석변수(어느 고객군에서
+    # 이득/손실이 났는지)이고, 게이트는 개입변수라 역할이 다르다. GATE_MODE를 바꿔도
+    # 세그먼트 정의가 따라 바뀌면 모드 간 세그먼트 결과를 비교할 수 없다.
     seg_th = segment_thresholds(clv, cfg["SEG_EDGES"])
     caches = {name: EvalCache(gt, rev, clv, seg_th, d["n_items"])
               for name, (gt, rev) in d["splits"].items()}
