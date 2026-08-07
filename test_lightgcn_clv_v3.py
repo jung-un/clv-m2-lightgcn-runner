@@ -3,7 +3,10 @@
 import io, tokenize
 from pathlib import Path
 
+import json
+
 import numpy as np
+import pytest
 import pandas as pd
 import torch
 
@@ -266,11 +269,9 @@ def test_kcore_raises_on_nonconvergence():
     rng = np.random.default_rng(0)
     n = 300
     tp = pd.DataFrame({"u_raw": rng.integers(0, 40, n), "i_raw": rng.integers(0, 40, n)})
-    try:
+    # 실패 '종류'까지 구분한다 — ValueError(빈 결과)로 통과해버리면 미수렴 검출을 못 본다
+    with pytest.raises(RuntimeError, match="수렴하지 않았다"):
         V3.kcore_filter(tp, min_u=3, min_i=3, max_iter=1)   # 일부러 1회로 제한
-        raise AssertionError("미수렴인데 반환했다")
-    except (RuntimeError, ValueError):
-        pass
 
 
 def test_kcore_result_satisfies_degree_invariant():
@@ -286,11 +287,74 @@ def test_kcore_result_satisfies_degree_invariant():
     assert len(pairs) == n_edge
 
 
+def _tiny_dataset(tmp_path, n_users=40, n_items=25, n_rows=1200, seed=0):
+    """prepare_data()를 실제로 돌릴 수 있는 최소 데이터셋(csv 2개 + DCFG)을 만든다."""
+    rng = np.random.default_rng(seed)
+    tx = pd.DataFrame({
+        "uid": rng.integers(0, n_users, n_rows),
+        "iid": rng.integers(0, n_items, n_rows),
+        "day": rng.integers(0, 60, n_rows),
+        "amt": rng.random(n_rows) * 10 + 1,
+        "bask": rng.integers(0, 400, n_rows),
+        "qty": 1,
+    })
+    tx_p, meta_p = tmp_path / "tx.csv", tmp_path / "meta.csv"
+    tx.to_csv(tx_p, index=False)
+    pd.DataFrame({"iid": np.arange(n_items),
+                  "cat": [f"C{i % 3}" for i in range(n_items)]}).to_csv(meta_p, index=False)
+    dcfg = {"tx_path": str(tx_p), "item_meta_path": str(meta_p),
+            "user_col": "uid", "item_col": "iid", "time_col": "day", "value_col": "amt",
+            "item_key_col": "iid", "category_col": "cat",
+            "basket_col": "bask", "qty_col": "qty", "is_date": False}
+    cfg = dict(V3.CFG)
+    cfg.update(WINDOW_DAYS=None, VAL_DAYS=7, TEST_DAYS=7, HOLDOUT_DAYS=7,
+               MIN_USER_INTER=1, MIN_ITEM_INTER=1, EVAL_HOLDOUT=False)
+    return cfg, dcfg
+
+
+def test_prepare_data_actually_runs_and_split_keys_are_strings(tmp_path):
+    """⚠ 이 테스트가 없어서 v3.9의 P0 회귀를 놓쳤다.
+    build_eval의 split_key 파라미터가 함수 안에서 pair_key 배열로 덮어써져
+    split_stats[ndarray] → TypeError로 데이터 준비 단계에서 항상 죽었는데,
+    소스 문자열만 검사하는 테스트는 이를 잡지 못했다. 실제로 호출해야 한다."""
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    d = V3.prepare_data(cfg, dcfg)
+    ds = d["data_stats"]
+    assert set(ds["splits"].keys()) == {"val", "test"}, ds["splits"].keys()
+    for k, v in ds["splits"].items():
+        assert isinstance(k, str)
+        assert {"eval_users", "gt_pairs", "gt_per_user"} <= set(v)
+    # data_stats 자체가 JSON 직렬화 가능해야 결과 파일에 들어간다
+    json.dumps(ds, default=float)
+
+
+def test_prepare_data_holdout_key_when_enabled(tmp_path):
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    cfg["EVAL_HOLDOUT"] = True
+    d = V3.prepare_data(cfg, dcfg)
+    assert set(d["data_stats"]["splits"].keys()) == {"val", "test", "holdout"}
+
+
+def test_prepare_data_respects_min_item_inter(tmp_path):
+    """k-core가 실제 파이프라인에서 아이템을 줄이고 통계에 반영되는지."""
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    lo = V3.prepare_data(dict(cfg, MIN_ITEM_INTER=1), dcfg)["data_stats"]
+    hi = V3.prepare_data(dict(cfg, MIN_ITEM_INTER=15), dcfg)["data_stats"]
+    assert hi["train_items_after"] <= lo["train_items_after"]
+    assert hi["item_drop_rate"] >= lo["item_drop_rate"]
+    for key in ("train_rows_after", "row_drop_rate", "train_edges_after"):
+        assert key in hi
+
+
 def test_split_stats_use_internal_lowercase_keys():
     """출력용 라벨('Val    ')을 JSON 키로 쓰면 공백까지 키에 섞인다."""
-    assert 'split_stats[key]=' in NS
+    assert 'split_stats[split_key]=' in NS
     assert 'split_stats[name.strip()]' not in NS
-    assert 'build_eval(df,key,label)' in NS
+    assert 'build_eval(df,split_key,label)' in NS
+    # split_key와 pair_key는 서로 다른 이름이어야 한다(v3.9 P0 회귀의 원인).
+    # 실제 방어는 test_prepare_data_actually_runs_...(런타임 호출)가 하고,
+    # 여기서는 이름이 분리됐다는 사실만 확인한다.
+    assert 'pair_key=d.u_idx.values' in NS
 
 
 def test_data_stats_has_row_counts_both_sides():

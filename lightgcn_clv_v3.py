@@ -65,7 +65,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
-CODE_VERSION = "v3.9"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.10"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -373,13 +373,18 @@ def prepare_data(cfg, dcfg):
     train_users = set(train.u_idx.unique()); train_items = set(train.i_idx.unique())
     train_pair_key = np.unique(train.u_idx.values.astype(np.int64) * n_items + train.i_idx.values)
 
-    def build_eval(df, key, label):
-        """key = JSON/코드용 내부 키(val/test/holdout), label = 사람이 읽는 출력용.
-        출력 문자열을 그대로 키로 쓰면 정렬 공백까지 키에 섞여 깨지기 쉽다."""
+    def build_eval(df, split_key, label):
+        """split_key = JSON/코드용 내부 키(val/test/holdout), label = 사람이 읽는 출력용.
+        출력 문자열을 그대로 키로 쓰면 정렬 공백까지 키에 섞여 깨지기 쉽다.
+
+        ⚠ split_key는 아래 pair_key(유저-아이템 결합 정수 배열)와 **절대 같은 이름을
+        쓰지 말 것**. v3.9에서 이 둘을 모두 key로 두었다가 split_stats[key]가 ndarray를
+        키로 받아 `TypeError: unhashable type: numpy.ndarray`로 데이터 준비 단계에서
+        항상 죽었다(소스 문자열만 보는 테스트라 잡히지 않았음)."""
         d = df[df.u_idx.isin(train_users) & df.i_idx.isin(train_items)]
-        key = d.u_idx.values.astype(np.int64) * n_items + d.i_idx.values
-        pos = np.clip(np.searchsorted(train_pair_key, key), 0, len(train_pair_key) - 1)
-        d = d[train_pair_key[pos] != key]           # 재구매쌍 제거 (교수님 지침)
+        pair_key = d.u_idx.values.astype(np.int64) * n_items + d.i_idx.values
+        pos = np.clip(np.searchsorted(train_pair_key, pair_key), 0, len(train_pair_key) - 1)
+        d = d[train_pair_key[pos] != pair_key]      # 재구매쌍 제거 (교수님 지침)
         agg = d.groupby(["u_idx", "i_idx"], sort=False)["v"].sum().reset_index()
         gt, rev = {}, {}
         for u, g in agg.groupby("u_idx", sort=False):
@@ -389,7 +394,7 @@ def prepare_data(cfg, dcfg):
         # MIN_ITEM_INTER를 올리면 희귀 아이템이 정답에서도 사라져 Recall이 기계적으로
         # 오른다. 이 분모를 남겨두지 않으면 "모델이 좋아진 것"과 "어려운 정답이 없어진 것"
         # 을 구분할 수 없다 — threshold 간 비교의 필수 전제다.
-        split_stats[key] = {
+        split_stats[split_key] = {
             "eval_users": len(gt), "gt_pairs": len(agg),
             "gt_per_user": len(agg) / max(len(gt), 1)}
         return gt, rev
