@@ -831,3 +831,80 @@ def test_result_hash_still_changes_with_code_version():
     finally:
         V3.CODE_VERSION = old_version
     assert h_before != h_after
+
+
+# ── 2026-08-09 2차 리뷰: 노출지표 / val delta / 설정 원자성 ──────────────
+def test_exposure_stats_math():
+    """엔트로피·실효카탈로그·상위점유율이 정의대로 계산되는가."""
+    z = V3.exposure_stats(np.zeros(10), 10)
+    assert z["n_distinct"] == 0 and z["eff_catalog"] == 0.0
+    uni = V3.exposure_stats(np.array([5.0] * 8 + [0.0] * 2), 10)
+    assert uni["n_distinct"] == 8
+    np.testing.assert_allclose(uni["entropy"], np.log(8), rtol=1e-9)
+    np.testing.assert_allclose(uni["eff_catalog"], 8.0, rtol=1e-9)   # 균등 → 상품 수
+    conc = V3.exposure_stats(np.array([100.0] + [0.0] * 999), 1000)
+    assert conc["eff_catalog"] < 1.001 and conc["top10_share"] == 1.0
+    # 절대 개수는 n_items(분모)와 무관해야 한다 — Coverage 착시 방지의 핵심
+    e = np.array([3.0, 1.0] + [0.0] * 98)
+    assert V3.exposure_stats(e, 100)["n_distinct"] == \
+           V3.exposure_stats(e, 100000)["n_distinct"] == 2
+
+
+def test_flatten_exposes_exposure_fields():
+    res = {"overall": {10: {"recall": 0.1}}, "coverage": {10: 0.5}, "gini": {10: 0.9},
+           "exposure": {10: V3.exposure_stats(np.array([2.0, 1.0, 0.0]), 3)},
+           "value_alignment": 0.3, "seg": {}}
+    f = V3.flatten(res)
+    for m in ("n_distinct@10", "entropy@10", "eff_catalog@10",
+              "top10_share@10", "top100_share@10"):
+        assert m in f, f"{m}가 결과 행에 안 실림"
+
+
+def test_model_id_distinguishes_interventions():
+    c = lambda **kw: dict(V3.CFG, **kw)
+    assert V3.model_id(c()) == "m1"
+    assert V3.model_id(c(GRAPH_MODE="clv")) == "m3_clv"
+    assert V3.model_id(c(LOSS_MODE="pair")) == "m4_pair"
+    assert V3.model_id(c(GRAPH_MODE="count", LOSS_MODE="user")) == "m3_count_m4_user"
+    assert V3.model_id(c(ARCH="two_stage")) == "m2_two_stage"
+    ids = {V3.model_id(c(GRAPH_MODE=g)) for g in ("binary", "count", "value", "price", "clv")}
+    assert len(ids) == 5
+
+
+def test_val_delta_is_computed(tmp_path):
+    """EVAL_TEST=False에서도 외부 M1 대비 delta가 남아야 한다.
+    (이전에는 pu_split이 test/holdout 전용이라 _delta.csv가 통째로 비었다)"""
+    src = _fn_ns("main")
+    assert 'pu_split["val"]=' in src, "val이 delta 계산 대상에 안 들어감"
+    assert 'base_pu_split["val"]=' in src
+
+
+def test_configure_run_updates_dcfg_and_out_dir():
+    """CFG["DATASET"]만 바꾸면 DCFG·OUT_DIR이 어긋난다 — 실제로 재현됐던 사고."""
+    import copy
+    saved, saved_dcfg = copy.deepcopy(V3.CFG), V3.DCFG
+    try:
+        V3.configure_run("dunnhumby")
+        assert V3.DCFG is V3.SCHEMA["dunnhumby"]
+        assert "dunnhumby" in V3.CFG["OUT_DIR"] and "results_v3_hm" not in V3.CFG["OUT_DIR"]
+        V3.configure_run("hm", SEED_LIST=[7])
+        assert V3.DCFG is V3.SCHEMA["hm"] and V3.CFG["SEED_LIST"] == [7]
+        assert "results_v3_hm" in V3.CFG["OUT_DIR"]
+        with pytest.raises(AssertionError):
+            V3.configure_run("없는데이터셋")
+    finally:
+        V3.CFG.clear(); V3.CFG.update(saved); V3.DCFG = saved_dcfg
+
+
+def test_main_asserts_dcfg_out_dir_consistency():
+    """configure_run을 우회해도 main() 진입 시 걸려야 한다."""
+    body = _fn_ns("main")
+    assert 'assertDCFGisSCHEMA[cfg["DATASET"]]' in body
+    assert 'cfg["DATASET"]instr(cfg["OUT_DIR"])' in body
+
+
+def test_run_2x2_does_not_hardcode_test_split():
+    """EVAL_TEST=False에서 긴 학습 뒤 AttributeError로 죽던 경로."""
+    body = _fn_ns("run_2x2_diagnostic")
+    assert 'sp="test"if' in body and 'else"val"' in body   # split을 런타임에 고름
+    assert 'df.split==sp' in body                          # 하드코딩된 test 필터 없음

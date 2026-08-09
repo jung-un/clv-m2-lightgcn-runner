@@ -65,7 +65,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
-CODE_VERSION = "v3.13"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.14"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -221,8 +221,13 @@ CFG = {
     "SEG_EDGES": (0.2, 0.8),          # [선택] 하위20%/중위60%/상위20%
                                       #        임계값은 train 전체 고객에서 한 번 계산해 고정
 }
-CFG["OUT_DIR"] = (f"/content/drive/MyDrive/논문/data/results_v3_{CFG['DATASET']}" if IN_COLAB
-                  else f"/Users/jungun/Workspace/논문준비/data/results_v3_{CFG['DATASET']}")
+def default_out_dir(dataset):
+    base = ("/content/drive/MyDrive/논문/data" if IN_COLAB
+            else "/Users/jungun/Workspace/논문준비/data")
+    return f"{base}/results_v3_{dataset}"
+
+
+CFG["OUT_DIR"] = default_out_dir(CFG["DATASET"])
 DCFG = SCHEMA[CFG["DATASET"]]
 
 _METS = ["recall", "precision", "ndcg", "hr", "map", "revenue", "vndcg", "arp", "novelty", "diversity"]
@@ -920,6 +925,30 @@ def _gini(x):
     c = np.cumsum(x); return float((n + 1 - 2 * (c / c[-1]).sum()) / n)
 
 
+def exposure_stats(expo, n_items):
+    """추천 노출 분포의 집중도. Coverage/Gini만으로는 부족해서 함께 저장한다.
+
+    n_distinct : 추천된 서로 다른 상품 **절대 개수**. Coverage는 n_items로 나누므로
+                 MIN_ITEM_INTER를 바꾸면 분모가 같이 변해 설정 간 비교가 불가능하다
+                 (2026-08-07에 실제로 이 착시로 잘못된 판정을 냈다).
+    entropy    : 노출 분포의 섀넌 엔트로피(nat). 균등하면 log(n_distinct).
+    eff_catalog: exp(entropy) — "실효 카탈로그 크기". 노출이 몇 개 상품에 해당하는
+                 만큼 균등하게 퍼져 있는지를 상품 개수 단위로 읽을 수 있다.
+    top10/100  : 노출 상위 10·100개 상품이 가져가는 노출 점유율."""
+    e = np.asarray(expo, dtype=np.float64)
+    tot = e.sum()
+    if tot <= 0:
+        return {"n_distinct": 0, "entropy": 0.0, "eff_catalog": 0.0,
+                "top10_share": 0.0, "top100_share": 0.0}
+    p_ = e[e > 0] / tot
+    ent = float(-(p_ * np.log(p_)).sum())
+    srt = np.sort(e)[::-1]
+    return {"n_distinct": int((e > 0).sum()), "entropy": ent,
+            "eff_catalog": float(np.exp(ent)),
+            "top10_share": float(srt[:10].sum() / tot),
+            "top100_share": float(srt[:100].sum() / tot)}
+
+
 def _spearman(a, b):
     if len(a) < 3: return 0.0
     r = spearmanr(a, b).correlation
@@ -1040,6 +1069,9 @@ def evaluate(model, lam, gate_t, cache, meta, ks, csr_ptr, csr_items, cfg, per_u
     out = dict(overall=overall, seg=seg_acc, seg_cnt=cache.seg_cnt, n_eval=n,
                coverage={k: float((expo[k] > 0).sum()) / n_items for k in ks},
                gini={k: _gini(expo[k]) for k in ks},
+               # Coverage는 n_items로 나눈 값이라 설정 간 비교가 안 된다 — 절대 개수와
+               # 노출 집중도를 함께 남긴다. expo를 여기서 버리면 사후 복원이 불가능하다.
+               exposure={k: exposure_stats(expo[k], n_items) for k in ks},
                value_alignment=_spearman(cal_v, cal_p))
     if per_user:
         out["per_user"] = {m: np.concatenate(pu[m]) for m in _METS}
@@ -1251,12 +1283,24 @@ def select_lambda(val_per_seed, base_per_seed, cfg):
     return float(best["lambda"]), df
 
 
+def model_id(cfg):
+    """결과 행을 사람이 구분할 수 있게 하는 파생 라벨. arch는 M1/M3/M4가 전부
+    pref_only라 CSV를 합치면 구분이 안 된다. 실행 노브가 아니라 cfg에서 유도한다."""
+    parts = []
+    if cfg["GRAPH_MODE"] != "binary": parts.append(f"m3_{cfg['GRAPH_MODE']}")
+    if cfg["LOSS_MODE"] != "plain": parts.append(f"m4_{cfg['LOSS_MODE']}")
+    if cfg["ARCH"] != "pref_only": parts.append(f"m2_{cfg['ARCH']}")
+    return "_".join(parts) if parts else "m1"
+
+
 def flatten(res):
     out = {}
     for k, mets in res["overall"].items():
         for m, v in mets.items(): out[f"{m}@{k}"] = v
     for name in ("coverage", "gini"):
         for k, v in res[name].items(): out[f"{name}@{k}"] = v
+    for k, st in res["exposure"].items():
+        for m, v in st.items(): out[f"{m}@{k}"] = v
     out["value_alignment"] = res["value_alignment"]
     for k, segs in res["seg"].items():
         for sg, mets in segs.items():
@@ -1282,18 +1326,49 @@ def run_2x2_diagnostic():
                                          SEED_LIST=[base["SEED_LIST"][0]])
             print(f"\n{'#'*84}\n#  진단: REG_MODE={reg} | NEG_MODE={neg}\n{'#'*84}")
             df = main()
-            r = df[(df.split == "test") & (df["lambda"] == 0.0)].iloc[0]
-            rows.append({"reg": reg, "neg": neg, "recall@10": r["recall@10"],
-                         "ndcg@10": r["ndcg@10"], "coverage@10": r["coverage@10"]})
+            # EVAL_TEST=False면 test 행이 없다. 진단은 validation으로도 충분하므로
+            # 있는 split을 쓴다 — 긴 학습이 끝난 뒤 AttributeError로 죽지 않게.
+            sp = "test" if (df.split == "test").any() else "val"
+            r = df[(df.split == sp) & (df["lambda"] == 0.0)
+                   & (df.role == "model")].iloc[0]
+            rows.append({"reg": reg, "neg": neg, "split": sp, "recall@10": r["recall@10"],
+                         "ndcg@10": r["ndcg@10"], "n_distinct@10": r["n_distinct@10"]})
     CFG.update(base)
     out = pd.DataFrame(rows)
-    print(f"\n{'='*84}\n2×2 진단 요약 (pref_only, test @10)\n{'='*84}")
+    print(f"\n{'='*84}\n2×2 진단 요약 (pref_only, @10)\n{'='*84}")
     print(out.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
     return out
 
 
+def configure_run(dataset=None, out_dir=None, **overrides):
+    """CFG·DCFG·OUT_DIR을 **함께** 갱신한다. 실행 설정을 바꿀 때는 항상 이걸 쓸 것.
+
+    CFG["DATASET"]만 바꾸면 전역 DCFG(스키마)와 OUT_DIR이 이전 데이터셋 상태로 남아,
+    다른 데이터셋의 컬럼 규칙으로 읽고 결과를 엉뚱한 폴더에 쓰는 사고가 난다.
+    main()도 실행 직전에 같은 불변식을 assert하므로 우회 경로는 거기서 걸린다."""
+    global DCFG
+    if dataset is not None:
+        assert dataset in SCHEMA, f"모르는 DATASET: {dataset}"
+        if dataset != CFG["DATASET"] and out_dir is None:
+            CFG["OUT_DIR"] = default_out_dir(dataset)     # 이전 데이터셋 폴더에 안 쓰도록
+        CFG["DATASET"] = dataset
+    CFG.update(overrides)
+    DCFG = SCHEMA[CFG["DATASET"]]
+    if out_dir is not None:
+        CFG["OUT_DIR"] = out_dir
+    print(f"[configure_run] DATASET={CFG['DATASET']} | OUT_DIR={CFG['OUT_DIR']}")
+    return CFG
+
+
 def main():
     cfg, arch = CFG, CFG["ARCH"]
+    # ⚠ DCFG는 전역이라 CFG["DATASET"]만 바꾸면 어긋난다. configure_run()을 안 썼더라도
+    #   여기서 잡아 15시간짜리 실행이 잘못된 스키마로 도는 일을 막는다.
+    assert DCFG is SCHEMA[cfg["DATASET"]], (
+        f"DCFG가 CFG['DATASET']={cfg['DATASET']}와 불일치 — configure_run()을 쓸 것")
+    assert cfg["OUT_DIR"] and cfg["DATASET"] in str(cfg["OUT_DIR"]), (
+        f"OUT_DIR={cfg['OUT_DIR']}에 데이터셋 이름이 없다 — 다른 데이터셋 결과를 "
+        "덮어쓸 수 있으므로 경로에 반드시 포함할 것")
     print(f"DATASET={cfg['DATASET']} | ARCH={arch} ({ARCH_LABEL[arch]}) | "
           f"DEVICE={DEVICE} | CODE={CODE_VERSION}")
     d = prepare_data(cfg, DCFG)
@@ -1371,10 +1446,18 @@ def main():
                              d["csr_ptr"], d["csr_items"], cfg, per_user=True)
                 pu_split.setdefault(split, {}).setdefault(lam, {})[seed] = r.pop("per_user")
                 label = "ablation" if (arch in ABLATION_ARCHS and lam == 0.0) else "model"
-                test_rows.append({"seed": seed, "arch": arch, "split": split,
-                                  "lambda": lam, "role": label, **flatten(r)})
+                test_rows.append({"seed": seed, "arch": arch, "model_id": model_id(cfg),
+                                  "split": split, "lambda": lam, "role": label,
+                                  **flatten(r)})
 
     # Δ는 **모든 시드를 모아** 유저 단위로 한 번에 계산한다(시드는 독립 표본이 아님).
+    # validation도 delta를 남긴다. EVAL_TEST=False면 pu_split이 비어서 _delta.csv와
+    # JSON delta_table이 통째로 비었고, 개입모형 절대값만 남아 외부 M1 대비 효과를
+    # 결과물만 보고는 알 수 없었다.
+    pu_split["val"] = {lam: {s: val_per_seed[s][lam]["pu"] for s in val_per_seed}
+                       for lam in sweep}
+    base_pu_split["val"] = {s: base_per_seed[s]["pu"] for s in base_per_seed}
+
     delta_rows = []
     for split, per_lam in pu_split.items():
         for lam, per_seed in per_lam.items():
@@ -1386,6 +1469,7 @@ def main():
                 row[f"d_{m}_seed_sd"] = ci["per_seed_sd"]
             delta_rows.append(row)
     delta_df = pd.DataFrame(delta_rows)
+    if len(delta_df): delta_df.insert(0, "model_id", model_id(cfg))
 
     sel_lambda, sel_table = select_lambda(val_per_seed, base_per_seed, cfg)
 
@@ -1394,13 +1478,20 @@ def main():
     df = pd.DataFrame(test_rows)
     df.to_csv(out / f"{stem}.csv", index=False, float_format="%.6f")
     delta_df.to_csv(out / f"{stem}_delta.csv", index=False, float_format="%.6f")
-    val_rows = [{"seed": s, "arch": arch, "split": "val", "lambda": lam,
-                 **flatten(v["agg"])} for s in val_per_seed for lam, v in val_per_seed[s].items()]
-    pd.DataFrame(val_rows).to_csv(out / f"{stem}_val.csv", index=False, float_format="%.6f")
+    val_rows = [{"seed": s, "arch": arch, "model_id": model_id(cfg), "split": "val",
+                 "lambda": lam, "role": "ablation" if (arch in ABLATION_ARCHS and lam == 0.0)
+                 else "model", **flatten(v["agg"])}
+                for s in val_per_seed for lam, v in val_per_seed[s].items()]
+    # 기준모형 절대값도 같은 파일에 남긴다 — delta만으로는 수준을 못 읽는다
+    val_rows += [{"seed": s, "arch": "pref_only", "model_id": "m1_baseline", "split": "val",
+                  "lambda": 0.0, "role": "baseline", **flatten(base_per_seed[s]["agg"])}
+                 for s in base_per_seed]
+    val_df = pd.DataFrame(val_rows)
+    val_df.to_csv(out / f"{stem}_val.csv", index=False, float_format="%.6f")
     with open(out / f"{stem}.json", "w") as f:
         json.dump({"code_version": CODE_VERSION,
                    "cfg": {k: v for k, v in cfg.items() if k != "OUT_DIR"},
-                   "arch_label": ARCH_LABEL[arch],
+                   "arch_label": ARCH_LABEL[arch], "model_id": model_id(cfg),
                    "selected_lambda_from_validation": sel_lambda,
                    "baseline_for_comparison":
                        "pref_only + GRAPH_MODE=binary + LOSS_MODE=plain (순수 M1, 같은 시드)",
@@ -1435,9 +1526,16 @@ def main():
         vsel = pd.DataFrame(val_rows)
         vsel = vsel[vsel["lambda"] == sel_lambda]
         for m in ("recall@10", "ndcg@10", "revenue@10", "arp@10", "value_alignment",
-                  "coverage@10"):
+                  "n_distinct@10", "eff_catalog@10", "top100_share@10"):
             print(f"  {m:<18} {vsel[m].mean():.6f}")
-        return df
+        dsel = delta_df[(delta_df.split == "val") & (delta_df["lambda"] == sel_lambda)]
+        if len(dsel):
+            r = dsel.iloc[0]
+            print("  ── 순수 M1 대비 (paired bootstrap, validation) ──")
+            for m in ("recall", "ndcg", "revenue", "arp"):
+                print(f"  Δ{m:<8} {r[f'd_{m}_mean']:+.6f} "
+                      f"[{r[f'd_{m}_lo']:+.6f}, {r[f'd_{m}_hi']:+.6f}]")
+        return pd.concat([df, val_df], ignore_index=True)
 
     print(f"\n{'='*84}\n[주 결과] validation 선택 λ = {sel_lambda} — test\n"
           f"  비교 기준: 외부 pref_only(같은 시드). joint의 λ=0은 ablation으로 별도 보고.\n{'='*84}")
@@ -1462,7 +1560,7 @@ def main():
         ["recall@10", "ndcg@10", "revenue@10", "arp@10", "diversity@10",
          "coverage@10", "value_alignment"]].mean()
     print(g.to_string(float_format=lambda x: f"{x:.6f}"))
-    return df
+    return pd.concat([df, val_df], ignore_index=True)
 
 
 if __name__ == "__main__":
