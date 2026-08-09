@@ -400,7 +400,7 @@ def test_graph_modes_change_adjacency(tmp_path):
     """binary는 기존 동작과 동일해야 하고, count/value는 실제로 가중치를 바꿔야 한다."""
     cfg, dcfg = _tiny_dataset(tmp_path)
     a = V3.prepare_data(dict(cfg, GRAPH_MODE="binary"), dcfg)["adj"].coalesce()
-    for mode in ("count", "value"):
+    for mode in ("count", "value", "clv"):
         b = V3.prepare_data(dict(cfg, GRAPH_MODE=mode), dcfg)["adj"].coalesce()
         assert a.indices().shape == b.indices().shape        # 엣지 집합은 동일
         assert not torch.allclose(a.values(), b.values()), f"{mode}가 가중치를 안 바꿈"
@@ -420,6 +420,46 @@ def test_graph_alpha_scales_weights(tmp_path):
     z = V3.prepare_data(dict(cfg, GRAPH_MODE="value", GRAPH_ALPHA=0.0), dcfg)["adj"].coalesce()
     b = V3.prepare_data(dict(cfg, GRAPH_MODE="binary"), dcfg)["adj"].coalesce()
     torch.testing.assert_close(z.values(), b.values(), rtol=1e-5, atol=1e-6)
+
+
+def test_graph_clv_mode_actually_uses_clv(tmp_path):
+    """clv 변형만 CLV를 직접 참조한다 — count/value는 거래정보만 쓰는 대조군.
+    CLV가 달라지면 clv 그래프는 바뀌고 count/value 그래프는 안 바뀌어야 한다."""
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    real = V3.prepare_data(dict(cfg, GRAPH_MODE="clv"), dcfg)
+    assert "clv" in real and "vhat" in real and "x_val_u" in real   # main과 공유
+
+    # CLV를 뒤집어도 count/value는 불변, clv는 변해야 한다
+    orig = V3.clv_features
+    try:
+        def flipped(train, n_users, c, is_date):
+            x, cl, vh = orig(train, n_users, c, is_date)
+            return x, -cl, vh                      # CLV 순서를 뒤집는다
+        V3.clv_features = flipped
+        for mode, should_change in (("count", False), ("value", False), ("clv", True)):
+            base = V3.prepare_data(dict(cfg, GRAPH_MODE=mode), dcfg)["adj"].coalesce()
+            V3.clv_features = orig
+            ref = V3.prepare_data(dict(cfg, GRAPH_MODE=mode), dcfg)["adj"].coalesce()
+            V3.clv_features = flipped
+            changed = not torch.allclose(base.values(), ref.values())
+            assert changed == should_change, f"{mode}: CLV 의존성이 기대와 다름"
+    finally:
+        V3.clv_features = orig
+
+
+def test_graph_clv_varies_within_user(tmp_path):
+    """유저 단위 상수 가중은 D^-1/2 정규화에 대부분 먹힌다. clv 모드는 아이템 항과
+    곱해 유저 안에서 값이 달라져야 한다 — 그래야 개입이 살아남는다."""
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    d = V3.prepare_data(dict(cfg, GRAPH_MODE="clv"), dcfg)
+    a = d["adj"].coalesce()
+    idx, val = a.indices().numpy(), a.values().numpy()
+    n_u = d["n_users"]
+    # 유저→아이템 방향 엣지만 골라 유저별 가중치 분산이 0이 아닌지 본다
+    m = idx[0] < n_u
+    rows, vals = idx[0][m], val[m]
+    spreads = [vals[rows == u].std() for u in np.unique(rows) if (rows == u).sum() > 1]
+    assert len(spreads) > 0 and max(spreads) > 0, "유저 내부에서 엣지 가중치가 전부 같음"
 
 
 def test_loss_weight_modes():
@@ -481,7 +521,8 @@ def test_m3_m4_in_ckpt_hash_for_all_archs():
     import copy
     base = copy.deepcopy(V3.CFG)
     # 모드를 켜는 변경은 모든 아키텍처의 해시를 바꿔야 한다
-    for key, val in [("GRAPH_MODE", "count"), ("LOSS_MODE", "pair")]:
+    for key, val in [("GRAPH_MODE", "count"), ("GRAPH_MODE", "value"),
+                     ("GRAPH_MODE", "clv"), ("LOSS_MODE", "pair")]:
         c2 = copy.deepcopy(base); c2[key] = val
         for arch in ("pref_only", "two_stage", "joint_warm", "joint"):
             assert V3.cfg_hash(base, V3.DCFG, arch, 42) != V3.cfg_hash(c2, V3.DCFG, arch, 42), \

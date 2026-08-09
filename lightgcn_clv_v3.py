@@ -65,7 +65,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
-CODE_VERSION = "v3.11"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.12"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -180,12 +180,20 @@ CFG = {
     "GATE_MODE": "clv",               # [선택] "none" | "clv" | "vhat"
 
     # ── M3: 가치그래프 (그래프 개입) ──
-    # binary = LightGCN 표준 이진 인접행렬(= M1). count/value가 M3의 두 변형이다.
-    #   count : w_ui = 1 + α·log(cnt_ui)              반복구매 횟수
-    #   value : w_ui = 1 + α·log(1 + spend_ui / ū)    거래금액 (ū = 전체 평균단가)
+    # binary = LightGCN 표준 이진 인접행렬(= M1). 나머지 셋이 M3의 변형이다.
+    #   count : w_ui = 1 + α·log(cnt_ui)                        반복구매 횟수
+    #   value : w_ui = 1 + α·log(1 + spend_ui / ū)              거래금액
+    #   clv   : w_ui = 1 + α·g(CLV_u)·log(1 + price_i / ū)      CLV × 상품가격
+    #   (ū = 전체 평균단가, g = M2와 동일한 CLV 백분위 게이트)
+    #
+    # ⚠ count·value는 **CLV 값을 직접 쓰지 않는다.** CLV를 구성하는 두 축(N̂ 반복거래,
+    #   V̂ 거래금액)을 고객 수준이 아니라 (고객,상품) 상호작용 수준에서 쓸 뿐이다.
+    #   clv 변형만이 CLV를 직접 참조하며, count/value는 "CLV 없이 거래정보만으로도
+    #   되는가"를 가리는 대조군 역할을 한다. 논문에서 이 구분을 반드시 명시할 것.
+    #
     # Dunnhumby는 거래기록의 약 46%가 반복구매인데 이진 그래프가 이를 모두 버린다
     # (H&M은 3.5%). M3는 점수 재정렬이 아니라 전파 자체를 바꾸는 유일한 개입이다.
-    "GRAPH_MODE": "binary",           # [선택] "binary" | "count" | "value"
+    "GRAPH_MODE": "binary",           # [선택] "binary" | "count" | "value" | "clv"
     "GRAPH_ALPHA": 1.0,               # [기본] 참고 구현의 VG_ALPHA와 동일
 
     # ── M4: CLV-aware 손실함수 (목적함수 개입) ──
@@ -442,6 +450,11 @@ def prepare_data(cfg, dcfg):
                       train_rows_after=len(train),
                       row_drop_rate=1 - len(train) / max(data_stats["train_rows_before"], 1))
 
+    # CLV 특징은 여기서 한 번만 계산해 main()과 공유한다. GRAPH_MODE="clv"가
+    # 인접행렬 구성에 CLV를 쓰므로 그래프보다 먼저 있어야 하고, 두 곳에서 따로
+    # 계산하면 정의가 갈릴 수 있다.
+    x_val_u, clv, vhat = clv_features(train, n_users, cfg, dcfg["is_date"])
+
     tu = train.u_idx.values.astype(np.int64); ti = train.i_idx.values.astype(np.int64)
     edge_key = np.unique(tu * n_items + ti)
     eu = (edge_key // n_items).astype(np.int64); ei = (edge_key % n_items).astype(np.int64)
@@ -462,8 +475,25 @@ def prepare_data(cfg, dcfg):
             w_edge = (1.0 + a * np.log(g_e["cnt"].values)).astype(np.float32)
         elif cfg["GRAPH_MODE"] == "value":
             w_edge = (1.0 + a * np.log1p(g_e["spend"].values / up_mean)).astype(np.float32)
+        elif cfg["GRAPH_MODE"] == "clv":
+            # w_ui = 1 + α · g(CLV_u) · log(1 + price_i/ū)
+            # 고가치 고객이 비싼 상품과 맺은 연결을 굵게 한다. count/value가 거래
+            # 횟수·금액만 쓰는 것과 달리 이 변형은 **CLV를 직접 참조**하며, M2의
+            # 게이트 구조(gate(u) × 아이템 가격속성)를 점수단이 아니라 전파단에
+            # 적용한 것이다 — 같은 CLV 조건화를 어느 층에 넣느냐를 가르는 대조군.
+            #
+            # ⚠ 유저 단위 상수 가중(w_ui = c_u)으로는 안 된다. D^-1/2·A·D^-1/2
+            #   정규화에서 유저 degree도 같이 c_u배가 되어 √c_u로 줄고 아이템
+            #   degree를 통해 더 희석된다(M4-user가 유저 내부 순위를 못 바꾸는 것과
+            #   같은 종류의 문제). 유저 안에서 상품마다 값이 달라져야 개입이
+            #   살아남으므로 반드시 아이템 항과 곱한다.
+            g_u = build_gate(clv, vhat, "clv")          # M2 게이트와 동일 정의
+            med = train.groupby("i_idx")["up"].median()
+            price_i = np.full(n_items, float(train["up"].median()), np.float64)
+            price_i[med.index.values] = med.values
+            w_edge = (1.0 + a * g_u[eu] * np.log1p(price_i[ei] / up_mean)).astype(np.float32)
         else:
-            raise ValueError(f"GRAPH_MODE={cfg['GRAPH_MODE']!r} — binary|count|value")
+            raise ValueError(f"GRAPH_MODE={cfg['GRAPH_MODE']!r} — binary|count|value|clv")
         print(f"  가치그래프({cfg['GRAPH_MODE']}, α={a}): 엣지 {len(eu):,} | "
               f"w 평균 {w_edge.mean():.3f} 중앙값 {np.median(w_edge):.3f} 최대 {w_edge.max():.3f}")
 
@@ -496,6 +526,7 @@ def prepare_data(cfg, dcfg):
         "n_degree_lt_5": int((ideg < 5).sum()), "n_degree_lt_10": int((ideg < 10).sum())}
 
     return dict(train=train, splits=splits, adj=adj, pos_key=edge_key, tr_u=tu, tr_i=ti,
+                x_val_u=x_val_u, clv=clv, vhat=vhat,
                 csr_ptr=csr_ptr, csr_items=csr_items, item_cat=item_cat_arr, cat_items=cat_items,
                 n_users=n_users, n_items=n_items, n_cat=n_cat, data_stats=data_stats)
 
@@ -1204,7 +1235,7 @@ def main():
     print(f"DATASET={cfg['DATASET']} | ARCH={arch} ({ARCH_LABEL[arch]}) | "
           f"DEVICE={DEVICE} | CODE={CODE_VERSION}")
     d = prepare_data(cfg, DCFG)
-    x_val_u, clv, vhat = clv_features(d["train"], d["n_users"], cfg, DCFG["is_date"])
+    x_val_u, clv, vhat = d["x_val_u"], d["clv"], d["vhat"]   # prepare_data에서 계산됨
     x_item, item_cat = item_value_features(d["train"], d["n_items"])
     meta = item_meta(d["train"], d["n_items"])
     gate = build_gate(clv, vhat, cfg["GATE_MODE"]); gate_t = torch.from_numpy(gate).to(DEVICE)
