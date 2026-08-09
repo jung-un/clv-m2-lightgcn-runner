@@ -320,7 +320,7 @@ def test_prepare_data_actually_runs_and_split_keys_are_strings(tmp_path):
     cfg, dcfg = _tiny_dataset(tmp_path)
     d = V3.prepare_data(cfg, dcfg)
     ds = d["data_stats"]
-    assert set(ds["splits"].keys()) == {"val", "test"}, ds["splits"].keys()
+    assert set(ds["splits"].keys()) == {"val"}, ds["splits"].keys()   # EVAL_TEST=False
     for k, v in ds["splits"].items():
         assert isinstance(k, str)
         assert {"eval_users", "gt_pairs", "gt_per_user"} <= set(v)
@@ -330,7 +330,7 @@ def test_prepare_data_actually_runs_and_split_keys_are_strings(tmp_path):
 
 def test_prepare_data_holdout_key_when_enabled(tmp_path):
     cfg, dcfg = _tiny_dataset(tmp_path)
-    cfg["EVAL_HOLDOUT"] = True
+    cfg["EVAL_HOLDOUT"] = True; cfg["EVAL_TEST"] = True
     d = V3.prepare_data(cfg, dcfg)
     assert set(d["data_stats"]["splits"].keys()) == {"val", "test", "holdout"}
 
@@ -400,9 +400,10 @@ def test_graph_modes_change_adjacency(tmp_path):
     """binary는 기존 동작과 동일해야 하고, count/value는 실제로 가중치를 바꿔야 한다."""
     cfg, dcfg = _tiny_dataset(tmp_path)
     a = V3.prepare_data(dict(cfg, GRAPH_MODE="binary"), dcfg)["adj"].coalesce()
-    for mode in ("count", "value", "clv"):
+    for mode in ("count", "value", "price", "clv"):
         b = V3.prepare_data(dict(cfg, GRAPH_MODE=mode), dcfg)["adj"].coalesce()
-        assert a.indices().shape == b.indices().shape        # 엣지 집합은 동일
+        # shape만 보면 엣지 집합이 바뀌어도 통과한다 — 좌표 자체를 비교한다.
+        torch.testing.assert_close(a.indices(), b.indices())
         assert not torch.allclose(a.values(), b.values()), f"{mode}가 가중치를 안 바꿈"
     try:
         V3.prepare_data(dict(cfg, GRAPH_MODE="bogus"), dcfg)
@@ -447,19 +448,76 @@ def test_graph_clv_mode_actually_uses_clv(tmp_path):
         V3.clv_features = orig
 
 
-def test_graph_clv_varies_within_user(tmp_path):
-    """유저 단위 상수 가중은 D^-1/2 정규화에 대부분 먹힌다. clv 모드는 아이템 항과
-    곱해 유저 안에서 값이 달라져야 한다 — 그래야 개입이 살아남는다."""
+def test_graph_clv_varies_within_user_in_raw_weights(tmp_path):
+    """clv 모드는 **정규화 전 raw 엣지가중치**가 유저 안에서 달라야 한다.
+    정규화된 adj로 검사하면 유저별 상수 가중이어도 아이템 degree 차이 때문에 통과한다."""
     cfg, dcfg = _tiny_dataset(tmp_path)
     d = V3.prepare_data(dict(cfg, GRAPH_MODE="clv"), dcfg)
-    a = d["adj"].coalesce()
-    idx, val = a.indices().numpy(), a.values().numpy()
-    n_u = d["n_users"]
-    # 유저→아이템 방향 엣지만 골라 유저별 가중치 분산이 0이 아닌지 본다
-    m = idx[0] < n_u
-    rows, vals = idx[0][m], val[m]
-    spreads = [vals[rows == u].std() for u in np.unique(rows) if (rows == u).sum() > 1]
-    assert len(spreads) > 0 and max(spreads) > 0, "유저 내부에서 엣지 가중치가 전부 같음"
+    eu = d["pos_key"] // d["n_items"]
+    w = d["w_edge"]
+    assert len(w) == len(eu)
+    spreads = [w[eu == u].std() for u in np.unique(eu) if (eu == u).sum() > 1]
+    assert len(spreads) > 0, "여러 상품을 산 유저가 없어 검증이 성립하지 않는다"
+    assert max(spreads) > 1e-6, "raw 엣지가중치가 유저 내부에서 전부 같음"
+    # 대조: 유저별 상수 가중을 넣으면 이 검사가 실패해야 한다(검사가 실효적인지 확인)
+    const = np.repeat(np.arange(1.0, len(np.unique(eu)) + 1.0), 1)[
+        np.searchsorted(np.unique(eu), eu)]
+    assert max(const[eu == u].std() for u in np.unique(eu) if (eu == u).sum() > 1) < 1e-6
+
+
+def test_graph_price_is_clv_free_control(tmp_path):
+    """price는 clv에서 g(CLV_u)만 뺀 대조군 — CLV가 바뀌어도 불변이어야 한다."""
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    orig = V3.clv_features
+    try:
+        def flipped(train, n_users, c, is_date):
+            x, cl, vh = orig(train, n_users, c, is_date)
+            return x, -cl, vh
+        a = V3.prepare_data(dict(cfg, GRAPH_MODE="price"), dcfg)["w_edge"]
+        V3.clv_features = flipped
+        b = V3.prepare_data(dict(cfg, GRAPH_MODE="price"), dcfg)["w_edge"]
+    finally:
+        V3.clv_features = orig
+    np.testing.assert_allclose(a, b, rtol=1e-6)
+    # price와 clv는 서로 달라야 한다(g가 상수 1이 아니므로)
+    c = V3.prepare_data(dict(cfg, GRAPH_MODE="clv"), dcfg)["w_edge"]
+    assert not np.allclose(a, c), "price와 clv가 같으면 게이트가 작동하지 않는 것"
+
+
+def test_binary_baseline_is_pure_m1(tmp_path):
+    """M3/M4를 켜도 비교기준은 binary+plain이어야 한다 (paired delta가 0이 되면 안 됨)."""
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    on = dict(cfg, GRAPH_MODE="clv", LOSS_MODE="pair")
+    d = V3.prepare_data(on, dcfg)
+    d["loss_w"] = np.ones(len(d["tr_u"]), np.float32)      # main()이 채우는 자리
+    d_base, cfg_base = V3.binary_baseline(d, on)
+    assert d_base is not d
+    assert cfg_base["GRAPH_MODE"] == "binary" and cfg_base["LOSS_MODE"] == "plain"
+    assert d_base["loss_w"] is None
+    ref = V3.prepare_data(dict(cfg, GRAPH_MODE="binary"), dcfg)["adj"].coalesce()
+    b = d_base["adj"].coalesce()
+    torch.testing.assert_close(b.indices(), ref.indices())
+    torch.testing.assert_close(b.values(), ref.values())
+    # 순수 M1로 실행 중이면 같은 객체를 돌려줘 불필요한 재계산을 안 한다
+    d2 = V3.prepare_data(dict(cfg), dcfg)
+    assert V3.binary_baseline(d2, dict(cfg))[0] is d2
+    # 기준 체크포인트 해시는 기존 M1과 같아야 한다(재학습 방지)
+    for arch in ("pref_only", "two_stage", "joint_warm", "joint"):
+        assert V3.cfg_hash(cfg_base, V3.DCFG, arch, 42) == \
+               V3.cfg_hash(dict(cfg), V3.DCFG, arch, 42)
+
+
+def test_eval_test_is_opt_in(tmp_path):
+    """EVAL_TEST=False면 test 정답조차 만들지 않는다 — 개발 중 반복 노출 방지."""
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    assert V3.CFG["EVAL_TEST"] is False, "기본값은 꺼져 있어야 한다"
+    off = V3.prepare_data(dict(cfg, EVAL_TEST=False), dcfg)["splits"]
+    assert set(off) == {"val"}, f"test가 계산됨: {set(off)}"
+    on = V3.prepare_data(dict(cfg, EVAL_TEST=True), dcfg)["splits"]
+    assert "test" in on
+    # 결과 파일명에도 반영돼야 이전 test 포함 결과를 덮어쓰지 않는다
+    a = dict(V3.CFG); b = dict(V3.CFG); b["EVAL_TEST"] = True
+    assert V3.result_hash(a, V3.DCFG, "pref_only") != V3.result_hash(b, V3.DCFG, "pref_only")
 
 
 def test_loss_weight_modes():
@@ -490,10 +548,21 @@ def test_loss_weight_modes():
         pass
 
 
-def test_loss_weight_user_cannot_reorder_within_user():
-    """m4_user는 유저 내부 아이템 순위를 바꾸지 못한다 — 논문 서술의 근거.
-    (_fn은 docstring을 걷어내므로 원본 소스에서 확인한다)"""
-    assert "유저 내부 아이템 순위" in _RAW
+def test_loss_weight_user_is_constant_within_user(tmp_path):
+    """m4_user 가중은 한 유저 안에서 상수, m4_pair는 상수가 아니다.
+
+    ⚠ 이전 버전은 여기서 "m4_user는 순위를 못 바꾼다"는 **부정확한** 서술을 소스에서
+    문자열로 확인했다. 유저 상수 가중도 공유 아이템 임베딩을 통해 최종 순위를 바꾼다.
+    검증 가능한 사실(가중치가 유저 안에서 상수인지)만 확인한다."""
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    d = V3.prepare_data(cfg, dcfg)
+    tr_u, clv = d["tr_u"], d["clv"]
+    wu = V3.build_loss_weights(d["train"], tr_u, clv, dict(cfg, LOSS_MODE="user"))
+    wp = V3.build_loss_weights(d["train"], tr_u, clv, dict(cfg, LOSS_MODE="pair"))
+    multi = [u for u in np.unique(tr_u) if (tr_u == u).sum() > 1]
+    assert multi, "거래가 여러 건인 유저가 없어 검증이 성립하지 않는다"
+    assert max(wu[tr_u == u].std() for u in multi) < 1e-6
+    assert max(wp[tr_u == u].std() for u in multi) > 1e-6
 
 
 def test_bpr_loss_applies_sample_weights():

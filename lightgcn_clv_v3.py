@@ -65,7 +65,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
-CODE_VERSION = "v3.12"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.13"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -110,6 +110,10 @@ CFG = {
     "WINDOW_DAYS": 60,                # [선택] hm=60, dunnhumby=None(전체)
     "VAL_DAYS": 7, "TEST_DAYS": 7,    # [기본]
     "HOLDOUT_DAYS": 7,                # [선택] 최종 확증 전용. 아래 플래그 전엔 계산 안 함
+    # [2026-08-09] test도 holdout과 같은 방식으로 **명시적으로 켜야** 계산된다.
+    # 개발 중 매 실행마다 test를 채점해 파일에 남기면, 보지 않겠다고 선언해도 실제로는
+    # 반복 노출된 셈이 되어 confirmatory 지위를 잃는다. 개발 단계는 validation만 본다.
+    "EVAL_TEST": False,               # ⚠ 모형을 확정한 뒤에만 True
     "EVAL_HOLDOUT": False,            # ⚠ 논문 최종 확증 때 딱 한 번만 True
     # [2026-08-07] MIN_ITEM_INTER=1은 Dunnhumby(유저 2,500 vs 아이템 90,785, 아이템당
     # 상호작용 중앙값 3)에서 학습 불가능한 아이템 임베딩을 6만 개 넘게 만들어 baseline이
@@ -183,17 +187,25 @@ CFG = {
     # binary = LightGCN 표준 이진 인접행렬(= M1). 나머지 셋이 M3의 변형이다.
     #   count : w_ui = 1 + α·log(cnt_ui)                        반복구매 횟수
     #   value : w_ui = 1 + α·log(1 + spend_ui / ū)              거래금액
+    #   price : w_ui = 1 + α·log(1 + price_i / ū)               상품가격만 (식별용 대조군)
     #   clv   : w_ui = 1 + α·g(CLV_u)·log(1 + price_i / ū)      CLV × 상품가격
     #   (ū = 전체 평균단가, g = M2와 동일한 CLV 백분위 게이트)
     #
-    # ⚠ count·value는 **CLV 값을 직접 쓰지 않는다.** CLV를 구성하는 두 축(N̂ 반복거래,
-    #   V̂ 거래금액)을 고객 수준이 아니라 (고객,상품) 상호작용 수준에서 쓸 뿐이다.
-    #   clv 변형만이 CLV를 직접 참조하며, count/value는 "CLV 없이 거래정보만으로도
-    #   되는가"를 가리는 대조군 역할을 한다. 논문에서 이 구분을 반드시 명시할 것.
+    # ⚠ count·value는 **CLV 값을 쓰지 않는다.** cnt_ui는 N̂=mean(F,T,R)가 아니고
+    #   spend_ui도 V̂=mean(AOV,Prem)가 아니다 — CLV 산식과 관련된 거래빈도·금액 신호를
+    #   (고객,상품) 수준에서 쓰는 것일 뿐, CLV를 계산하지도 참조하지도 않는다.
+    #   clv 변형만이 고객의 CLV를 직접 참조한다. 논문에서 이 구분을 반드시 명시할 것.
     #
-    # Dunnhumby는 거래기록의 약 46%가 반복구매인데 이진 그래프가 이를 모두 버린다
-    # (H&M은 3.5%). M3는 점수 재정렬이 아니라 전파 자체를 바꾸는 유일한 개입이다.
-    "GRAPH_MODE": "binary",           # [선택] "binary" | "count" | "value" | "clv"
+    # ⚠ price는 clv에서 g(CLV_u)만 1로 고정한 **식별용 대조군**이다. clv 수식은 모든
+    #   고객에게 고가상품 엣지를 강화하므로, price 없이 clv만 좋아지는 걸 보면
+    #   "CLV × 가격 상호작용" 효과인지 "전역 고가상품" 효과인지 구분할 수 없다.
+    #
+    # ⚠ M3는 "반복구매를 처음 반영하는 개입"이 아니다. BPR 학습행(tr_u/tr_i)이 고유쌍이
+    #   아니라 **원거래행**이라, 반복구매가 많은 쌍은 이미 더 자주 샘플링되어 M1에도
+    #   빈도가 반영돼 있다. M3-count가 새로 하는 일은 그 빈도를 **그래프 전파**에도
+    #   싣는 것이다. 사전 후보는 binary/count/value였고 price·clv는 2026-08-09에 추가한
+    #   사후 변형이므로, 논문에서는 탐색적(exploratory) 분석으로 표기할 것.
+    "GRAPH_MODE": "binary",           # [선택] "binary"|"count"|"value"|"price"|"clv"
     "GRAPH_ALPHA": 1.0,               # [기본] 참고 구현의 VG_ALPHA와 동일
 
     # ── M4: CLV-aware 손실함수 (목적함수 개입) ──
@@ -278,6 +290,7 @@ def result_hash(cfg, dcfg, arch):
                "seeds": cfg["SEED_LIST"], "lambda_eval": cfg["LAMBDA_EVAL_SWEEP"],
                "delta": cfg["NONINFERIORITY_DELTA"], "k_list": cfg["K_LIST"],
                "n_boot": cfg["N_BOOT"], "seg_edges": list(cfg["SEG_EDGES"]),
+               "eval_test": cfg["EVAL_TEST"],
                "eval_holdout": cfg["EVAL_HOLDOUT"], "code": CODE_VERSION}
     return hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:10]
 
@@ -351,6 +364,51 @@ def kcore_filter(tp, min_u, min_i, max_iter=20):
             f"k-core 불변식 위반: 최소 아이템 degree={int(ic.min())}(≥{min_i} 필요), "
             f"최소 유저 degree={int(uc.min())}(≥{min_u} 필요)")
     return set(pairs["u_raw"].unique()), set(pairs["i_raw"].unique()), len(pairs), it
+
+
+def _price_i(train, n_items):
+    """아이템별 단가 대표값(중앙값). 학습에 한 번도 안 나온 아이템은 전체 중앙값."""
+    med = train.groupby("i_idx")["up"].median()
+    out = np.full(n_items, float(train["up"].median()), np.float64)
+    out[med.index.values] = med.values
+    return out
+
+
+def build_adj(eu, ei, w_edge, n_users, n_items):
+    """가중 엣지 리스트 → 대칭 정규화 인접행렬 D^-1/2·A·D^-1/2 (희소, DEVICE 위).
+
+    w_edge가 전부 1이면 표준 LightGCN 인접행렬과 동일하다. M3 실험과, M3/M4를 껐을 때의
+    순수 M1 비교기준(binary_baseline)이 같은 코드 경로를 쓰도록 함수로 분리해 두었다."""
+    n = n_users + n_items
+    rows = np.concatenate([eu, ei + n_users]); cols = np.concatenate([ei + n_users, eu])
+    w2 = np.concatenate([w_edge, w_edge])
+    deg = np.bincount(rows, weights=w2, minlength=n).astype(np.float32)
+    dinv = np.where(deg > 0, np.power(np.maximum(deg, 1e-12), -0.5), 0.0).astype(np.float32)
+    vals = (w2 * dinv[rows] * dinv[cols]).astype(np.float32)
+    return torch.sparse_coo_tensor(torch.from_numpy(np.stack([rows, cols])),
+                                   torch.from_numpy(vals), size=(n, n)).coalesce().to(DEVICE)
+
+
+def binary_baseline(d, cfg):
+    """M3/M4가 켜져 있을 때 **순수 M1**(binary 그래프 + 균등 손실)용 (d, cfg)를 만든다.
+
+    이게 없으면 비교기준이 오염된다. 이전 버전은 ARCH=pref_only일 때 base_model=model로
+    두어 paired delta가 항상 0이었고, 다른 ARCH에서도 "같은 M3/M4 설정의 pref_only"를
+    기준으로 삼아 M3/M4 효과가 기준에서 상쇄됐다.
+
+    아이템·유저 인덱스와 split은 GRAPH_MODE/LOSS_MODE와 무관하므로 데이터 준비를 다시 할
+    필요 없이 인접행렬만 이진으로 다시 만든다. cfg의 M3/M4 키를 기본값으로 되돌리므로
+    cfg_hash가 기존 M1 체크포인트와 일치해 재학습도 일어나지 않는다."""
+    if cfg["GRAPH_MODE"] == "binary" and cfg["LOSS_MODE"] == "plain":
+        return d, cfg                              # 이미 순수 M1
+    n_u, n_i = d["n_users"], d["n_items"]
+    eu, ei = d["pos_key"] // n_i, d["pos_key"] % n_i
+    d_base = {**d, "adj": build_adj(eu, ei, np.ones(len(eu), np.float32), n_u, n_i),
+              "w_edge": np.ones(len(eu), np.float32), "loss_w": None}
+    cfg_base = {**cfg, "GRAPH_MODE": "binary", "LOSS_MODE": "plain"}
+    print("  [비교기준] 순수 M1(binary+plain) 인접행렬을 별도로 만든다 "
+          f"(실행 설정: GRAPH_MODE={cfg['GRAPH_MODE']}, LOSS_MODE={cfg['LOSS_MODE']})")
+    return d_base, cfg_base
 
 
 def prepare_data(cfg, dcfg):
@@ -436,9 +494,12 @@ def prepare_data(cfg, dcfg):
 
     split_stats = {}
     splits = {"val": build_eval(tx[(tx.t > val_start) & (tx.t <= test_start)],
-                                "val", "Val    "),
-              "test": build_eval(tx[(tx.t > test_start) & (tx.t <= hold_start)],
-                                 "test", "Test   ")}
+                                "val", "Val    ")}
+    if cfg["EVAL_TEST"]:
+        splits["test"] = build_eval(tx[(tx.t > test_start) & (tx.t <= hold_start)],
+                                    "test", "Test   ")
+    else:
+        print("  Test: 계산 안 함 (EVAL_TEST=False — 개발 중에는 validation만 본다)")
     if cfg["EVAL_HOLDOUT"]:
         splits["holdout"] = build_eval(tx[tx.t > hold_start], "holdout", "Holdout")
     else:
@@ -458,10 +519,9 @@ def prepare_data(cfg, dcfg):
     tu = train.u_idx.values.astype(np.int64); ti = train.i_idx.values.astype(np.int64)
     edge_key = np.unique(tu * n_items + ti)
     eu = (edge_key // n_items).astype(np.int64); ei = (edge_key % n_items).astype(np.int64)
-    n = n_users + n_items
 
     # ── M3: 가치그래프 (엣지 가중치) ──────────────────────────────────
-    # binary는 LightGCN 표준(0/1). count/value는 반복구매·거래금액을 엣지에 싣는다.
+    # binary는 LightGCN 표준(0/1). 나머지는 엣지에 가중치를 싣는다(CFG 주석 참고).
     # groupby(sort=True)의 (u_idx,i_idx) 사전식 순서는 np.unique(u*n_items+i)의
     # 오름차순과 일치하므로 eu/ei와 행이 정렬된다(아래 assert로 고정).
     w_edge = np.ones(len(eu), np.float32)
@@ -475,6 +535,11 @@ def prepare_data(cfg, dcfg):
             w_edge = (1.0 + a * np.log(g_e["cnt"].values)).astype(np.float32)
         elif cfg["GRAPH_MODE"] == "value":
             w_edge = (1.0 + a * np.log1p(g_e["spend"].values / up_mean)).astype(np.float32)
+        elif cfg["GRAPH_MODE"] == "price":
+            # 식별용 대조군: clv에서 g(CLV_u)만 1로 고정한 것. clv가 개선되고 price는
+            # 아니어야 "CLV와 가격의 상호작용" 효과라고 말할 수 있다. 둘 다 같이
+            # 오르면 그것은 CLV와 무관한 전역 고가상품 선호 효과다.
+            w_edge = (1.0 + a * np.log1p(_price_i(train, n_items)[ei] / up_mean)).astype(np.float32)
         elif cfg["GRAPH_MODE"] == "clv":
             # w_ui = 1 + α · g(CLV_u) · log(1 + price_i/ū)
             # 고가치 고객이 비싼 상품과 맺은 연결을 굵게 한다. count/value가 거래
@@ -482,29 +547,23 @@ def prepare_data(cfg, dcfg):
             # 게이트 구조(gate(u) × 아이템 가격속성)를 점수단이 아니라 전파단에
             # 적용한 것이다 — 같은 CLV 조건화를 어느 층에 넣느냐를 가르는 대조군.
             #
-            # ⚠ 유저 단위 상수 가중(w_ui = c_u)으로는 안 된다. D^-1/2·A·D^-1/2
-            #   정규화에서 유저 degree도 같이 c_u배가 되어 √c_u로 줄고 아이템
-            #   degree를 통해 더 희석된다(M4-user가 유저 내부 순위를 못 바꾸는 것과
-            #   같은 종류의 문제). 유저 안에서 상품마다 값이 달라져야 개입이
-            #   살아남으므로 반드시 아이템 항과 곱한다.
+            # ⚠ 아이템 항과 곱하는 이유 — 유저 단위 상수 가중(w_ui = c_u)이 **사라지기
+            #   때문이 아니다**. D^-1/2·A·D^-1/2에서 유저 degree도 c_u배가 되므로 유저 u의
+            #   행은 √c_u배로 남고(그 유저 안에서는 모든 아이템에 같은 배율이라 1-hop
+            #   내부순위는 안 바뀜), 아이템 degree d_i = Σ_{u'∈N(i)} c_{u'}를 통해 다른
+            #   유저에게까지 간접적으로 전파된다. 즉 효과가 없는 게 아니라 **간접적·약하고
+            #   해석이 어렵다**. 아이템 가격 항과 곱하면 같은 유저 안에서도 상품마다 값이
+            #   달라져 "고가치 고객 × 고가 상품"이라는 의도가 직접 반영된다.
             g_u = build_gate(clv, vhat, "clv")          # M2 게이트와 동일 정의
-            med = train.groupby("i_idx")["up"].median()
-            price_i = np.full(n_items, float(train["up"].median()), np.float64)
-            price_i[med.index.values] = med.values
-            w_edge = (1.0 + a * g_u[eu] * np.log1p(price_i[ei] / up_mean)).astype(np.float32)
+            w_edge = (1.0 + a * g_u[eu] *
+                      np.log1p(_price_i(train, n_items)[ei] / up_mean)).astype(np.float32)
         else:
-            raise ValueError(f"GRAPH_MODE={cfg['GRAPH_MODE']!r} — binary|count|value|clv")
+            raise ValueError(f"GRAPH_MODE={cfg['GRAPH_MODE']!r} — "
+                             "binary|count|value|price|clv")
         print(f"  가치그래프({cfg['GRAPH_MODE']}, α={a}): 엣지 {len(eu):,} | "
               f"w 평균 {w_edge.mean():.3f} 중앙값 {np.median(w_edge):.3f} 최대 {w_edge.max():.3f}")
 
-    rows = np.concatenate([eu, ei + n_users]); cols = np.concatenate([ei + n_users, eu])
-    w2 = np.concatenate([w_edge, w_edge])
-    # 가중 degree로 정규화한다. 이진 그래프에서는 w=1이라 기존 동작과 동일하다.
-    deg = np.bincount(rows, weights=w2, minlength=n).astype(np.float32)
-    dinv = np.where(deg > 0, np.power(np.maximum(deg, 1e-12), -0.5), 0.0).astype(np.float32)
-    vals = (w2 * dinv[rows] * dinv[cols]).astype(np.float32)
-    adj = torch.sparse_coo_tensor(torch.from_numpy(np.stack([rows, cols])),
-                                   torch.from_numpy(vals), size=(n, n)).coalesce().to(DEVICE)
+    adj = build_adj(eu, ei, w_edge, n_users, n_items)
     order = np.argsort(eu, kind="stable")
     csr_items = ei[order].astype(np.int32)
     csr_ptr = np.zeros(n_users + 1, dtype=np.int64)
@@ -525,7 +584,8 @@ def prepare_data(cfg, dcfg):
         "min": int(ideg.min()), "max": int(ideg.max()),
         "n_degree_lt_5": int((ideg < 5).sum()), "n_degree_lt_10": int((ideg < 10).sum())}
 
-    return dict(train=train, splits=splits, adj=adj, pos_key=edge_key, tr_u=tu, tr_i=ti,
+    return dict(train=train, splits=splits, adj=adj, w_edge=w_edge,
+                pos_key=edge_key, tr_u=tu, tr_i=ti,
                 x_val_u=x_val_u, clv=clv, vhat=vhat,
                 csr_ptr=csr_ptr, csr_items=csr_items, item_cat=item_cat_arr, cat_items=cat_items,
                 n_users=n_users, n_items=n_items, n_cat=n_cat, data_stats=data_stats)
@@ -630,9 +690,11 @@ def build_loss_weights(train, tr_u, clv, cfg):
     고객 평균이 1이어야 하고(구매가 많은 고객은 결과적으로 더 많이 반영된다),
     pair는 상호작용 단위 개입이라 상호작용 평균이 1이어야 한다.
 
-    m4_user는 한 유저의 모든 상호작용에 같은 가중을 주므로 **유저 내부 아이템 순위를
-    바꾸지 못한다**. m4_pair는 상호작용마다 달라 순위를 바꾼다 — 예비실험에서 pair가
-    더 큰 효과를 보인 것도 이 차이로 설명된다.
+    m4_user는 한 유저의 모든 상호작용에 같은 가중을 준다. 그 유저의 BPR 항만 놓고 보면
+    순위를 직접 바꾸지 못하지만, **효과가 없는 것은 아니다** — 유저별 학습강도가 달라지면
+    모든 유저가 공유하는 아이템 임베딩이 고CLV 고객 쪽으로 끌려가고, 그 결과 최종 순위도
+    바뀐다. 다만 경로가 간접적이라 상호작용마다 값이 다른 m4_pair보다 효과가 작고 해석이
+    어렵다 — 예비실험에서 pair가 더 컸던 것도 이것으로 설명된다(추정이며 미검증).
     """
     mode, lam = cfg["LOSS_MODE"], cfg["LOSS_LAMBDA"]
     if mode == "plain":
@@ -1254,6 +1316,8 @@ def main():
     if arch == "pref_only":
         print("  (pref_only는 가치 블록이 미학습이므로 λ=0만 평가한다)")
 
+    d_base, cfg_base = binary_baseline(d, cfg)     # 순수 M1 비교기준 (M3/M4 끄면 d 그대로)
+
     train_stats, diagnostics = {}, {}
     val_per_seed, base_per_seed, test_rows = {}, {}, []
     pu_split, base_pu_split = {}, {}       # split → λ → seed → 유저별 지표
@@ -1280,12 +1344,13 @@ def main():
         if warn:
             print(f"      {warn.strip()}")
 
-        # 비교 기준 = **외부 pref_only(같은 시드)**. arch가 pref_only면 자기 자신.
-        if arch == "pref_only":
-            base_model = model
+        # 비교 기준 = **순수 M1**(pref_only + binary 그래프 + 균등 손실, 같은 시드).
+        # M3/M4를 켠 실행에서도 기준은 개입이 전혀 없는 모형이어야 Δ가 개입 효과를 뜻한다.
+        if arch == "pref_only" and d_base is d:
+            base_model = model                      # 실행 자체가 순수 M1
         else:
-            base_model, _ = get_or_train("pref_only", seed, d, gate_t, x_val_u, x_item,
-                                         item_cat, meta, caches["val"], cfg)
+            base_model, _ = get_or_train("pref_only", seed, d_base, gate_t, x_val_u, x_item,
+                                         item_cat, meta, caches["val"], cfg_base)
             base_model.eval()
 
         val_per_seed[seed] = {}
@@ -1337,7 +1402,8 @@ def main():
                    "cfg": {k: v for k, v in cfg.items() if k != "OUT_DIR"},
                    "arch_label": ARCH_LABEL[arch],
                    "selected_lambda_from_validation": sel_lambda,
-                   "baseline_for_comparison": "pref_only (same seed)",
+                   "baseline_for_comparison":
+                       "pref_only + GRAPH_MODE=binary + LOSS_MODE=plain (순수 M1, 같은 시드)",
                    "delta_table": delta_df.to_dict("records"),
                    "lambda_selection_table": sel_table.to_dict("records"),
                    "train_stats": train_stats, "score_diagnostics": diagnostics,
@@ -1362,6 +1428,16 @@ def main():
                    "note_arp": "arp = 추천 상품의 평균 가격 백분위(인기도 기반 ARP와 다름)",
                    }, f, indent=2, default=float, ensure_ascii=False)
     print(f"\n저장 → {out / (stem + '.csv')}\n     → {out / (stem + '_val.csv')}")
+
+    if "test" not in caches:
+        print(f"\n{'='*84}\n[요약] validation 선택 λ = {sel_lambda} "
+              f"(EVAL_TEST=False — test는 계산하지 않았다)\n{'='*84}")
+        vsel = pd.DataFrame(val_rows)
+        vsel = vsel[vsel["lambda"] == sel_lambda]
+        for m in ("recall@10", "ndcg@10", "revenue@10", "arp@10", "value_alignment",
+                  "coverage@10"):
+            print(f"  {m:<18} {vsel[m].mean():.6f}")
+        return df
 
     print(f"\n{'='*84}\n[주 결과] validation 선택 λ = {sel_lambda} — test\n"
           f"  비교 기준: 외부 pref_only(같은 시드). joint의 λ=0은 ablation으로 별도 보고.\n{'='*84}")
