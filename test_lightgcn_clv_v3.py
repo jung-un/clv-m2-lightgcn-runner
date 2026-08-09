@@ -395,6 +395,128 @@ def test_data_stats_recorded():
     assert '"data_stats":d["data_stats"]' in _fn_ns("main")
 
 
+# ── 2026-08-09: M3(가치그래프) / M4(CLV-aware 손실) ────────────────────────
+def test_graph_modes_change_adjacency(tmp_path):
+    """binary는 기존 동작과 동일해야 하고, count/value는 실제로 가중치를 바꿔야 한다."""
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    a = V3.prepare_data(dict(cfg, GRAPH_MODE="binary"), dcfg)["adj"].coalesce()
+    for mode in ("count", "value"):
+        b = V3.prepare_data(dict(cfg, GRAPH_MODE=mode), dcfg)["adj"].coalesce()
+        assert a.indices().shape == b.indices().shape        # 엣지 집합은 동일
+        assert not torch.allclose(a.values(), b.values()), f"{mode}가 가중치를 안 바꿈"
+    try:
+        V3.prepare_data(dict(cfg, GRAPH_MODE="bogus"), dcfg)
+        raise AssertionError("알 수 없는 GRAPH_MODE는 거부해야 한다")
+    except ValueError:
+        pass
+
+
+def test_graph_alpha_scales_weights(tmp_path):
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    lo = V3.prepare_data(dict(cfg, GRAPH_MODE="value", GRAPH_ALPHA=0.5), dcfg)["adj"].coalesce()
+    hi = V3.prepare_data(dict(cfg, GRAPH_MODE="value", GRAPH_ALPHA=4.0), dcfg)["adj"].coalesce()
+    assert not torch.allclose(lo.values(), hi.values())
+    # α=0이면 1 + 0·log(...) = 1 이므로 binary와 같아야 한다
+    z = V3.prepare_data(dict(cfg, GRAPH_MODE="value", GRAPH_ALPHA=0.0), dcfg)["adj"].coalesce()
+    b = V3.prepare_data(dict(cfg, GRAPH_MODE="binary"), dcfg)["adj"].coalesce()
+    torch.testing.assert_close(z.values(), b.values(), rtol=1e-5, atol=1e-6)
+
+
+def test_loss_weight_modes():
+    """user는 유저 평균 1, pair는 행 평균 1. plain은 None."""
+    rng = np.random.default_rng(0)
+    n_u, n_rows = 50, 400
+    tr_u = rng.integers(0, n_u, n_rows)
+    train = pd.DataFrame({"u_idx": tr_u, "i_idx": rng.integers(0, 30, n_rows),
+                          "up": rng.random(n_rows) * 10 + 1})
+    clv = rng.random(n_u)
+    assert V3.build_loss_weights(train, tr_u, clv, dict(V3.CFG, LOSS_MODE="plain")) is None
+
+    wp = V3.build_loss_weights(train, tr_u, clv, dict(V3.CFG, LOSS_MODE="pair", LOSS_LAMBDA=1.0))
+    assert len(wp) == n_rows and abs(wp.mean() - 1.0) < 1e-5      # 행 평균 1
+
+    wu = V3.build_loss_weights(train, tr_u, clv, dict(V3.CFG, LOSS_MODE="user", LOSS_LAMBDA=1.0))
+    assert len(wu) == n_rows
+    # 같은 유저의 행은 모두 같은 가중치여야 한다(유저 단위 개입)
+    for u in np.unique(tr_u):
+        assert np.allclose(wu[tr_u == u], wu[tr_u == u][0])
+    # 유저 단위로 모으면 평균 1
+    per_user = np.array([wu[tr_u == u][0] for u in range(n_u)])
+    assert abs(per_user.mean() - 1.0) < 1e-5
+    try:
+        V3.build_loss_weights(train, tr_u, clv, dict(V3.CFG, LOSS_MODE="bogus"))
+        raise AssertionError("알 수 없는 LOSS_MODE는 거부해야 한다")
+    except ValueError:
+        pass
+
+
+def test_loss_weight_user_cannot_reorder_within_user():
+    """m4_user는 유저 내부 아이템 순위를 바꾸지 못한다 — 논문 서술의 근거.
+    (_fn은 docstring을 걷어내므로 원본 소스에서 확인한다)"""
+    assert "유저 내부 아이템 순위" in _RAW
+
+
+def test_bpr_loss_applies_sample_weights():
+    """가중치를 주면 손실이 달라져야 하고, 전부 1이면 균등 평균과 같아야 한다."""
+    torch.manual_seed(0)
+    n_u, n_i, n_c = 8, 12, 3
+    adj = torch.sparse_coo_tensor(torch.tensor([[0, n_u], [n_u, 0]]),
+                                  torch.tensor([0.5, 0.5]),
+                                  size=(n_u + n_i, n_u + n_i)).coalesce()
+    m = V3.DualSpaceLightGCN(n_u, n_i, n_c,
+                             np.random.rand(n_u, 5).astype(np.float32),
+                             np.random.rand(n_i, 2).astype(np.float32),
+                             np.zeros(n_i, dtype=np.int64), dict(V3.CFG), adj)
+    u = torch.tensor([0, 1, 2, 3]); i = torch.tensor([0, 1, 2, 3]); j = torch.tensor([4, 5, 6, 7])
+    g = torch.ones(n_u)
+    l0, _ = m.bpr_loss(u, i, j, g, 0.0, None)
+    l1, _ = m.bpr_loss(u, i, j, g, 0.0, torch.ones(4))
+    torch.testing.assert_close(l0, l1)                    # w=1이면 동일
+    lw, _ = m.bpr_loss(u, i, j, g, 0.0, torch.tensor([2.0, 0.5, 1.0, 0.5]))
+    assert not torch.allclose(l0, lw)                     # 가중치가 실제로 반영됨
+
+
+def test_m3_m4_in_ckpt_hash_for_all_archs():
+    """GATE_MODE와 달리 M3·M4는 pref_only의 가중치도 바꾸므로 예외가 없어야 한다."""
+    import copy
+    base = copy.deepcopy(V3.CFG)
+    # 모드를 켜는 변경은 모든 아키텍처의 해시를 바꿔야 한다
+    for key, val in [("GRAPH_MODE", "count"), ("LOSS_MODE", "pair")]:
+        c2 = copy.deepcopy(base); c2[key] = val
+        for arch in ("pref_only", "two_stage", "joint_warm", "joint"):
+            assert V3.cfg_hash(base, V3.DCFG, arch, 42) != V3.cfg_hash(c2, V3.DCFG, arch, 42), \
+                f"{key}가 {arch} 해시에 반영되지 않음"
+    # 계수는 해당 모드가 켜져 있을 때만 반영된다(꺼져 있으면 학습에 안 쓰이므로)
+    for on_key, on_val, coef in [("GRAPH_MODE", "count", "GRAPH_ALPHA"),
+                                 ("LOSS_MODE", "pair", "LOSS_LAMBDA")]:
+        on = copy.deepcopy(base); on[on_key] = on_val
+        on2 = copy.deepcopy(on); on2[coef] = 2.0
+        for arch in ("pref_only", "two_stage", "joint_warm", "joint"):
+            assert V3.cfg_hash(on, V3.DCFG, arch, 42) != V3.cfg_hash(on2, V3.DCFG, arch, 42), \
+                f"{coef}가 {arch} 해시에 반영되지 않음"
+
+
+def test_m3_m4_defaults_are_neutral():
+    """기본값은 M1과 동일해야 한다 — 기존 결과와의 연속성."""
+    assert V3.CFG["GRAPH_MODE"] == "binary" and V3.CFG["LOSS_MODE"] == "plain"
+
+
+def test_default_m3_m4_do_not_invalidate_existing_checkpoints():
+    """기본값(binary/plain)이면 학습 결과가 v3.10 이전과 같으므로 해시가 바뀌면 안 된다.
+    바뀌면 M3/M4 도입만으로 두 데이터셋의 모든 baseline을 다시 학습하게 된다."""
+    import copy
+    c = copy.deepcopy(V3.CFG)
+    h = V3.cfg_hash(c, V3.DCFG, "pref_only", 42)
+    # 기본 모드에서는 α·λ를 바꿔도 학습에 쓰이지 않으므로 해시가 같아야 한다
+    for key, val in [("GRAPH_ALPHA", 7.0), ("LOSS_LAMBDA", 7.0)]:
+        c2 = copy.deepcopy(V3.CFG); c2[key] = val
+        assert V3.cfg_hash(c2, V3.DCFG, "pref_only", 42) == h, f"{key}가 기본모드에서 해시를 바꿈"
+    # 반면 모드를 켜면 α·λ가 해시에 반영돼야 한다
+    on = copy.deepcopy(V3.CFG); on["GRAPH_MODE"] = "count"
+    on2 = copy.deepcopy(on); on2["GRAPH_ALPHA"] = 7.0
+    assert V3.cfg_hash(on, V3.DCFG, "pref_only", 42) != V3.cfg_hash(on2, V3.DCFG, "pref_only", 42)
+
+
 def test_min_item_inter_changes_ckpt_hash():
     """k-core 필터는 아이템 유니버스를 바꾸므로 체크포인트가 달라야 한다."""
     import copy

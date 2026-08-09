@@ -65,7 +65,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
-CODE_VERSION = "v3.10"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.11"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -179,6 +179,22 @@ CFG = {
     #     데이터셋별로 공식을 맞추는 것이 아니다.
     "GATE_MODE": "clv",               # [선택] "none" | "clv" | "vhat"
 
+    # ── M3: 가치그래프 (그래프 개입) ──
+    # binary = LightGCN 표준 이진 인접행렬(= M1). count/value가 M3의 두 변형이다.
+    #   count : w_ui = 1 + α·log(cnt_ui)              반복구매 횟수
+    #   value : w_ui = 1 + α·log(1 + spend_ui / ū)    거래금액 (ū = 전체 평균단가)
+    # Dunnhumby는 거래기록의 약 46%가 반복구매인데 이진 그래프가 이를 모두 버린다
+    # (H&M은 3.5%). M3는 점수 재정렬이 아니라 전파 자체를 바꾸는 유일한 개입이다.
+    "GRAPH_MODE": "binary",           # [선택] "binary" | "count" | "value"
+    "GRAPH_ALPHA": 1.0,               # [기본] 참고 구현의 VG_ALPHA와 동일
+
+    # ── M4: CLV-aware 손실함수 (목적함수 개입) ──
+    #   user : w(u)   = 1 + λ·sigmoid(zscore(CLV_u))
+    #   pair : w(u,i) = 1 + λ·log1p(쌍 평균단가 / 전체 평균단가)
+    # ⚠ 이 λ는 M2의 LAMBDA_TRAIN/LAMBDA_EVAL_SWEEP과 **다른 것**이다. 혼동 금지.
+    "LOSS_MODE": "plain",             # [선택] "plain" | "user" | "pair"
+    "LOSS_LAMBDA": 1.0,               # [기본] 참고 구현의 CLV_LAMBDA (스윕 0.5/1.0/2.0)
+
     # ── 평가 ──
     "K_LIST": [10, 20, 50],           # [기본]
     "N_BOOT": 2000,                   # [기본]
@@ -219,7 +235,10 @@ def cfg_hash(cfg, dcfg, arch, seed):
             "MIN_USER_INTER", "MIN_ITEM_INTER", "PREMIUM_THR", "LAMBDA_TRAIN",
             # GATE_MODE는 bpr_loss의 gate를 통해 가중치를 직접 바꾸므로 학습 설정이다.
             # 빠뜨리면 모드가 다른 실행이 같은 체크포인트를 재사용해 결과가 오염된다.
-            "GATE_MODE"]
+            "GATE_MODE",
+            # M3(그래프)·M4(손실)는 가중치를 직접 바꾸므로 **모든 아키텍처**에서 학습
+            # 설정이다. GATE_MODE와 달리 pref_only도 영향을 받으므로 예외를 두지 않는다.
+            "GRAPH_MODE", "GRAPH_ALPHA", "LOSS_MODE", "LOSS_LAMBDA"]
     payload = {k: cfg[k] for k in keys}
     # 단, pref_only는 λ_train=0이라 가치항이 손실에 전혀 들어가지 않는다 → 게이트가
     # 가중치에 영향을 못 준다. 그런데도 해시에 넣으면 GATE_MODE만 바꿔도 pref_only를
@@ -227,6 +246,14 @@ def cfg_hash(cfg, dcfg, arch, seed):
     # 이 체크포인트를 warm start로 재사용하므로 영향 범위도 크다.
     if arch == "pref_only":
         payload.pop("GATE_MODE")
+    # M3·M4가 기본값이면 학습 결과가 v3.10 이전과 **수치적으로 동일**하다.
+    # (binary는 w=1이라 가중 degree가 기존 식으로 환원되고, plain은 w=None으로 균등 평균.)
+    # 그러므로 기본값일 때는 payload에서 빼서 기존 체크포인트를 그대로 재사용한다 —
+    # 넣어두면 M3/M4 도입만으로 H&M·Dunnhumby의 모든 baseline을 다시 학습하게 된다.
+    if payload["GRAPH_MODE"] == "binary":
+        payload.pop("GRAPH_MODE"); payload.pop("GRAPH_ALPHA")
+    if payload["LOSS_MODE"] == "plain":
+        payload.pop("LOSS_MODE"); payload.pop("LOSS_LAMBDA")
     payload.update(category_col=dcfg["category_col"], arch=arch, seed=seed)
     return hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:8]
 
@@ -419,10 +446,33 @@ def prepare_data(cfg, dcfg):
     edge_key = np.unique(tu * n_items + ti)
     eu = (edge_key // n_items).astype(np.int64); ei = (edge_key % n_items).astype(np.int64)
     n = n_users + n_items
+
+    # ── M3: 가치그래프 (엣지 가중치) ──────────────────────────────────
+    # binary는 LightGCN 표준(0/1). count/value는 반복구매·거래금액을 엣지에 싣는다.
+    # groupby(sort=True)의 (u_idx,i_idx) 사전식 순서는 np.unique(u*n_items+i)의
+    # 오름차순과 일치하므로 eu/ei와 행이 정렬된다(아래 assert로 고정).
+    w_edge = np.ones(len(eu), np.float32)
+    if cfg["GRAPH_MODE"] != "binary":
+        g_e = train.groupby(["u_idx", "i_idx"], sort=True).agg(cnt=("v", "size"),
+                                                              spend=("v", "sum"))
+        if len(g_e) != len(eu):
+            raise RuntimeError(f"엣지 집계 불일치: groupby {len(g_e)} vs unique {len(eu)}")
+        a, up_mean = cfg["GRAPH_ALPHA"], float(train["up"].mean())
+        if cfg["GRAPH_MODE"] == "count":
+            w_edge = (1.0 + a * np.log(g_e["cnt"].values)).astype(np.float32)
+        elif cfg["GRAPH_MODE"] == "value":
+            w_edge = (1.0 + a * np.log1p(g_e["spend"].values / up_mean)).astype(np.float32)
+        else:
+            raise ValueError(f"GRAPH_MODE={cfg['GRAPH_MODE']!r} — binary|count|value")
+        print(f"  가치그래프({cfg['GRAPH_MODE']}, α={a}): 엣지 {len(eu):,} | "
+              f"w 평균 {w_edge.mean():.3f} 중앙값 {np.median(w_edge):.3f} 최대 {w_edge.max():.3f}")
+
     rows = np.concatenate([eu, ei + n_users]); cols = np.concatenate([ei + n_users, eu])
-    deg = np.bincount(rows, minlength=n).astype(np.float32)
-    dinv = np.power(np.maximum(deg, 1), -0.5)
-    vals = (dinv[rows] * dinv[cols]).astype(np.float32)
+    w2 = np.concatenate([w_edge, w_edge])
+    # 가중 degree로 정규화한다. 이진 그래프에서는 w=1이라 기존 동작과 동일하다.
+    deg = np.bincount(rows, weights=w2, minlength=n).astype(np.float32)
+    dinv = np.where(deg > 0, np.power(np.maximum(deg, 1e-12), -0.5), 0.0).astype(np.float32)
+    vals = (w2 * dinv[rows] * dinv[cols]).astype(np.float32)
     adj = torch.sparse_coo_tensor(torch.from_numpy(np.stack([rows, cols])),
                                    torch.from_numpy(vals), size=(n, n)).coalesce().to(DEVICE)
     order = np.argsort(eu, kind="stable")
@@ -534,6 +584,46 @@ def build_gate(clv, vhat, mode):
           f"전체 평균 {gate.mean():.4f} min {gate[valid].min():.4f} max {gate.max():.4f} "
           f"비개입(0) 유저 {int((~valid).sum()):,}명")
     return gate
+
+
+def build_loss_weights(train, tr_u, clv, cfg):
+    """M4: BPR 손실의 표본별 가중치를 **train 행 단위 배열**로 반환(없으면 None).
+
+    학습 배치가 train 행 인덱스로 잘리므로(train_phase의 perm/idx), 두 방식 모두
+    행 단위로 펼쳐두면 배치에서 `w[idx]` 한 줄로 쓸 수 있다.
+
+      user : w(u) = 1 + λ·sigmoid(zscore(CLV_u))   — **유저** 평균 1로 정규화 후 행에 전개
+      pair : w(u,i) = 1 + λ·log1p(그 쌍의 평균단가 / 전체 평균단가) — **행** 평균 1로 정규화
+
+    정규화 기준이 다른 것은 의도적이며 참고 구현과 동일하다. user는 고객 단위 개입이라
+    고객 평균이 1이어야 하고(구매가 많은 고객은 결과적으로 더 많이 반영된다),
+    pair는 상호작용 단위 개입이라 상호작용 평균이 1이어야 한다.
+
+    m4_user는 한 유저의 모든 상호작용에 같은 가중을 주므로 **유저 내부 아이템 순위를
+    바꾸지 못한다**. m4_pair는 상호작용마다 달라 순위를 바꾼다 — 예비실험에서 pair가
+    더 큰 효과를 보인 것도 이 차이로 설명된다.
+    """
+    mode, lam = cfg["LOSS_MODE"], cfg["LOSS_LAMBDA"]
+    if mode == "plain":
+        return None
+    if mode == "user":
+        c = np.asarray(clv, dtype=np.float64).copy()
+        if np.all(np.isnan(c)):
+            raise ValueError("CLV가 전부 NaN이라 m4_user 가중을 만들 수 없다")
+        c[np.isnan(c)] = np.nanmedian(c)
+        z = (c - c.mean()) / (c.std() + 1e-12)
+        w_u = 1.0 + lam / (1.0 + np.exp(-z))
+        w_u = w_u / w_u.mean()                      # 유저 평균 1
+        w = w_u[tr_u].astype(np.float32)            # 행으로 전개
+    elif mode == "pair":
+        pm = train.groupby(["u_idx", "i_idx"])["up"].transform("mean").values
+        w = 1.0 + lam * np.log1p(pm / float(train["up"].mean()))
+        w = (w / w.mean()).astype(np.float32)       # 행 평균 1
+    else:
+        raise ValueError(f"LOSS_MODE={mode!r} — plain|user|pair 중 하나여야 한다")
+    print(f"  손실가중({mode}, λ={lam}): 행 {len(w):,} | 평균 {w.mean():.3f} "
+          f"min {w.min():.3f} 중앙값 {np.median(w):.3f} max {w.max():.3f}")
+    return w
 
 
 def segment_thresholds(clv, edges):
@@ -688,8 +778,12 @@ class DualSpaceLightGCN(nn.Module):
                 reg = reg + cfg["VALUE_REG"] * sum(q.pow(2).sum() for q in vp)
         return reg
 
-    def bpr_loss(self, u, i, j, gate, lam):
-        """반환 (loss, 진단값). 진단값은 붕괴를 매 epoch 눈으로 확인하기 위한 것."""
+    def bpr_loss(self, u, i, j, gate, lam, w=None):
+        """반환 (loss, 진단값). 진단값은 붕괴를 매 epoch 눈으로 확인하기 위한 것.
+
+        w는 M4의 표본별 손실 가중치(배치 크기와 같은 길이). None이면 균등 평균이다.
+        전역 평균이 1로 정규화된 가중치를 쓰므로 손실 스케일이 유지되고, 따라서
+        학습률·정규화 계수를 M4 모드마다 다시 조정할 필요가 없다."""
         need_value = lam != 0.0
         Up, Ip, Uv, Iv = self.embeddings(need_value=need_value)
         if not need_value:
@@ -697,7 +791,8 @@ class DualSpaceLightGCN(nn.Module):
         else:
             pos = combined_score_pairs(Up, Ip, Uv, Iv, gate, lam, u, i)
             neg = combined_score_pairs(Up, Ip, Uv, Iv, gate, lam, u, j)
-        bpr = -F.logsigmoid(pos - neg).mean()
+        ll = -F.logsigmoid(pos - neg)
+        bpr = (ll * w).mean() if w is not None else ll.mean()
         loss = bpr + (self.batch_l2(u, i, j, need_value)
                       if self.cfg["REG_MODE"] == "batch_l2" else 0.0)
         with torch.no_grad():
@@ -897,6 +992,7 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, 
     opt = torch.optim.Adam(params, lr=cfg["LR"], weight_decay=wd)
     rng = np.random.default_rng(seed)
     tr_u, tr_i, pos_key = d["tr_u"], d["tr_i"], d["pos_key"]
+    loss_w = d.get("loss_w")            # M4 표본 가중치(행 단위) 또는 None
     n_train = len(tr_u); n_batch = math.ceil(n_train / cfg["BATCH_SIZE"])
     best, best_ep, best_state, bad = -1.0, -1, None, 0
     updates, samples, t_start = 0, 0, time.time()
@@ -909,10 +1005,13 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, 
             bu, bi = tr_u[idx], tr_i[idx]
             bj = sample_negatives(bu, bi, d["n_items"], pos_key, rng, cfg["NEG_MODE"],
                                   d["item_cat"], d["cat_items"])
+            # M4: 손실가중은 train 행 단위 배열이므로 배치 인덱스로 그대로 자른다
+            bw = (torch.as_tensor(loss_w[idx], dtype=torch.float32, device=DEVICE)
+                  if loss_w is not None else None)
             loss, dg = model.bpr_loss(torch.as_tensor(bu, dtype=torch.long, device=DEVICE),
                                       torch.as_tensor(bi, dtype=torch.long, device=DEVICE),
                                       torch.as_tensor(bj, dtype=torch.long, device=DEVICE),
-                                      gate_t, lam_train)
+                                      gate_t, lam_train, bw)
             opt.zero_grad(); loss.backward(); opt.step()
             tot += loss.item(); tot_bpr += dg["bpr"]; tot_pc += dg["p_correct"]
             updates += 1; samples += len(idx)
@@ -1109,6 +1208,7 @@ def main():
     x_item, item_cat = item_value_features(d["train"], d["n_items"])
     meta = item_meta(d["train"], d["n_items"])
     gate = build_gate(clv, vhat, cfg["GATE_MODE"]); gate_t = torch.from_numpy(gate).to(DEVICE)
+    d["loss_w"] = build_loss_weights(d["train"], d["tr_u"], clv, cfg)   # M4 (없으면 None)
     # 세그먼트는 게이트와 무관하게 **항상 CLV 기준**이다 — CLV는 분석변수(어느 고객군에서
     # 이득/손실이 났는지)이고, 게이트는 개입변수라 역할이 다르다. GATE_MODE를 바꿔도
     # 세그먼트 정의가 따라 바뀌면 모드 간 세그먼트 결과를 비교할 수 없다.
