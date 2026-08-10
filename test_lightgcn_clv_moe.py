@@ -473,7 +473,9 @@ def test_colab_has_fresh_clone_preflight_and_high_cost_gate():
     source = "\n".join(
         "".join(cell.get("source", [])) for cell in notebook["cells"]
     )
-    assert "feat/clv-conditioned-moe" in source
+    assert "REVIEWED_COMMIT = '7f433bf712644db21d3b11b4ffd130549c11dfbc'" in source
+    assert "checkout', '--detach', REVIEWED_COMMIT" in source
+    assert "rev-parse', 'HEAD'" in source
     assert "sys.path.insert" in source
     assert "configure_moe_run" in source
     assert "preflight_summary" in source
