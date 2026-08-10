@@ -88,6 +88,7 @@ def test_joint_warm_updates_only_adapters_before_epoch_six():
     )
     assert records["base_updates_by_epoch"][:5] == [0, 0, 0, 0, 0]
     assert records["base_updates_by_epoch"][5] == 2
+    assert records["base_updates_at_best"] == 2
     assert records["loss"] == "plain_bpr"
 
 
@@ -124,3 +125,109 @@ def test_pref_continue_has_exact_matched_base_updates():
     assert stats["base_updates"] == 3
     assert stats["loss"] == "plain_bpr"
     assert moe.state_hash(base) != before
+
+
+def _baseline_metrics():
+    return {
+        f"{metric}@{k}": 1.0
+        for metric in ("recall", "ndcg")
+        for k in (10, 20, 50)
+    } | {"revenue@10": 1.0}
+
+
+def _lambda_row(lam, baseline, *, revenue=1.0, recall50=None):
+    row = {"lambda": lam, **baseline}
+    row["revenue@10"] = revenue
+    if recall50 is not None:
+        row["recall@50"] = recall50
+    return row
+
+
+def test_select_lambda_uses_all_six_accuracy_guardrails():
+    import lightgcn_clv_moe as moe
+
+    base = _baseline_metrics()
+    rows = [
+        _lambda_row(0.0, base),
+        _lambda_row(0.5, base, revenue=1.1),
+        _lambda_row(1.0, base, revenue=1.2, recall50=0.989),
+    ]
+    selected, table = moe.select_lambda(rows, base, tolerance=0.01)
+    assert selected == 0.5
+    assert not bool(table.loc[table["lambda"].eq(1.0), "eligible"].iat[0])
+    assert table.attrs["success"] is True
+
+
+def test_select_lambda_fallback_zero_is_not_success():
+    import lightgcn_clv_moe as moe
+
+    base = _baseline_metrics()
+    selected, table = moe.select_lambda(
+        [_lambda_row(0.0, base), _lambda_row(0.5, base, recall50=0.5)], base
+    )
+    assert selected == 0.0
+    assert table.attrs["success"] is False
+
+
+def test_select_lambda_prefers_smaller_positive_lambda_on_revenue_tie():
+    import lightgcn_clv_moe as moe
+
+    base = _baseline_metrics()
+    selected, _ = moe.select_lambda(
+        [
+            _lambda_row(0.0, base),
+            _lambda_row(0.25, base, revenue=1.2),
+            _lambda_row(0.5, base, revenue=1.2),
+        ],
+        base,
+    )
+    assert selected == 0.25
+
+
+def test_preflight_exposes_m2_boundaries_and_high_cost_settings():
+    import lightgcn_clv_moe as moe
+
+    summary = moe.preflight_summary(moe.configure_moe_run("hm"))
+    assert summary["dataset"] == "hm"
+    assert summary["seed_list"] == [42]
+    assert summary["eval_test"] is False
+    assert summary["eval_holdout"] is False
+    assert summary["graph_mode"] == "binary"
+    assert summary["loss_mode"] == "plain"
+    assert summary["expert_count"] == 3
+    assert summary["window"] == "full official train (~2 years)"
+
+
+def test_validate_result_metrics_requires_exposure_outputs():
+    import lightgcn_clv_moe as moe
+
+    try:
+        moe.validate_result_metrics({"recall@10": 0.1}, ks=(10,))
+    except KeyError as exc:
+        assert "n_distinct@10" in str(exc)
+        assert "exposure_entropy@10" in str(exc)
+    else:
+        raise AssertionError("missing exposure metrics must be rejected")
+
+
+def test_confirmation_splits_require_explicit_ready_flag():
+    import lightgcn_clv_moe as moe
+
+    try:
+        moe.configure_moe_run("dunnhumby", eval_test=True)
+    except ValueError as exc:
+        assert "confirmation_ready" in str(exc)
+    else:
+        raise AssertionError("test exposure must require explicit confirmation")
+
+
+def test_checkpoint_paths_are_json_key_safe():
+    import lightgcn_clv_moe as moe
+
+    converted = moe.checkpoint_paths_for_json(
+        {("clv_moe", 42): "/tmp/a.pt", ("frozen_moe", 42): "/tmp/b.pt"}
+    )
+    assert converted == {
+        "clv_moe_s42": "/tmp/a.pt",
+        "frozen_moe_s42": "/tmp/b.pt",
+    }

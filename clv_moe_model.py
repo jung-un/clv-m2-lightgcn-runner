@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -206,6 +207,25 @@ class CLVMixtureEmbeddingModel(nn.Module):
         base_user, base_item = self._base_embeddings()
         return base_user[users] @ base_item.T
 
+    def embeddings(self, need_value: bool = True):
+        """Expose a flattened equivalent for the existing v3 evaluator.
+
+        Concatenating ``alpha_uk * e_uk`` on the user side and ``e_ik`` on
+        the item side preserves the exact mixture-of-inner-products score.
+        """
+        base_user, base_item = self._base_embeddings()
+        if not need_value:
+            return base_user, base_item, None, None
+        users = torch.arange(base_user.shape[0], device=base_user.device)
+        user_experts, item_experts, gate = self.expert_embeddings(users)
+        value_user = (
+            gate[:, :, None]
+            * user_experts
+            * self.has_profile[:, None, None]
+        ).reshape(base_user.shape[0], -1)
+        value_item = item_experts.reshape(base_item.shape[0], -1)
+        return base_user, base_item, value_user, value_item
+
     def score_all(self, users: torch.Tensor, lam: float) -> torch.Tensor:
         base = self.base_score_all(users)
         if float(lam) == 0.0:
@@ -244,3 +264,62 @@ class CLVMixtureEmbeddingModel(nn.Module):
         positive_score = self.score_pairs(users, positives, lam)
         negative_score = self.score_pairs(users, negatives, lam)
         return -F.logsigmoid(positive_score - negative_score).mean()
+
+
+def _expert_cosine(embedding: torch.Tensor) -> list[list[float]]:
+    # embedding: entity × expert × dimension
+    expert = embedding.permute(1, 0, 2).reshape(embedding.shape[1], -1)
+    expert = F.normalize(expert, dim=1)
+    return (expert @ expert.T).detach().cpu().tolist()
+
+
+@torch.no_grad()
+def moe_diagnostics(
+    model: CLVMixtureEmbeddingModel,
+    *,
+    seed: int = 0,
+    max_users: int = 2048,
+    max_items: int = 2048,
+) -> dict:
+    """Bounded routing and specialization diagnostics for one trained model."""
+    rng = np.random.default_rng(seed)
+    device = model.routed_profile.device
+    valid_users = torch.where(model.has_profile)[0].detach().cpu().numpy()
+    if not len(valid_users):
+        valid_users = np.arange(model.routed_profile.shape[0])
+    user_ids = np.sort(
+        rng.choice(valid_users, min(len(valid_users), max_users), replace=False)
+    )
+    valid_items = torch.where(model.valid_item)[0].detach().cpu().numpy()
+    if not len(valid_items):
+        valid_items = np.arange(model.item_numeric.shape[0])
+    item_ids = np.sort(
+        rng.choice(valid_items, min(len(valid_items), max_items), replace=False)
+    )
+    users = torch.as_tensor(user_ids, dtype=torch.long, device=device)
+    items = torch.as_tensor(item_ids, dtype=torch.long, device=device)
+    user_experts, item_experts, gate = model.expert_embeddings(users, items)
+    entropy = -(gate * torch.log(gate.clamp_min(1e-12))).sum(dim=1)
+    expert_scores = torch.einsum("ukd,ikd->kui", user_experts, item_experts)
+    score_matrix = expert_scores.reshape(model.expert_count, -1).cpu().numpy()
+    if model.expert_count == 1:
+        score_correlation = [[1.0]]
+    else:
+        score_correlation = np.nan_to_num(
+            np.corrcoef(score_matrix), nan=0.0
+        ).tolist()
+    base = model.base_score_all(users)[:, items]
+    combined = model.score_all(users, 1.0)[:, items]
+    residual_score = combined - base
+    ratio = float(residual_score.std() / (base.std() + 1e-12))
+    return {
+        "gate_entropy_mean": float(entropy.mean()),
+        "expert_usage_mean": gate.mean(dim=0).cpu().tolist(),
+        "expert_user_cosine": _expert_cosine(user_experts),
+        "expert_item_cosine": _expert_cosine(item_experts),
+        "expert_score_correlation": score_correlation,
+        "residual_to_base_score_std": ratio,
+        "parameter_match_ratio": float(model.parameter_match_ratio),
+        "diagnostic_users": int(len(users)),
+        "diagnostic_items": int(len(items)),
+    }

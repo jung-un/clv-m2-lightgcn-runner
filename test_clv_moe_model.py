@@ -74,6 +74,14 @@ def test_score_is_mixture_of_expert_embedding_inner_products():
     torch.testing.assert_close(model.score_all(users, 1.0), expected)
 
 
+def test_flattened_value_embeddings_reproduce_moe_score_for_v3_evaluator():
+    model = _model()
+    base_user, base_item, value_user, value_item = model.embeddings()
+    direct = model.score_all(torch.arange(4), 1.0)
+    flattened = base_user @ base_item.T + value_user @ value_item.T
+    torch.testing.assert_close(flattened, direct)
+
+
 def test_constant_gate_removes_user_specific_routing_only():
     model = _model(control="constant_gate")
     gate = model.routing_weights(torch.arange(4))
@@ -134,3 +142,21 @@ def test_single_adapter_matches_moe_capacity_without_a_router():
     assert single.expert_count == 1
     gate = single.routing_weights(torch.arange(4))
     torch.testing.assert_close(gate, torch.ones(4, 1))
+
+
+def test_moe_diagnostics_report_routing_and_specialization():
+    from clv_moe_model import moe_diagnostics
+
+    diagnostics = moe_diagnostics(_model(), seed=42, max_users=4, max_items=5)
+    assert set(diagnostics) >= {
+        "gate_entropy_mean",
+        "expert_usage_mean",
+        "expert_user_cosine",
+        "expert_item_cosine",
+        "expert_score_correlation",
+        "residual_to_base_score_std",
+        "parameter_match_ratio",
+    }
+    assert len(diagnostics["expert_usage_mean"]) == 3
+    assert np.isfinite(diagnostics["gate_entropy_mean"])
+    assert np.isfinite(diagnostics["residual_to_base_score_std"])
