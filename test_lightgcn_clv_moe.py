@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -231,3 +234,19 @@ def test_checkpoint_paths_are_json_key_safe():
         "clv_moe_s42": "/tmp/a.pt",
         "frozen_moe_s42": "/tmp/b.pt",
     }
+
+
+def test_colab_has_fresh_clone_preflight_and_high_cost_gate():
+    notebook = json.loads(Path("clv_moe_colab.ipynb").read_text())
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+    assert "feat/clv-conditioned-moe" in source
+    assert "sys.path.insert" in source
+    assert "configure_moe_run" in source
+    assert "preflight_summary" in source
+    assert "ACKNOWLEDGE_HIGH_COST = False" in source
+    assert "assert ACKNOWLEDGE_HIGH_COST" in source
+    assert "eval_test=False" in source
+    assert "eval_holdout=False" in source
+    assert "run_experiment(cfg)" in source
