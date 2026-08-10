@@ -12,8 +12,10 @@ class _Base(torch.nn.Module):
         self.E_u = torch.nn.Embedding(4, 8)
         self.E_i = torch.nn.Embedding(6, 8)
         self.register_buffer("adj", torch.zeros(10, 10))
+        self.embedding_calls = 0
 
     def embeddings(self, need_value=True):
+        self.embedding_calls += 1
         return self.E_u.weight, self.E_i.weight, None, None
 
 
@@ -84,6 +86,7 @@ def test_flattened_value_embeddings_reproduce_moe_score_for_v3_evaluator():
 
 def test_constant_gate_removes_user_specific_routing_only():
     model = _model(control="constant_gate")
+    assert model.constant_gate_logits.shape == (3,)
     gate = model.routing_weights(torch.arange(4))
     torch.testing.assert_close(gate, gate[:1].expand_as(gate))
 
@@ -115,6 +118,25 @@ def test_bpr_is_plain_mean_without_clv_sample_weights():
     torch.testing.assert_close(
         model.bpr_loss(users, positives, negatives, 1.0), expected
     )
+
+
+def test_bpr_computes_base_graph_embeddings_once_per_batch():
+    model = _model()
+    model.base_model.embedding_calls = 0
+    model.bpr_loss(
+        torch.tensor([0, 1]),
+        torch.tensor([1, 2]),
+        torch.tensor([3, 4]),
+        1.0,
+    )
+    assert model.base_model.embedding_calls == 1
+
+
+def test_evaluation_embedding_export_computes_base_graph_once():
+    model = _model()
+    model.base_model.embedding_calls = 0
+    model.embeddings()
+    assert model.base_model.embedding_calls == 1
 
 
 def test_model_reuses_base_graph_and_experts_have_no_graph():
@@ -160,3 +182,17 @@ def test_moe_diagnostics_report_routing_and_specialization():
     assert len(diagnostics["expert_usage_mean"]) == 3
     assert np.isfinite(diagnostics["gate_entropy_mean"])
     assert np.isfinite(diagnostics["residual_to_base_score_std"])
+
+
+def test_moe_diagnostics_never_scores_the_full_catalog():
+    from clv_moe_model import moe_diagnostics
+
+    model = _model()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("diagnostics must use only sampled users and items")
+
+    model.score_all = forbidden
+    diagnostics = moe_diagnostics(model, seed=42, max_users=2, max_items=3)
+    assert diagnostics["diagnostic_users"] == 2
+    assert diagnostics["diagnostic_items"] == 3

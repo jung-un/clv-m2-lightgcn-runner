@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -14,12 +15,25 @@ class _Base(torch.nn.Module):
         torch.manual_seed(9)
         self.E_u = torch.nn.Embedding(4, 8)
         self.E_i = torch.nn.Embedding(6, 8)
+        self._pref_cache = None
+        self.freeze_calls = 0
 
     def embeddings(self, need_value=True):
-        return self.E_u.weight, self.E_i.weight, None, None
+        user, item = (
+            self._pref_cache
+            if self._pref_cache is not None
+            else (self.E_u.weight, self.E_i.weight)
+        )
+        return user, item, None, None
 
     def pref_params(self):
         return list(self.E_u.parameters()) + list(self.E_i.parameters())
+
+    def freeze_pref_and_cache(self):
+        self.freeze_calls += 1
+        for parameter in self.pref_params():
+            parameter.requires_grad_(False)
+        self._pref_cache = (self.E_u.weight.detach(), self.E_i.weight.detach())
 
 
 def _model():
@@ -80,6 +94,80 @@ def test_default_screening_is_seed42_validation_only():
     assert cfg.lambda_eval == (0.0, 0.1, 0.25, 0.5, 1.0, 2.0)
 
 
+def test_source_revision_is_recordable_for_provenance():
+    import lightgcn_clv_moe as moe
+
+    revision = moe.source_revision()
+    assert isinstance(revision, str) and revision
+
+
+def test_file_sha256_is_content_sensitive(tmp_path):
+    import lightgcn_clv_moe as moe
+
+    path = tmp_path / "transactions.csv"
+    path.write_bytes(b"a,b\n1,2\n")
+    first = moe.file_sha256(path)
+    path.write_bytes(b"a,b\n1,3\n")
+    assert len(first) == 64
+    assert moe.file_sha256(path) != first
+
+
+def test_input_manifest_hashes_transactions_and_item_metadata(tmp_path):
+    import lightgcn_clv_moe as moe
+
+    tx = tmp_path / "tx.csv"
+    item = tmp_path / "items.csv"
+    tx.write_bytes(b"tx-v1")
+    item.write_bytes(b"item-v1")
+    manifest = moe.build_input_manifest(
+        {"tx_path": str(tx), "item_meta_path": str(item)}
+    )
+    assert manifest["transactions"]["sha256"] == moe.file_sha256(tx)
+    assert manifest["item_metadata"]["sha256"] == moe.file_sha256(item)
+    item.write_bytes(b"item-v2")
+    assert moe.build_input_manifest(
+        {"tx_path": str(tx), "item_meta_path": str(item)}
+    ) != manifest
+
+
+def test_m1_manifest_fails_closed_when_data_identity_changes(tmp_path):
+    import lightgcn_clv_moe as moe
+
+    checkpoint = tmp_path / "m1.pt"
+    checkpoint.write_bytes(b"checkpoint-v1")
+    inputs = {
+        "transactions": {"path": "/a", "bytes": 2, "sha256": "aa"},
+        "item_metadata": {"path": "/b", "bytes": 2, "sha256": "bb"},
+    }
+    moe.validate_or_write_m1_manifest(
+        checkpoint,
+        inputs,
+        config_hash="cfg1",
+        state_hash_value="state1",
+        existed_before=False,
+    )
+    moe.validate_or_write_m1_manifest(
+        checkpoint,
+        inputs,
+        config_hash="cfg1",
+        state_hash_value="state1",
+        existed_before=True,
+    )
+    changed = {**inputs, "item_metadata": {"path": "/b", "bytes": 3, "sha256": "cc"}}
+    try:
+        moe.validate_or_write_m1_manifest(
+            checkpoint,
+            changed,
+            config_hash="cfg1",
+            state_hash_value="state1",
+            existed_before=True,
+        )
+    except RuntimeError as exc:
+        assert "manifest" in str(exc)
+    else:
+        raise AssertionError("M1/data mismatch must fail closed")
+
+
 def test_joint_warm_updates_only_adapters_before_epoch_six():
     import lightgcn_clv_moe as moe
 
@@ -114,6 +202,18 @@ def test_frozen_moe_preserves_m1_hash():
     )
     assert moe.state_hash(model.base_model) == before
     assert stats["base_updates"] == 0
+
+
+def test_frozen_phase_builds_base_graph_cache_once_and_clears_on_unfreeze():
+    import lightgcn_clv_moe as moe
+
+    base = _Base()
+    moe._set_base_trainable(base, False)
+    moe._set_base_trainable(base, False)
+    assert base.freeze_calls == 1
+    assert base._pref_cache is not None
+    moe._set_base_trainable(base, True)
+    assert base._pref_cache is None
 
 
 def test_pref_continue_has_exact_matched_base_updates():
@@ -172,6 +272,22 @@ def test_select_lambda_fallback_zero_is_not_success():
     assert table.attrs["success"] is False
 
 
+def test_select_lambda_rejects_eligible_lambda_without_economic_improvement():
+    import lightgcn_clv_moe as moe
+
+    base = _baseline_metrics()
+    selected, table = moe.select_lambda(
+        [
+            _lambda_row(0.0, base),
+            _lambda_row(0.25, base, revenue=0.99),
+            _lambda_row(0.5, base, revenue=1.0),
+        ],
+        base,
+    )
+    assert selected == 0.0
+    assert table.attrs["success"] is False
+
+
 def test_select_lambda_prefers_smaller_positive_lambda_on_revenue_tie():
     import lightgcn_clv_moe as moe
 
@@ -187,6 +303,37 @@ def test_select_lambda_prefers_smaller_positive_lambda_on_revenue_tie():
     assert selected == 0.25
 
 
+def test_screening_decision_requires_main_to_outperform_all_controls():
+    import lightgcn_clv_moe as moe
+
+    selected = {
+        "clv_moe": 0.5,
+        "frozen_moe": 0.5,
+        "constant_gate": 0.25,
+        "shuffled_clv": 0.25,
+        "single_adapter": 0.5,
+        "pref_continue": 0.0,
+    }
+    rows = [
+        {"seed": 42, "model_id": model_id, "split": "val", "lambda": lam,
+         "revenue@10": revenue}
+        for model_id, lam, revenue in [
+            ("clv_moe", 0.5, 1.10),
+            ("frozen_moe", 0.5, 1.05),
+            ("constant_gate", 0.25, 1.02),
+            ("shuffled_clv", 0.25, 1.01),
+            ("single_adapter", 0.5, 1.04),
+            ("pref_continue", 0.0, 1.03),
+        ]
+    ]
+    decision = moe.screening_decision(rows, selected, {"clv_moe": True})
+    assert decision["success"] is True
+    rows[2]["revenue@10"] = 1.11
+    decision = moe.screening_decision(rows, selected, {"clv_moe": True})
+    assert decision["success"] is False
+    assert "constant_gate" in decision["failed_controls"]
+
+
 def test_preflight_exposes_m2_boundaries_and_high_cost_settings():
     import lightgcn_clv_moe as moe
 
@@ -195,6 +342,7 @@ def test_preflight_exposes_m2_boundaries_and_high_cost_settings():
     assert summary["seed_list"] == [42]
     assert summary["eval_test"] is False
     assert summary["eval_holdout"] is False
+    assert summary["confirmation_ready"] is False
     assert summary["graph_mode"] == "binary"
     assert summary["loss_mode"] == "plain"
     assert summary["expert_count"] == 3
@@ -224,6 +372,50 @@ def test_confirmation_splits_require_explicit_ready_flag():
         raise AssertionError("test exposure must require explicit confirmation")
 
 
+def test_screening_runner_fails_closed_even_with_confirmation_flag():
+    import lightgcn_clv_moe as moe
+
+    try:
+        moe.configure_moe_run(
+            "dunnhumby", eval_test=True, confirmation_ready=True
+        )
+    except ValueError as exc:
+        assert "screening-only" in str(exc)
+        assert "manifest" in str(exc)
+    else:
+        raise AssertionError("test must stay closed until two-dataset manifest exists")
+
+
+def test_run_experiment_revalidates_direct_dataclass_before_any_data_access(
+    monkeypatch,
+):
+    import lightgcn_clv_moe as moe
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("protected split must fail before touching data")
+
+    monkeypatch.setattr(moe, "file_sha256", forbidden)
+    monkeypatch.setattr(moe.v3, "prepare_data", forbidden)
+    try:
+        moe.run_experiment(moe.MoEConfig(eval_test=True, confirmation_ready=True))
+    except ValueError as exc:
+        assert "screening-only" in str(exc)
+    else:
+        raise AssertionError("direct dataclass construction must not bypass split guard")
+
+
+def test_screening_runner_rejects_multi_seed_direct_config():
+    import lightgcn_clv_moe as moe
+
+    try:
+        moe.validate_moe_config(moe.MoEConfig(seed_list=(42, 43, 44)))
+    except ValueError as exc:
+        assert "seed 42" in str(exc)
+        assert "screening-only" in str(exc)
+    else:
+        raise AssertionError("screening must stay fixed to seed 42")
+
+
 def test_checkpoint_paths_are_json_key_safe():
     import lightgcn_clv_moe as moe
 
@@ -234,6 +426,46 @@ def test_checkpoint_paths_are_json_key_safe():
         "clv_moe_s42": "/tmp/a.pt",
         "frozen_moe_s42": "/tmp/b.pt",
     }
+
+
+def test_moe_checkpoint_round_trip_reproduces_scores(tmp_path):
+    import lightgcn_clv_moe as moe
+
+    model = _model()
+    context = {
+        "user_profile": SimpleNamespace(
+            values=model.original_profile.cpu().numpy(),
+            valid_user=model.has_profile.cpu().numpy(),
+            feature_names=tuple(f"u{x}" for x in range(51)),
+        ),
+        "item_profile": SimpleNamespace(
+            numeric=model.item_numeric.cpu().numpy(),
+            category_ids=model.item_category_ids.cpu().numpy(),
+            valid_item=model.valid_item.cpu().numpy(),
+            numeric_names=tuple(f"i{x}" for x in range(6)),
+            n_categories=4,
+        ),
+        "artifact": SimpleNamespace(ev_all=np.arange(4, dtype=np.float32)),
+    }
+    path = tmp_path / "model.pt"
+    moe._save_model_checkpoint(path, model, context, {"best_epoch": 1}, {})
+    reload_base = _Base()
+    reload_base._pref_cache = (
+        torch.zeros_like(reload_base.E_u.weight),
+        torch.zeros_like(reload_base.E_i.weight),
+    )
+    loaded = moe.load_moe_checkpoint(
+        path,
+        reload_base,
+        moe.configure_moe_run("dunnhumby"),
+        control="clv",
+        device=torch.device("cpu"),
+    )
+    assert loaded.base_model._pref_cache is None
+    users = torch.arange(4)
+    torch.testing.assert_close(
+        loaded.score_all(users, 0.5), model.score_all(users, 0.5), rtol=0, atol=0
+    )
 
 
 def test_colab_has_fresh_clone_preflight_and_high_cost_gate():
@@ -249,4 +481,23 @@ def test_colab_has_fresh_clone_preflight_and_high_cost_gate():
     assert "assert ACKNOWLEDGE_HIGH_COST" in source
     assert "eval_test=False" in source
     assert "eval_holdout=False" in source
+    assert "summary['confirmation_ready'] is False" in source
     assert "run_experiment(cfg)" in source
+    assert "screening_decision" in source
+    assert "failed_controls" in source
+
+
+def test_direct_cli_is_preflight_only(monkeypatch, capsys):
+    import lightgcn_clv_moe as moe
+
+    monkeypatch.setattr(
+        moe,
+        "run_experiment",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("CLI must not start high-cost training")
+        ),
+    )
+    moe.main_cli()
+    output = capsys.readouterr().out
+    assert '"dataset": "dunnhumby"' in output
+    assert '"confirmation_ready": false' in output

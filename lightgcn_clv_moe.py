@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -15,11 +16,110 @@ import torch.nn.functional as F
 
 import lightgcn_clv_residual as residual
 import lightgcn_clv_v3 as v3
-from clv_moe_features import build_item_profiles, compose_user_profiles
+from clv_moe_features import (
+    ItemProfileArtifact,
+    UserProfileArtifact,
+    build_item_profiles,
+    compose_user_profiles,
+)
 from clv_moe_model import CLVMixtureEmbeddingModel, moe_diagnostics
 
 
 CODE_VERSION = "clv-moe-v1.0"
+
+
+def source_revision() -> str:
+    """Return the exact Git revision, marking uncommitted source as dirty."""
+    try:
+        root = Path(__file__).resolve().parent
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        diff = subprocess.run(
+            ["git", "diff", "--binary", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        ).stdout
+        if diff:
+            dirty_hash = hashlib.sha256(diff).hexdigest()[:12]
+            return f"{revision}-dirty-{dirty_hash}"
+        return revision
+    except (OSError, subprocess.SubprocessError):
+        return "git-unavailable"
+
+
+def file_sha256(path: str | Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    """Stream a source file hash without loading the transaction file into RAM."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_input_manifest(dcfg: dict) -> dict:
+    """Hash every raw file that affects graph, category, or economic features."""
+    manifest = {}
+    for label, key in (
+        ("transactions", "tx_path"),
+        ("item_metadata", "item_meta_path"),
+    ):
+        path = Path(dcfg[key]).resolve()
+        manifest[label] = {
+            "path": str(path),
+            "bytes": path.stat().st_size,
+            "sha256": file_sha256(path),
+        }
+    return manifest
+
+
+def manifest_hash(manifest: dict) -> str:
+    identity = {
+        label: {"bytes": entry["bytes"], "sha256": entry["sha256"]}
+        for label, entry in manifest.items()
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True).encode()
+    ).hexdigest()
+
+
+def validate_or_write_m1_manifest(
+    checkpoint_path: str | Path,
+    input_manifest: dict,
+    *,
+    config_hash: str,
+    state_hash_value: str,
+    existed_before: bool,
+) -> Path:
+    """Bind an M1 checkpoint to exact raw inputs and fail closed on mismatch."""
+    checkpoint_path = Path(checkpoint_path)
+    manifest_path = checkpoint_path.with_suffix(
+        checkpoint_path.suffix + ".manifest.json"
+    )
+    expected = {
+        "input_manifest_hash": manifest_hash(input_manifest),
+        "config_hash": config_hash,
+        "state_hash": state_hash_value,
+        "checkpoint_sha256": file_sha256(checkpoint_path),
+    }
+    if existed_before:
+        if not manifest_path.exists():
+            raise RuntimeError(
+                f"기존 M1에 데이터 manifest가 없어 재사용을 중단합니다: {manifest_path}"
+            )
+        saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if saved != expected:
+            raise RuntimeError("M1 checkpoint/data/config manifest 불일치")
+    else:
+        manifest_path.write_text(
+            json.dumps(expected, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    return manifest_path
 
 
 @dataclass
@@ -61,15 +161,30 @@ def configure_moe_run(dataset: str, **overrides) -> MoEConfig:
     unknown = set(overrides).difference(valid)
     if unknown:
         raise TypeError(f"알 수 없는 MoE 설정: {sorted(unknown)}")
-    cfg = MoEConfig(dataset=dataset, **overrides)
+    return validate_moe_config(MoEConfig(dataset=dataset, **overrides))
+
+
+def validate_moe_config(cfg: MoEConfig) -> MoEConfig:
+    """Validate every public entry path before any data or split is touched."""
+    if cfg.dataset not in {"hm", "dunnhumby"}:
+        raise ValueError("dataset은 'hm' 또는 'dunnhumby'여야 합니다")
+    if tuple(cfg.seed_list) != (42,):
+        raise ValueError(
+            "screening-only runner는 seed 42 하나만 허용합니다. 추가 seed는 양 "
+            "데이터셋 확증 manifest를 검증하는 별도 runner에서만 실행합니다."
+        )
     if cfg.expert_count != 3:
         raise ValueError("승인된 screening의 expert_count는 3입니다")
     if cfg.frozen_epochs < 0 or cfg.max_epochs <= cfg.frozen_epochs:
         raise ValueError("max_epochs는 frozen_epochs보다 커야 합니다")
     if cfg.eval_holdout and not cfg.eval_test:
         raise ValueError("holdout 확증은 test 확증 설정 뒤에만 활성화합니다")
-    if (cfg.eval_test or cfg.eval_holdout) and not cfg.confirmation_ready:
-        raise ValueError("확증 split은 confirmation_ready=True로 명시 승인해야 합니다")
+    if cfg.eval_test or cfg.eval_holdout:
+        raise ValueError(
+            "이 버전은 screening-only입니다. confirmation_ready만으로 test를 열 수 "
+            "없으며, 두 데이터셋 성공·대조군 우월성·코드/데이터/설정을 동결한 "
+            "manifest 검증이 구현되기 전까지 확증 split은 닫혀 있습니다."
+        )
     return cfg
 
 
@@ -89,7 +204,11 @@ def select_lambda(rows, baseline: dict, tolerance: float = 0.01):
             1.0 - tolerance
         )
     table["eligible"] = eligible
-    candidates = table[table["eligible"] & table["lambda"].gt(0)]
+    candidates = table[
+        table["eligible"]
+        & table["lambda"].gt(0)
+        & table["revenue@10"].gt(float(baseline["revenue@10"]))
+    ]
     if candidates.empty:
         selected = 0.0
     else:
@@ -100,6 +219,56 @@ def select_lambda(rows, baseline: dict, tolerance: float = 0.01):
         selected = float(tied["lambda"].min())
     table.attrs["success"] = selected > 0.0
     return selected, table
+
+
+def screening_decision(rows, selected: dict, selection_success: dict) -> dict:
+    """Require economic lift and rule out all planned capacity/training controls."""
+    controls = (
+        "frozen_moe",
+        "constant_gate",
+        "shuffled_clv",
+        "single_adapter",
+        "pref_continue",
+    )
+    if not selection_success.get("clv_moe", False):
+        return {
+            "success": False,
+            "reason": "main model did not improve M1 under accuracy guardrails",
+            "failed_controls": list(controls),
+        }
+    table = pd.DataFrame(rows)
+
+    def selected_revenue(model_id: str) -> float | None:
+        if model_id not in selected:
+            return None
+        subset = table[
+            table["model_id"].eq(model_id)
+            & table["split"].eq("val")
+            & table["seed"].eq(42)
+            & np.isclose(table["lambda"].to_numpy(dtype=float), selected[model_id])
+        ]
+        if subset.empty:
+            return None
+        return float(subset["revenue@10"].iloc[0])
+
+    main = selected_revenue("clv_moe")
+    control_revenue = {control: selected_revenue(control) for control in controls}
+    failed = [
+        control
+        for control, revenue in control_revenue.items()
+        if main is None or revenue is None or not main > revenue
+    ]
+    return {
+        "success": not failed,
+        "reason": (
+            "main economically outperformed M1 and every planned control"
+            if not failed
+            else "main improvement is absent or explained by a planned control"
+        ),
+        "main_revenue@10": main,
+        "control_revenue@10": control_revenue,
+        "failed_controls": failed,
+    }
 
 
 def validate_result_metrics(flat: dict, ks=(10, 20, 50)) -> None:
@@ -125,12 +294,13 @@ def preflight_summary(cfg: MoEConfig) -> dict:
         "base_lr": cfg.base_lr,
         "lambda_train": cfg.lambda_train,
         "lambda_eval": list(cfg.lambda_eval),
-        "selection": "six Recall/NDCG@10/20/50 >= 99% of external M1, then max weighted-hit@10",
+        "selection": "six Recall/NDCG@10/20/50 >= 99% of external M1 and weighted-hit@10 > M1, then max weighted-hit@10",
         "graph_mode": "binary",
         "loss_mode": "plain",
         "negative_sampling": "uniform",
         "eval_test": cfg.eval_test,
         "eval_holdout": cfg.eval_holdout,
+        "confirmation_ready": cfg.confirmation_ready,
         "run_controls_after_success": cfg.run_controls_after_success,
         "models": [
             "m1",
@@ -152,6 +322,13 @@ def _base_parameters(base_model: torch.nn.Module) -> list[torch.nn.Parameter]:
 
 
 def _set_base_trainable(base_model: torch.nn.Module, enabled: bool) -> None:
+    if (
+        not enabled
+        and hasattr(base_model, "freeze_pref_and_cache")
+        and getattr(base_model, "_pref_cache", None) is None
+    ):
+        base_model.freeze_pref_and_cache()
+        return
     for parameter in _base_parameters(base_model):
         parameter.requires_grad_(enabled)
     if enabled and hasattr(base_model, "_pref_cache"):
@@ -341,9 +518,17 @@ def _encoder_config(cfg: MoEConfig) -> residual.ResidualConfig:
     )
 
 
-def _result_fingerprint(cfg: MoEConfig, base_cfg: dict) -> str:
+def _result_fingerprint(
+    cfg: MoEConfig,
+    base_cfg: dict,
+    input_manifest: dict,
+    baseline_state_hashes: dict[str, str] | None = None,
+) -> str:
     payload = {
         "code_version": CODE_VERSION,
+        "source_revision": source_revision(),
+        "input_manifest_hash": manifest_hash(input_manifest),
+        "baseline_state_hashes": baseline_state_hashes or {},
         "moe": asdict(cfg),
         "base": {
             key: base_cfg[key]
@@ -497,16 +682,60 @@ def _save_model_checkpoint(path: Path, model, context, stats, diagnostics):
     )
 
 
+def load_moe_checkpoint(
+    path: str | Path,
+    base_model,
+    cfg: MoEConfig,
+    *,
+    control: str,
+    device: torch.device,
+):
+    """Rebuild a standalone MoE model and restore its exact saved state."""
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    user_profile = UserProfileArtifact(
+        values=checkpoint["user_profile"],
+        valid_user=checkpoint["user_valid"],
+        feature_names=tuple(checkpoint["user_feature_names"]),
+    )
+    item_profile = ItemProfileArtifact(
+        numeric=checkpoint["item_numeric"],
+        category_ids=checkpoint["item_category_ids"],
+        valid_item=checkpoint["item_valid"],
+        numeric_names=tuple(checkpoint["item_numeric_names"]),
+        n_categories=int(checkpoint["item_n_categories"]),
+    )
+    model = CLVMixtureEmbeddingModel(
+        base_model,
+        user_profile,
+        item_profile,
+        control=control,
+        seed=0,
+        expert_count=cfg.expert_count,
+        expert_hidden_dim=cfg.expert_hidden_dim,
+        expert_dim=cfg.expert_dim,
+        category_dim=cfg.category_dim,
+    ).to(device)
+    model.load_state_dict(checkpoint["state"])
+    if hasattr(model.base_model, "_pref_cache"):
+        model.base_model._pref_cache = None
+    model.eval()
+    return model
+
+
 def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
     """Run validation screening, optional controls, and protected confirmation."""
-    cfg = cfg or configure_moe_run("dunnhumby")
+    cfg = validate_moe_config(cfg or configure_moe_run("dunnhumby"))
     out_dir = Path(
         cfg.out_dir or f"{v3.default_out_dir(cfg.dataset)}_clv_moe"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
-    m1_dir = cfg.m1_checkpoint_dir or v3.default_out_dir(cfg.dataset)
+    input_manifest = build_input_manifest(v3.SCHEMA[cfg.dataset])
+    input_id = manifest_hash(input_manifest)
+    m1_root = Path(cfg.m1_checkpoint_dir or v3.default_out_dir(cfg.dataset))
+    m1_dir = m1_root / f"data_{input_id[:12]}"
     base_cfg = _pure_m1_config(cfg, str(m1_dir))
     print(json.dumps(preflight_summary(cfg), ensure_ascii=False, indent=2))
+    revision = source_revision()
     data = v3.prepare_data(base_cfg, v3.DCFG)
     encoder_cfg = _encoder_config(cfg)
     anchors = residual.build_anchor_examples(
@@ -524,7 +753,7 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
     x_item, item_cat = v3.item_value_features(data["train"], data["n_items"])
     meta = v3.item_meta(data["train"], data["n_items"])
     ones_gate = torch.ones(data["n_users"], dtype=torch.float32, device=v3.DEVICE)
-    fingerprint = _result_fingerprint(cfg, base_cfg)
+    run_fingerprint = _result_fingerprint(cfg, base_cfg, input_manifest)
 
     rows: list[dict] = []
     delta_records: list[dict] = []
@@ -535,6 +764,8 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
     train_records: dict[str, dict] = {}
     diagnostic_records: dict[str, dict] = {}
     checkpoint_paths: dict[tuple[str, int], str] = {}
+    baseline_state_hashes: dict[str, str] = {}
+    seed_fingerprints: dict[int, str] = {}
     encoder_records: dict[str, dict] = {}
 
     for seed in cfg.seed_list:
@@ -542,7 +773,7 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
             anchors, snapshot, encoder_cfg, seed, v3.DEVICE
         )
         encoder_records[str(seed)] = artifact.diagnostics
-        encoder_path = out_dir / f"encoder_{cfg.dataset}_s{seed}_{fingerprint}.pt"
+        encoder_path = out_dir / f"encoder_{cfg.dataset}_s{seed}_{run_fingerprint}.pt"
         torch.save(
             {
                 "state": artifact.model.state_dict(),
@@ -556,6 +787,7 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
             },
             encoder_path,
         )
+        checkpoint_paths[("encoder", seed)] = str(encoder_path)
         user_profile = compose_user_profiles(artifact, snapshot, v3.DEVICE)
         segment_thresholds = v3.segment_thresholds(
             artifact.ev_all, base_cfg["SEG_EDGES"]
@@ -582,7 +814,26 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
             "encoder_path": str(encoder_path),
         }
         contexts[seed] = context
+        m1_checkpoint = Path(base_cfg["OUT_DIR"]) / (
+            f"ckpt_pref_only_{cfg.dataset}_s{seed}_"
+            f"{v3.cfg_hash(base_cfg, v3.DCFG, 'pref_only', seed)}.pt"
+        )
+        m1_existed_before = m1_checkpoint.exists()
         external_m1, _ = _fresh_external_m1(context, seed, data, base_cfg)
+        baseline_state_hashes[str(seed)] = state_hash(external_m1)
+        if not m1_checkpoint.exists():
+            raise RuntimeError(f"M1 체크포인트가 저장되지 않았습니다: {m1_checkpoint}")
+        validate_or_write_m1_manifest(
+            m1_checkpoint,
+            input_manifest,
+            config_hash=v3.cfg_hash(base_cfg, v3.DCFG, "pref_only", seed),
+            state_hash_value=baseline_state_hashes[str(seed)],
+            existed_before=m1_existed_before,
+        )
+        checkpoint_paths[("m1", seed)] = str(m1_checkpoint)
+        seed_fingerprints[seed] = hashlib.sha256(
+            f"{run_fingerprint}:{baseline_state_hashes[str(seed)]}".encode()
+        ).hexdigest()[:10]
         baseline_flat, baseline_pu = _flat_evaluation(
             external_m1,
             0.0,
@@ -628,7 +879,9 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
         diagnostics = moe_diagnostics(model, seed=seed)
         train_records[f"clv_moe_s{seed}"] = stats
         diagnostic_records[f"clv_moe_s{seed}"] = diagnostics
-        checkpoint = out_dir / f"clv_moe_{cfg.dataset}_s{seed}_{fingerprint}.pt"
+        checkpoint = (
+            out_dir / f"clv_moe_{cfg.dataset}_s{seed}_{seed_fingerprints[seed]}.pt"
+        )
         _save_model_checkpoint(checkpoint, model, context, stats, diagnostics)
         checkpoint_paths[("clv_moe", seed)] = str(checkpoint)
         for lam in cfg.lambda_eval:
@@ -714,7 +967,10 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
             diagnostics = moe_diagnostics(model, seed=seed)
             train_records[f"{model_id}_s{seed}"] = stats
             diagnostic_records[f"{model_id}_s{seed}"] = diagnostics
-            checkpoint = out_dir / f"{model_id}_{cfg.dataset}_s{seed}_{fingerprint}.pt"
+            checkpoint = (
+                out_dir
+                / f"{model_id}_{cfg.dataset}_s{seed}_{seed_fingerprints[seed]}.pt"
+            )
             _save_model_checkpoint(checkpoint, model, context, stats, diagnostics)
             checkpoint_paths[(model_id, seed)] = str(checkpoint)
             control_rows = []
@@ -768,6 +1024,20 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
             per_user=True,
         )
         train_records[f"pref_continue_s{seed}"] = stats
+        pref_checkpoint = (
+            out_dir
+            / f"pref_continue_{cfg.dataset}_s{seed}_{seed_fingerprints[seed]}.pt"
+        )
+        torch.save(
+            {
+                "state": external_m1.state_dict(),
+                "training": stats,
+                "source_revision": revision,
+                "starting_m1_state_hash": baseline_state_hashes[str(seed)],
+            },
+            pref_checkpoint,
+        )
+        checkpoint_paths[("pref_continue", seed)] = str(pref_checkpoint)
         model_per_user[("val", "pref_continue", seed, 0.0)] = per_user
         rows.append(
             {
@@ -781,6 +1051,8 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
         )
         selected["pref_continue"] = 0.0
         selection_success["pref_continue"] = True
+
+    screen_decision = screening_decision(rows, selected, selection_success)
 
     for model_id, lam in selected.items():
         relevant_seeds = [
@@ -812,8 +1084,11 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
                 )
 
     if cfg.eval_test or cfg.eval_holdout:
-        if not selection_success["clv_moe"]:
-            raise RuntimeError("validation에서 실패한 M2는 확증 split으로 진행할 수 없습니다")
+        if not screen_decision["success"]:
+            raise RuntimeError(
+                "M1 개선과 모든 대조군 우월성을 통과하지 못한 M2는 확증 split으로 "
+                "진행할 수 없습니다"
+            )
         for split in ("test", "holdout"):
             if split not in data["splits"]:
                 continue
@@ -880,6 +1155,10 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
                     )
 
     frame = pd.DataFrame(rows)
+    fingerprint = _result_fingerprint(
+        cfg, base_cfg, input_manifest, baseline_state_hashes
+    )
+    frame.attrs["screening_decision"] = screen_decision
     stem = f"clv_moe_{cfg.dataset}_{fingerprint}"
     result_csv = out_dir / f"{stem}.csv"
     delta_csv = out_dir / f"{stem}_delta.csv"
@@ -890,18 +1169,28 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
         json.dump(
             {
                 "code_version": CODE_VERSION,
+                "source_revision": revision,
+                "result_fingerprint": fingerprint,
+                "input_manifest": input_manifest,
                 "config": asdict(cfg),
                 "base_config": {
                     key: value for key, value in base_cfg.items() if key != "OUT_DIR"
                 },
                 "data_stats": data["data_stats"],
+                "feature_schema": {
+                    "user": list(next(iter(contexts.values()))["user_profile"].feature_names),
+                    "item_numeric": list(item_profile.numeric_names),
+                },
+                "baseline_state_hashes": baseline_state_hashes,
                 "selected_lambda": selected,
-                "selection_success": selection_success,
+                "lambda_selection_success": selection_success,
+                "screening_decision": screen_decision,
                 "selection_tables": selection_tables,
                 "encoder_diagnostics": encoder_records,
                 "training": train_records,
                 "moe_diagnostics": diagnostic_records,
                 "checkpoint_paths": checkpoint_paths_for_json(checkpoint_paths),
+                "absolute_rows": frame.to_dict("records"),
                 "delta": delta_records,
                 "interpretation": {
                     "clv": "train-only CLV-related behavior representation; not realized lifetime CLV",
@@ -915,9 +1204,21 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
         )
     print(f"저장: {result_csv}")
     print(f"validation 선택 λ: {selected}")
-    print(f"선택 성공: {selection_success}")
+    print(f"λ 선택 단계 통과: {selection_success}")
+    print(
+        "최종 screening 판정: "
+        f"success={screen_decision['success']} | "
+        f"reason={screen_decision['reason']} | "
+        f"failed_controls={screen_decision['failed_controls']}"
+    )
     return frame
 
 
+def main_cli() -> None:
+    """Fail-safe CLI entry point: print screening settings, never train."""
+    print(json.dumps(preflight_summary(configure_moe_run("dunnhumby")), ensure_ascii=False, indent=2))
+    print("고비용 학습은 검토된 Colab의 ACKNOWLEDGE_HIGH_COST 셀에서만 실행하세요.")
+
+
 if __name__ == "__main__":
-    run_experiment()
+    main_cli()

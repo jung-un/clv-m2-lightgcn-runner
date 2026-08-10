@@ -86,7 +86,7 @@ class CLVMixtureEmbeddingModel(nn.Module):
                 routed[valid_indices] = values[permutation]
         self.register_buffer("routed_profile", routed)
 
-        base_user, base_item, *_ = self.base_model.embeddings()
+        base_user, base_item, *_ = self.base_model.embeddings(need_value=False)
         user_input_dim = int(base_user.shape[1] + values.shape[1])
         item_input_dim = int(base_item.shape[1] + item_numeric.shape[1] + category_dim)
         category_parameters = int(item_profile.n_categories * category_dim)
@@ -139,16 +139,21 @@ class CLVMixtureEmbeddingModel(nn.Module):
             )
             self.gate_net = (
                 None
-                if control == "single_adapter"
+                if control in {"single_adapter", "constant_gate"}
                 else nn.Sequential(
                     nn.Linear(values.shape[1], 32),
                     nn.GELU(),
                     nn.Linear(32, self.expert_count),
                 )
             )
+            self.constant_gate_logits = (
+                nn.Parameter(torch.zeros(self.expert_count))
+                if control == "constant_gate"
+                else None
+            )
 
     def _base_embeddings(self):
-        user, item, *_ = self.base_model.embeddings()
+        user, item, *_ = self.base_model.embeddings(need_value=False)
         return user, item
 
     def base_parameters(self) -> list[nn.Parameter]:
@@ -164,27 +169,23 @@ class CLVMixtureEmbeddingModel(nn.Module):
                 (len(users), 1), device=self.routed_profile.device, dtype=torch.float32
             )
         if self.control == "constant_gate":
-            valid = self.has_profile
-            if bool(valid.any()):
-                mean = F.softmax(self.gate_net(self.routed_profile[valid]), dim=1).mean(
-                    dim=0, keepdim=True
-                )
-            else:
-                mean = torch.full(
-                    (1, self.expert_count),
-                    1.0 / self.expert_count,
-                    device=self.routed_profile.device,
-                )
-            return mean.expand(len(users), -1)
+            weights = F.softmax(self.constant_gate_logits, dim=0).unsqueeze(0)
+            return weights.expand(len(users), -1)
         return F.softmax(self.gate_net(self.routed_profile[users]), dim=1)
 
-    def user_expert_embeddings(self, users: torch.Tensor) -> torch.Tensor:
-        base_user, _ = self._base_embeddings()
+    def _user_expert_embeddings_from(
+        self, base_user: torch.Tensor, users: torch.Tensor
+    ) -> torch.Tensor:
         inputs = torch.cat([base_user[users], self.routed_profile[users]], dim=1)
         return torch.stack([expert.user(inputs) for expert in self.experts], dim=1)
 
-    def item_expert_embeddings(self, items: torch.Tensor | None = None) -> torch.Tensor:
-        _, base_item = self._base_embeddings()
+    def user_expert_embeddings(self, users: torch.Tensor) -> torch.Tensor:
+        base_user, _ = self._base_embeddings()
+        return self._user_expert_embeddings_from(base_user, users)
+
+    def _item_expert_embeddings_from(
+        self, base_item: torch.Tensor, items: torch.Tensor | None = None
+    ) -> torch.Tensor:
         if items is None:
             items = torch.arange(base_item.shape[0], device=base_item.device)
         category = self.item_category(self.item_category_ids[items])
@@ -194,12 +195,17 @@ class CLVMixtureEmbeddingModel(nn.Module):
         output = torch.stack([expert.item(inputs) for expert in self.experts], dim=1)
         return output * self.valid_item[items, None, None]
 
+    def item_expert_embeddings(self, items: torch.Tensor | None = None) -> torch.Tensor:
+        _, base_item = self._base_embeddings()
+        return self._item_expert_embeddings_from(base_item, items)
+
     def expert_embeddings(
         self, users: torch.Tensor, items: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        base_user, base_item = self._base_embeddings()
         return (
-            self.user_expert_embeddings(users),
-            self.item_expert_embeddings(items),
+            self._user_expert_embeddings_from(base_user, users),
+            self._item_expert_embeddings_from(base_item, items),
             self.routing_weights(users),
         )
 
@@ -217,7 +223,9 @@ class CLVMixtureEmbeddingModel(nn.Module):
         if not need_value:
             return base_user, base_item, None, None
         users = torch.arange(base_user.shape[0], device=base_user.device)
-        user_experts, item_experts, gate = self.expert_embeddings(users)
+        user_experts = self._user_expert_embeddings_from(base_user, users)
+        item_experts = self._item_expert_embeddings_from(base_item)
+        gate = self.routing_weights(users)
         value_user = (
             gate[:, :, None]
             * user_experts
@@ -261,8 +269,21 @@ class CLVMixtureEmbeddingModel(nn.Module):
         negatives: torch.Tensor,
         lam: float = 1.0,
     ) -> torch.Tensor:
-        positive_score = self.score_pairs(users, positives, lam)
-        negative_score = self.score_pairs(users, negatives, lam)
+        base_user, base_item = self._base_embeddings()
+        positive_score = (base_user[users] * base_item[positives]).sum(dim=1)
+        negative_score = (base_user[users] * base_item[negatives]).sum(dim=1)
+        if float(lam) != 0.0:
+            user_experts = self._user_expert_embeddings_from(base_user, users)
+            positive_experts = self._item_expert_embeddings_from(base_item, positives)
+            negative_experts = self._item_expert_embeddings_from(base_item, negatives)
+            gate = self.routing_weights(users)[:, :, None]
+            valid = self.has_profile[users]
+            positive_score = positive_score + float(lam) * valid * (
+                gate * user_experts * positive_experts
+            ).sum(dim=(1, 2))
+            negative_score = negative_score + float(lam) * valid * (
+                gate * user_experts * negative_experts
+            ).sum(dim=(1, 2))
         return -F.logsigmoid(positive_score - negative_score).mean()
 
 
@@ -308,9 +329,11 @@ def moe_diagnostics(
         score_correlation = np.nan_to_num(
             np.corrcoef(score_matrix), nan=0.0
         ).tolist()
-    base = model.base_score_all(users)[:, items]
-    combined = model.score_all(users, 1.0)[:, items]
-    residual_score = combined - base
+    base_user, base_item = model._base_embeddings()
+    base = base_user[users] @ base_item[items].T
+    residual_score = torch.einsum(
+        "uk,ukd,ikd->ui", gate, user_experts, item_experts
+    ) * model.has_profile[users, None]
     ratio = float(residual_score.std() / (base.std() + 1e-12))
     return {
         "gate_entropy_mean": float(entropy.mean()),
