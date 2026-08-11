@@ -283,6 +283,73 @@ def test_hm_60day_preset_rejects_frozen_overrides(key, value):
         single.configure_hm_60day_run(**{key: value})
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("seed_list", (42, 43)),
+        ("input_days", 28),
+        ("target_days", 14),
+        ("anchor_offsets", (28, 14, 7)),
+        ("eval_test", True),
+        ("eval_holdout", True),
+        ("lambda_eval", (0.0, 1.0)),
+        ("accuracy_tolerance", 0.02),
+    ],
+)
+def test_validate_hm_60day_config_rejects_every_mutated_frozen_field(key, value):
+    import lightgcn_clv_single as single
+
+    cfg = dataclasses.replace(single.configure_hm_60day_run(), **{key: value})
+    with pytest.raises(ValueError, match=rf"H&M 60-day.*{key}"):
+        single.validate_single_config(cfg)
+
+
+def test_direct_hm_60day_dataclass_fails_before_data_access(monkeypatch):
+    import lightgcn_clv_moe as moe
+    import lightgcn_clv_single as single
+
+    monkeypatch.setattr(
+        single,
+        "_prepare_validation_context",
+        lambda cfg: (_ for _ in ()).throw(AssertionError("data touched")),
+    )
+    direct = moe.MoEConfig(
+        dataset="hm",
+        window_days=60,
+        input_days=28,
+        target_days=7,
+        anchor_offsets=(21, 14, 7),
+    )
+    with pytest.raises(ValueError, match=r"H&M 60-day.*input_days"):
+        single.run_experiment(direct)
+
+
+def test_hm_60day_config_mutated_after_preflight_fails_before_data_access(
+    monkeypatch,
+):
+    import lightgcn_clv_single as single
+
+    cfg = single.configure_hm_60day_run()
+    assert single.preflight_summary(cfg)["window_days"] == 60
+    cfg.anchor_offsets = (28, 14, 7)
+    monkeypatch.setattr(
+        single,
+        "_prepare_validation_context",
+        lambda current: (_ for _ in ()).throw(AssertionError("data touched")),
+    )
+    with pytest.raises(ValueError, match=r"H&M 60-day.*anchor_offsets"):
+        single.run_experiment(cfg)
+
+
+def test_full_window_hm_and_dunnhumby_configs_remain_supported():
+    import lightgcn_clv_single as single
+
+    for dataset in ("hm", "dunnhumby"):
+        cfg = single.configure_single_run(dataset)
+        assert single.validate_single_config(cfg) is cfg
+        assert cfg.window_days is None
+
+
 def test_anchor_diagnostics_summarize_observation_and_future_targets():
     import lightgcn_clv_residual as residual
     import lightgcn_clv_single as single
@@ -569,6 +636,215 @@ def test_reuse_accepts_exact_legacy_full_and_relabels_rows(reuse_fixture):
     assert {row["model_id"] for row in reused.rows} == {"single_full"}
     assert tuple(row["lambda"] for row in reused.rows) == reuse_fixture.cfg.lambda_eval
     assert reused.result_json_sha256
+
+
+def test_reuse_rejects_hybrid_current_checkpoint_with_legacy_metadata(
+    reuse_fixture,
+):
+    import lightgcn_clv_single as single
+
+    payload = json.loads(reuse_fixture.result_json.read_text())
+    payload["checkpoint_paths"]["single_full_s42"] = payload["checkpoint_paths"].pop(
+        "single_adapter_s42"
+    )
+    reuse_fixture.result_json.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="current reuse payload.*diagnostics"):
+        single.load_reusable_single_full(
+            reuse_fixture.result_json,
+            expected_checkpoint_sha256=reuse_fixture.checkpoint_sha256,
+            current_manifest=reuse_fixture.current_manifest,
+            baseline_state_hash=reuse_fixture.base_hash,
+            cfg=reuse_fixture.cfg,
+            base_cfg=reuse_fixture.base_cfg,
+            context=reuse_fixture.context,
+            data=reuse_fixture.data,
+        )
+
+
+def test_reuse_requires_window_days_in_current_schema(reuse_fixture):
+    import lightgcn_clv_single as single
+
+    payload = json.loads(reuse_fixture.result_json.read_text())
+    payload["checkpoint_paths"]["single_full_s42"] = payload["checkpoint_paths"].pop(
+        "single_adapter_s42"
+    )
+    payload["training"]["single_full_s42"] = payload["training"].pop(
+        "single_adapter_s42"
+    )
+    payload["diagnostics"] = {
+        "single_full_s42": payload.pop("moe_diagnostics")["single_adapter_s42"]
+    }
+    payload["config"].pop("window_days")
+    reuse_fixture.result_json.write_text(json.dumps(payload))
+
+    with pytest.raises(RuntimeError, match="saved config is missing window_days"):
+        single.load_reusable_single_full(
+            reuse_fixture.result_json,
+            expected_checkpoint_sha256=reuse_fixture.checkpoint_sha256,
+            current_manifest=reuse_fixture.current_manifest,
+            baseline_state_hash=reuse_fixture.base_hash,
+            cfg=reuse_fixture.cfg,
+            base_cfg=reuse_fixture.base_cfg,
+            context=reuse_fixture.context,
+            data=reuse_fixture.data,
+        )
+
+
+def _encoder_artifact_for_checkpoint_test():
+    return SimpleNamespace(
+        model=torch.nn.Linear(2, 1),
+        transform=SimpleNamespace(
+            mean=np.array([1.0, 2.0], dtype=np.float32),
+            std=np.array([0.5, 1.5], dtype=np.float32),
+            feature_names=("a", "b"),
+        ),
+        h_all=np.ones((2, 16), dtype=np.float32),
+        ev_all=np.array([1.0, 2.0], dtype=np.float32),
+        best_epoch=3,
+        diagnostics={"best_val_loss": 0.25},
+    )
+
+
+def test_encoder_checkpoint_filename_and_payload_isolate_data_and_source(tmp_path):
+    import lightgcn_clv_moe as moe
+    import lightgcn_clv_single as single
+
+    cfg = single.configure_single_run("dunnhumby", out_dir=str(tmp_path))
+    manifest = {
+        "transactions": {"path": "/tx", "bytes": 2, "sha256": "aa"},
+        "item_metadata": {"path": "/item", "bytes": 2, "sha256": "bb"},
+    }
+    diagnostics = [{"offset_days": 21, "n_users": 2}]
+    artifact = _encoder_artifact_for_checkpoint_test()
+
+    original = single._save_encoder_checkpoint(
+        tmp_path, cfg, 42, artifact, manifest, "source-a", diagnostics
+    )
+    changed_data = single._save_encoder_checkpoint(
+        tmp_path,
+        cfg,
+        42,
+        artifact,
+        manifest
+        | {
+            "transactions": {
+                "path": "/tx",
+                "bytes": 3,
+                "sha256": "changed",
+            }
+        },
+        "source-a",
+        diagnostics,
+    )
+    changed_source = single._save_encoder_checkpoint(
+        tmp_path, cfg, 42, artifact, manifest, "source-b", diagnostics
+    )
+
+    assert len({original.name, changed_data.name, changed_source.name}) == 3
+    assert all(path.is_file() for path in (original, changed_data, changed_source))
+    payload = torch.load(original, map_location="cpu", weights_only=False)
+    provenance = payload["provenance"]
+    assert provenance["config"] == asdict(cfg)
+    assert provenance["input_manifest"] == manifest
+    assert provenance["input_manifest_hash"] == moe.manifest_hash(manifest)
+    assert provenance["source_revision"] == "source-a"
+    assert provenance["checkpoint_fingerprint"] in original.name
+    assert payload["anchor_diagnostics"] == diagnostics
+
+
+def test_current_writer_result_round_trips_through_reuse_loader(
+    reuse_fixture, tmp_path
+):
+    import lightgcn_clv_single as single
+
+    fixture = reuse_fixture
+    anchor_diagnostics = [
+        {"offset_days": 21, "n_users": 2},
+        {"offset_days": 14, "n_users": 2},
+        {"offset_days": 7, "n_users": 2},
+    ]
+    encoder_path = single._save_encoder_checkpoint(
+        tmp_path,
+        fixture.cfg,
+        42,
+        _encoder_artifact_for_checkpoint_test(),
+        fixture.current_manifest,
+        "current-source",
+        anchor_diagnostics,
+    )
+    baseline_per_user = {
+        metric: np.zeros(2, dtype=np.float32)
+        for metric in ("recall", "ndcg", "revenue", "arp")
+    }
+    context = fixture.context | {
+        "anchor_diagnostics": anchor_diagnostics,
+    }
+    prepared = single.PreparedSingleContext(
+        out_dir=tmp_path,
+        baseline_row={},
+        baseline_metrics={},
+        baseline_per_user=baseline_per_user,
+        input_manifest=fixture.current_manifest,
+        baseline_state_hash=fixture.base_hash,
+        base_cfg=fixture.base_cfg,
+        data={"data_stats": {}, "n_items": 2},
+        context=context,
+        source_revision="current-source",
+        encoder_checkpoint=str(encoder_path),
+        m1_checkpoint="",
+        run_fingerprint="current1234",
+        anchor_diagnostics=anchor_diagnostics,
+    )
+    rows = tuple(
+        _reuse_metric_row(float(lam))
+        | {"model_id": single.PRIMARY_MODEL_ID, "role": "model"}
+        for lam in fixture.cfg.lambda_eval
+    )
+    per_user = {
+        float(lam): baseline_per_user for lam in fixture.cfg.lambda_eval
+    }
+    full = single.VariantRun(
+        model_id=single.PRIMARY_MODEL_ID,
+        rows=rows,
+        per_user=per_user,
+        training={"base_updates_at_best": 3},
+        diagnostics={"parameter_match_ratio": 1.0},
+        checkpoint=json.loads(fixture.result_json.read_text())["checkpoint_paths"][
+            "single_adapter_s42"
+        ],
+        reuse_provenance=None,
+    )
+    frame = single._persist_result(
+        prepared,
+        fixture.cfg,
+        list(rows),
+        {single.PRIMARY_MODEL_ID: 0.0},
+        {single.PRIMARY_MODEL_ID: False},
+        {single.PRIMARY_MODEL_ID: []},
+        {"success": False, "reason": "test", "failed_controls": []},
+        full,
+        {},
+    )
+    result_path = Path(frame.attrs["result_paths"]["json"])
+    payload = json.loads(result_path.read_text())
+    encoder_payload = torch.load(
+        encoder_path, map_location="cpu", weights_only=False
+    )
+    assert payload["anchor_diagnostics"] == context["anchor_diagnostics"]
+    assert payload["anchor_diagnostics"] == encoder_payload["anchor_diagnostics"]
+
+    reused = single.load_reusable_single_full(
+        result_path,
+        expected_checkpoint_sha256=single.moe.file_sha256(full.checkpoint),
+        current_manifest=fixture.current_manifest,
+        baseline_state_hash=fixture.base_hash,
+        cfg=fixture.cfg,
+        base_cfg=fixture.base_cfg,
+        context=fixture.context,
+        data=fixture.data,
+    )
+    assert {row["model_id"] for row in reused.rows} == {single.PRIMARY_MODEL_ID}
 
 
 def test_reuse_treats_missing_legacy_window_as_full_window(reuse_fixture):

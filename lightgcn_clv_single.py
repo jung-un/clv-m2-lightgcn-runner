@@ -115,7 +115,7 @@ class PreparedSingleContext:
     encoder_checkpoint: str
     m1_checkpoint: str
     run_fingerprint: str
-    anchor_diagnostics: tuple[dict, ...]
+    anchor_diagnostics: list[dict]
 
 
 @dataclass(frozen=True)
@@ -215,6 +215,10 @@ def configure_hm_60day_run(**overrides) -> moe.MoEConfig:
 
 
 def validate_single_config(cfg: moe.MoEConfig) -> moe.MoEConfig:
+    if cfg.dataset == "hm" and cfg.window_days == 60:
+        for key, expected in HM_60DAY_FROZEN.items():
+            if not _same_json_value(getattr(cfg, key), expected):
+                raise ValueError(f"H&M 60-day 고정설정 변경 금지: {key}")
     if cfg.eval_test or cfg.eval_holdout:
         raise ValueError(
             "single-adapter screening-only runner cannot open test/holdout"
@@ -320,11 +324,37 @@ def _require_reuse_payload(payload: dict) -> None:
         "checkpoint_paths",
         "absolute_rows",
         "training",
-        "moe_diagnostics",
     }
     missing = required.difference(payload)
+    if "diagnostics" not in payload and "moe_diagnostics" not in payload:
+        missing.add("diagnostics")
     if missing:
         raise RuntimeError(f"saved result JSON is missing fields: {sorted(missing)}")
+
+
+def _select_reuse_schema(payload: dict) -> tuple[str, str, dict, bool]:
+    current_key = f"{PRIMARY_MODEL_ID}_s42"
+    legacy_key = "single_adapter_s42"
+    checkpoints = payload["checkpoint_paths"]
+    if current_key in checkpoints:
+        diagnostics = payload.get("diagnostics")
+        if not isinstance(diagnostics, dict) or current_key not in diagnostics:
+            raise RuntimeError(
+                f"current reuse payload is missing diagnostics[{current_key}]"
+            )
+        if current_key not in payload["training"]:
+            raise RuntimeError(f"current reuse payload is missing training[{current_key}]")
+        return current_key, PRIMARY_MODEL_ID, diagnostics, False
+    if legacy_key in checkpoints:
+        diagnostics = payload.get("moe_diagnostics")
+        if not isinstance(diagnostics, dict) or legacy_key not in diagnostics:
+            raise RuntimeError(
+                f"legacy reuse payload is missing moe_diagnostics[{legacy_key}]"
+            )
+        if legacy_key not in payload["training"]:
+            raise RuntimeError(f"legacy reuse payload is missing training[{legacy_key}]")
+        return legacy_key, "single_adapter", diagnostics, True
+    raise RuntimeError("single_adapter seed-42 checkpoint is missing")
 
 
 def load_reusable_single_full(
@@ -348,6 +378,9 @@ def load_reusable_single_full(
     if not isinstance(payload, dict):
         raise RuntimeError("saved result JSON must contain an object")
     _require_reuse_payload(payload)
+    result_key, saved_model_id, diagnostic_payload, is_legacy = (
+        _select_reuse_schema(payload)
+    )
 
     if payload["input_manifest"] != current_manifest:
         raise RuntimeError("input manifest mismatch; refusing single-adapter reuse")
@@ -357,9 +390,13 @@ def load_reusable_single_full(
     current_config = asdict(cfg)
     saved_config = payload["config"]
     for key in REUSE_CONFIG_KEYS:
-        saved_value = (
-            saved_config.get(key) if key == "window_days" else saved_config[key]
-        )
+        if key not in saved_config:
+            if is_legacy and key == "window_days":
+                saved_value = None
+            else:
+                raise RuntimeError(f"saved config is missing {key}")
+        else:
+            saved_value = saved_config[key]
         if not _same_json_value(saved_value, current_config[key]):
             raise RuntimeError(f"saved config mismatch for {key}")
     saved_base_config = payload["base_config"]
@@ -376,7 +413,7 @@ def load_reusable_single_full(
     if payload["feature_schema"] != expected_schema:
         raise RuntimeError("feature schema mismatch; refusing single-adapter reuse")
 
-    checkpoint_value = payload["checkpoint_paths"].get("single_adapter_s42")
+    checkpoint_value = payload["checkpoint_paths"].get(result_key)
     if not checkpoint_value:
         raise RuntimeError("single_adapter seed-42 checkpoint is missing")
     checkpoint_path = Path(checkpoint_value)
@@ -430,7 +467,7 @@ def load_reusable_single_full(
         checkpoint_path,
         base_model,
         cfg,
-        control="single_adapter",
+        control=saved_model_id,
         device=v3.DEVICE,
     )
 
@@ -439,7 +476,7 @@ def load_reusable_single_full(
         for row in payload["absolute_rows"]
         if row.get("seed") == 42
         and row.get("split") == "val"
-        and row.get("model_id") == "single_adapter"
+        and row.get("model_id") == saved_model_id
     ]
     by_lambda = {float(row["lambda"]): row for row in saved_rows}
     if len(saved_rows) != len(cfg.lambda_eval) or set(by_lambda) != set(
@@ -470,12 +507,11 @@ def load_reusable_single_full(
         relabeled_rows.append(saved | {"model_id": PRIMARY_MODEL_ID, "role": "model"})
 
     result_sha = hashlib.sha256(result_path.read_bytes()).hexdigest()
-    key = "single_adapter_s42"
     return ReusableSingleFull(
         model=model,
         rows=tuple(relabeled_rows),
-        training=dict(payload["training"].get(key, {})),
-        diagnostics=dict(payload["moe_diagnostics"].get(key, {})),
+        training=dict(payload["training"].get(result_key, {})),
+        diagnostics=dict(diagnostic_payload.get(result_key, {})),
         result_json_sha256=result_sha,
         legacy_source_revision=str(payload["source_revision"]),
         legacy_checkpoint=str(checkpoint_path),
@@ -531,6 +567,59 @@ def _single_result_fingerprint(
     ).hexdigest()[:10]
 
 
+def _encoder_checkpoint_fingerprint(
+    cfg: moe.MoEConfig,
+    input_manifest: dict,
+    revision: str,
+) -> str:
+    payload = {
+        "code_version": CODE_VERSION,
+        "config": asdict(cfg),
+        "input_manifest_hash": moe.manifest_hash(input_manifest),
+        "source_revision": revision,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode()
+    ).hexdigest()[:10]
+
+
+def _save_encoder_checkpoint(
+    out_dir: str | Path,
+    cfg: moe.MoEConfig,
+    seed: int,
+    artifact,
+    input_manifest: dict,
+    revision: str,
+    anchor_diagnostics: list[dict],
+) -> Path:
+    """Persist an encoder under its exact config, raw-input, and source identity."""
+    fingerprint = _encoder_checkpoint_fingerprint(cfg, input_manifest, revision)
+    path = Path(out_dir) / f"encoder_{cfg.dataset}_s{seed}_{fingerprint}.pt"
+    provenance = {
+        "checkpoint_fingerprint": fingerprint,
+        "config": asdict(cfg),
+        "input_manifest": input_manifest,
+        "input_manifest_hash": moe.manifest_hash(input_manifest),
+        "source_revision": revision,
+    }
+    torch.save(
+        {
+            "state": artifact.model.state_dict(),
+            "transform_mean": artifact.transform.mean,
+            "transform_std": artifact.transform.std,
+            "feature_names": artifact.transform.feature_names,
+            "h_all": artifact.h_all,
+            "ev_all": artifact.ev_all,
+            "best_epoch": artifact.best_epoch,
+            "diagnostics": artifact.diagnostics,
+            "anchor_diagnostics": anchor_diagnostics,
+            "provenance": provenance,
+        },
+        path,
+    )
+    return path
+
+
 def _prepare_validation_context(cfg: moe.MoEConfig) -> PreparedSingleContext:
     cfg = validate_single_config(cfg)
     out_dir = Path(cfg.out_dir or f"{v3.default_out_dir(cfg.dataset)}_clv_single")
@@ -553,7 +642,7 @@ def _prepare_validation_context(cfg: moe.MoEConfig) -> PreparedSingleContext:
         cfg.target_days,
         cfg.anchor_offsets,
     )
-    anchor_diagnostics = summarize_anchor_dataset(anchors)
+    anchor_diagnostics = list(summarize_anchor_dataset(anchors))
     snapshot = moe.residual.build_final_snapshot(
         data["train"], data["n_users"], v3.DCFG["is_date"], cfg.input_days
     )
@@ -561,23 +650,14 @@ def _prepare_validation_context(cfg: moe.MoEConfig) -> PreparedSingleContext:
     artifact = moe.residual.train_future_value_encoder(
         anchors, snapshot, encoder_cfg, seed, v3.DEVICE
     )
-    encoder_seed = hashlib.sha256(
-        json.dumps(asdict(cfg), sort_keys=True, default=str).encode()
-    ).hexdigest()[:10]
-    encoder_path = out_dir / f"encoder_{cfg.dataset}_s{seed}_{encoder_seed}.pt"
-    torch.save(
-        {
-            "state": artifact.model.state_dict(),
-            "transform_mean": artifact.transform.mean,
-            "transform_std": artifact.transform.std,
-            "feature_names": artifact.transform.feature_names,
-            "h_all": artifact.h_all,
-            "ev_all": artifact.ev_all,
-            "best_epoch": artifact.best_epoch,
-            "diagnostics": artifact.diagnostics,
-            "anchor_diagnostics": anchor_diagnostics,
-        },
-        encoder_path,
+    encoder_path = _save_encoder_checkpoint(
+        out_dir,
+        cfg,
+        seed,
+        artifact,
+        input_manifest,
+        revision,
+        anchor_diagnostics,
     )
     user_profile = moe.compose_user_profiles(artifact, snapshot, v3.DEVICE)
     item_profile = moe.build_item_profiles(data["train"], data["n_items"])
@@ -605,6 +685,7 @@ def _prepare_validation_context(cfg: moe.MoEConfig) -> PreparedSingleContext:
         "ones_gate": ones_gate,
         "caches": caches,
         "encoder_path": str(encoder_path),
+        "anchor_diagnostics": anchor_diagnostics,
     }
 
     m1_checkpoint = Path(base_cfg["OUT_DIR"]) / (

@@ -416,15 +416,34 @@ def binary_baseline(d, cfg):
     return d_base, cfg_base
 
 
+def _json_safe_time(value):
+    """Convert time boundaries to JSON-native scalars without losing precision."""
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def prepare_data(cfg, dcfg):
     """시간순 분할: train | val | test | holdout(가장 최근).
     holdout은 EVAL_HOLDOUT=True일 때만 평가에 쓰인다(그 전엔 정답조차 만들지 않음)."""
     tx = load_transactions(dcfg)
+    source_stats = {
+        "rows": int(len(tx)),
+        "time_min": _json_safe_time(tx["t"].min()),
+        "time_max": _json_safe_time(tx["t"].max()),
+    }
     if cfg["WINDOW_DAYS"]:
         t_max0 = tx["t"].max()
         delta = pd.Timedelta(days=cfg["WINDOW_DAYS"]) if dcfg["is_date"] else cfg["WINDOW_DAYS"]
         tx = tx[tx["t"] >= t_max0 - delta].copy()
         print(f"최근 {cfg['WINDOW_DAYS']}일 사용: {len(tx):,}건")
+    analysis_window = {
+        "rows_before_kcore": int(len(tx)),
+        "time_min": _json_safe_time(tx["t"].min()),
+        "time_max": _json_safe_time(tx["t"].max()),
+    }
 
     meta = pd.read_csv(dcfg["item_meta_path"], dtype={dcfg["item_key_col"]: str} if dcfg["is_date"] else None)
     meta = meta.rename(columns={dcfg["item_key_col"]: "i_raw", dcfg["category_col"]: "cat_raw"})
@@ -448,6 +467,26 @@ def prepare_data(cfg, dcfg):
           f"유저 {n_u0:,}→{len(keep_u):,} 아이템 {n_i0:,}→{len(keep_i):,} "
           f"엣지 {n_edge0:,}→{n_edge1:,}")
     data_stats = {
+        "source": source_stats,
+        "analysis_window": analysis_window,
+        "split_boundaries": {
+            "train": {
+                "start_inclusive": analysis_window["time_min"],
+                "end_inclusive": _json_safe_time(val_start),
+            },
+            "val": {
+                "start_exclusive": _json_safe_time(val_start),
+                "end_inclusive": _json_safe_time(test_start),
+            },
+            "test": {
+                "start_exclusive": _json_safe_time(test_start),
+                "end_inclusive": _json_safe_time(hold_start),
+            },
+            "holdout": {
+                "start_exclusive": _json_safe_time(hold_start),
+                "end_inclusive": _json_safe_time(t_max),
+            },
+        },
         "min_user_inter": cfg["MIN_USER_INTER"], "min_item_inter": cfg["MIN_ITEM_INTER"],
         "kcore_iters": n_iter,
         "train_rows_before": n_row0, "train_edges_before": n_edge0,
@@ -468,6 +507,23 @@ def prepare_data(cfg, dcfg):
     print(f"유저 {n_users:,} | 아이템 {n_items:,} | 카테고리({dcfg['category_col']}) {n_cat:,}")
 
     train = tx[tx["t"] <= val_start].copy()
+    val_rows = tx[(tx.t > val_start) & (tx.t <= test_start)]
+    test_rows = tx[(tx.t > test_start) & (tx.t <= hold_start)]
+    holdout_rows = tx[tx.t > hold_start]
+    data_stats["analysis_window"]["rows_after_kcore"] = int(len(tx))
+    data_stats["split_rows"] = {
+        "train": int(len(train)),
+        "val": int(len(val_rows)),
+        "test": int(len(test_rows)),
+        "holdout": int(len(holdout_rows)),
+    }
+    data_stats["split_evaluation_status"] = {
+        "val": "constructed",
+        "test": "constructed" if cfg["EVAL_TEST"] else "not_constructed",
+        "holdout": (
+            "constructed" if cfg["EVAL_HOLDOUT"] else "not_constructed"
+        ),
+    }
     train_users = set(train.u_idx.unique()); train_items = set(train.i_idx.unique())
     train_pair_key = np.unique(train.u_idx.values.astype(np.int64) * n_items + train.i_idx.values)
 
@@ -498,15 +554,13 @@ def prepare_data(cfg, dcfg):
         return gt, rev
 
     split_stats = {}
-    splits = {"val": build_eval(tx[(tx.t > val_start) & (tx.t <= test_start)],
-                                "val", "Val    ")}
+    splits = {"val": build_eval(val_rows, "val", "Val    ")}
     if cfg["EVAL_TEST"]:
-        splits["test"] = build_eval(tx[(tx.t > test_start) & (tx.t <= hold_start)],
-                                    "test", "Test   ")
+        splits["test"] = build_eval(test_rows, "test", "Test   ")
     else:
         print("  Test: 계산 안 함 (EVAL_TEST=False — 개발 중에는 validation만 본다)")
     if cfg["EVAL_HOLDOUT"]:
-        splits["holdout"] = build_eval(tx[tx.t > hold_start], "holdout", "Holdout")
+        splits["holdout"] = build_eval(holdout_rows, "holdout", "Holdout")
     else:
         print("  Holdout: 계산 안 함 (EVAL_HOLDOUT=False — 최종 확증 때만 켤 것)")
     data_stats["splits"] = split_stats

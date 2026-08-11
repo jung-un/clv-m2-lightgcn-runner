@@ -328,11 +328,68 @@ def test_prepare_data_actually_runs_and_split_keys_are_strings(tmp_path):
     json.dumps(ds, default=float)
 
 
+def test_prepare_data_persists_reserved_boundaries_without_protected_truth(tmp_path):
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    d = V3.prepare_data(dict(cfg, EVAL_TEST=False, EVAL_HOLDOUT=False), dcfg)
+    stats = d["data_stats"]
+
+    assert stats["source"] == {"rows": stats["source"]["rows"], "time_min": 0, "time_max": 59}
+    assert stats["analysis_window"]["time_min"] == 0
+    assert stats["analysis_window"]["time_max"] == 59
+    assert stats["split_boundaries"] == {
+        "train": {"start_inclusive": 0, "end_inclusive": 38},
+        "val": {"start_exclusive": 38, "end_inclusive": 45},
+        "test": {"start_exclusive": 45, "end_inclusive": 52},
+        "holdout": {"start_exclusive": 52, "end_inclusive": 59},
+    }
+    assert stats["split_rows"]["train"] == len(d["train"])
+    assert sum(stats["split_rows"].values()) == stats["analysis_window"][
+        "rows_after_kcore"
+    ]
+    assert stats["split_evaluation_status"] == {
+        "val": "constructed",
+        "test": "not_constructed",
+        "holdout": "not_constructed",
+    }
+    assert set(d["splits"]) == {"val"}
+    assert set(stats["splits"]) == {"val"}
+    json.dumps(stats)
+
+
+def test_prepare_data_date_boundaries_are_json_safe(tmp_path):
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    tx_path = Path(dcfg["tx_path"])
+    tx = pd.read_csv(tx_path)
+    tx["day"] = (
+        pd.Timestamp("2020-01-01") + pd.to_timedelta(tx["day"], unit="D")
+    ).dt.strftime("%Y-%m-%d")
+    tx.to_csv(tx_path, index=False)
+    dcfg["is_date"] = True
+
+    stats = V3.prepare_data(
+        dict(cfg, EVAL_TEST=False, EVAL_HOLDOUT=False), dcfg
+    )["data_stats"]
+    assert stats["source"]["time_min"] == "2020-01-01T00:00:00"
+    assert stats["source"]["time_max"] == "2020-02-29T00:00:00"
+    assert stats["split_boundaries"]["test"] == {
+        "start_exclusive": "2020-02-15T00:00:00",
+        "end_inclusive": "2020-02-22T00:00:00",
+    }
+    assert stats["split_evaluation_status"]["test"] == "not_constructed"
+    assert stats["split_evaluation_status"]["holdout"] == "not_constructed"
+    json.dumps(stats)
+
+
 def test_prepare_data_holdout_key_when_enabled(tmp_path):
     cfg, dcfg = _tiny_dataset(tmp_path)
     cfg["EVAL_HOLDOUT"] = True; cfg["EVAL_TEST"] = True
     d = V3.prepare_data(cfg, dcfg)
     assert set(d["data_stats"]["splits"].keys()) == {"val", "test", "holdout"}
+    assert d["data_stats"]["split_evaluation_status"] == {
+        "val": "constructed",
+        "test": "constructed",
+        "holdout": "constructed",
+    }
 
 
 def test_prepare_data_respects_min_item_inter(tmp_path):

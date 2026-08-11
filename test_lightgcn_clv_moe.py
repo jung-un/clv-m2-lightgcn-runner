@@ -1,4 +1,6 @@
 import json
+import re
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -100,6 +102,75 @@ def test_source_revision_is_recordable_for_provenance():
 
     revision = moe.source_revision()
     assert isinstance(revision, str) and revision
+
+
+@pytest.mark.parametrize(
+    ("filename", "first_content", "second_content"),
+    [
+        ("new_module.py", "VALUE = 1\n", "VALUE = 2\n"),
+        ("new_runner.ipynb", '{"cells": []}\n', '{"cells": [{"cell_type": "code"}]}\n'),
+    ],
+)
+def test_source_revision_hashes_untracked_source_content(
+    tmp_path, monkeypatch, filename, first_content, second_content
+):
+    import lightgcn_clv_moe as moe
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    tracked = repo / "lightgcn_clv_moe.py"
+    tracked.write_text("# tracked\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test Runner"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "add", tracked.name], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "base"], cwd=repo, check=True
+    )
+    monkeypatch.setattr(moe, "__file__", str(tracked))
+    clean = moe.source_revision()
+
+    untracked = repo / filename
+    untracked.write_text(first_content, encoding="utf-8")
+    first = moe.source_revision()
+    untracked.write_text(second_content, encoding="utf-8")
+    second = moe.source_revision()
+
+    assert re.fullmatch(r"[0-9a-f]{40}", clean)
+    assert first.startswith(f"{clean}-dirty-")
+    assert second.startswith(f"{clean}-dirty-")
+    assert first != second
+
+
+def test_source_revision_hashes_tracked_text_diff_without_bytes_type_error(
+    tmp_path, monkeypatch
+):
+    import lightgcn_clv_moe as moe
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    tracked = repo / "lightgcn_clv_moe.py"
+    tracked.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.com"], cwd=repo, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test Runner"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "add", tracked.name], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "base"], cwd=repo, check=True
+    )
+    monkeypatch.setattr(moe, "__file__", str(tracked))
+    clean = moe.source_revision()
+    tracked.write_text("VALUE = 2\n", encoding="utf-8")
+    dirty = moe.source_revision()
+    assert dirty.startswith(f"{clean}-dirty-")
 
 
 def test_file_sha256_is_content_sensitive(tmp_path):
@@ -390,6 +461,18 @@ def test_preflight_distinguishes_full_and_bounded_hm_windows():
     assert short["estimated_train_days"] == 39
     assert "last 60 calendar days" in short["window"]
     assert "not observed row count" in short["window"]
+
+
+@pytest.mark.parametrize(("window_days", "expected"), [(1, 0), (21, 0), (22, 1)])
+def test_preflight_never_reports_negative_estimated_train_days(
+    window_days, expected
+):
+    import lightgcn_clv_moe as moe
+
+    summary = moe.preflight_summary(
+        moe.configure_moe_run("hm", window_days=window_days)
+    )
+    assert summary["estimated_train_days"] == expected
 
 
 def test_validate_result_metrics_requires_exposure_outputs():

@@ -26,10 +26,13 @@ from clv_moe_model import CLVMixtureEmbeddingModel, moe_diagnostics
 
 
 CODE_VERSION = "clv-moe-v1.0"
+SOURCE_REVISION_SUFFIXES = frozenset(
+    {".py", ".ipynb", ".md", ".toml", ".yaml", ".yml", ".json", ".sh"}
+)
 
 
 def source_revision() -> str:
-    """Return the exact Git revision, marking uncommitted source as dirty."""
+    """Return the Git revision plus content hash for tracked/untracked source."""
     try:
         root = Path(__file__).resolve().parent
         revision = subprocess.run(
@@ -45,8 +48,33 @@ def source_revision() -> str:
             check=True,
             capture_output=True,
         ).stdout
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        ).stdout
+        dirty = hashlib.sha256()
+        has_dirty_source = False
         if diff:
-            dirty_hash = hashlib.sha256(diff).hexdigest()[:12]
+            dirty.update(b"tracked\0")
+            dirty.update(diff)
+            has_dirty_source = True
+        for raw_name in sorted(name for name in untracked.split(b"\0") if name):
+            relative = raw_name.decode("utf-8", errors="surrogateescape")
+            source_path = root / relative
+            if (
+                source_path.suffix.lower() not in SOURCE_REVISION_SUFFIXES
+                or not source_path.is_file()
+            ):
+                continue
+            dirty.update(b"untracked\0")
+            dirty.update(raw_name)
+            dirty.update(b"\0")
+            dirty.update(source_path.read_bytes())
+            has_dirty_source = True
+        if has_dirty_source:
+            dirty_hash = dirty.hexdigest()[:12]
             return f"{revision}-dirty-{dirty_hash}"
         return revision
     except (OSError, subprocess.SubprocessError):
@@ -282,7 +310,9 @@ def validate_result_metrics(flat: dict, ks=(10, 20, 50)) -> None:
 
 def preflight_summary(cfg: MoEConfig) -> dict:
     estimated_train_days = (
-        None if cfg.window_days is None else cfg.window_days - (7 + 7 + 7)
+        None
+        if cfg.window_days is None
+        else max(cfg.window_days - (7 + 7 + 7), 0)
     )
     return {
         "code_version": CODE_VERSION,
@@ -541,10 +571,11 @@ def _result_fingerprint(
     base_cfg: dict,
     input_manifest: dict,
     baseline_state_hashes: dict[str, str] | None = None,
+    revision: str | None = None,
 ) -> str:
     payload = {
         "code_version": CODE_VERSION,
-        "source_revision": source_revision(),
+        "source_revision": revision or source_revision(),
         "input_manifest_hash": manifest_hash(input_manifest),
         "baseline_state_hashes": baseline_state_hashes or {},
         "moe": asdict(cfg),
@@ -771,7 +802,9 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
     x_item, item_cat = v3.item_value_features(data["train"], data["n_items"])
     meta = v3.item_meta(data["train"], data["n_items"])
     ones_gate = torch.ones(data["n_users"], dtype=torch.float32, device=v3.DEVICE)
-    run_fingerprint = _result_fingerprint(cfg, base_cfg, input_manifest)
+    run_fingerprint = _result_fingerprint(
+        cfg, base_cfg, input_manifest, revision=revision
+    )
 
     rows: list[dict] = []
     delta_records: list[dict] = []
@@ -1174,7 +1207,11 @@ def run_experiment(cfg: MoEConfig | None = None) -> pd.DataFrame:
 
     frame = pd.DataFrame(rows)
     fingerprint = _result_fingerprint(
-        cfg, base_cfg, input_manifest, baseline_state_hashes
+        cfg,
+        base_cfg,
+        input_manifest,
+        baseline_state_hashes,
+        revision=revision,
     )
     frame.attrs["screening_decision"] = screen_decision
     stem = f"clv_moe_{cfg.dataset}_{fingerprint}"
