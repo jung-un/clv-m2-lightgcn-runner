@@ -786,3 +786,24 @@ def test_colab_has_pinned_source_preflight_gate_and_final_decision():
     assert "assert ACKNOWLEDGE_HIGH_COST" in source
     assert "screening_decision" in source
     assert "eval_test=False" in source and "eval_holdout=False" in source
+
+
+def test_hm_w60_colab_has_pinned_preset_preflight_gate_and_result_views():
+    notebook = json.loads(Path("clv_single_adapter_hm_w60_colab.ipynb").read_text())
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "configure_hm_60day_run" in source
+    assert "results_clv_single_hm_w60" in source
+    assert "results_v3_hm_w60" in source
+    assert "ACKNOWLEDGE_HIGH_COST = False" in source
+    assert "window_days == 60" in source
+    assert "input_days == 14" in source
+    assert "anchor_offsets == (21, 14, 7)" in source
+    assert "eval_test" in source and "eval_holdout" in source
+    assert "TO_BE_PINNED" not in source
+    assert re.search(
+        r"REVIEWED_SHA = '[0-9a-f]{40}'",
+        source,
+    )
