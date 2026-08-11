@@ -104,6 +104,72 @@ def reuse_fixture(tmp_path, monkeypatch):
     )
 
 
+def _install_tiny_runner_stubs(monkeypatch, tmp_path, full_revenue):
+    import lightgcn_clv_single as single
+
+    calls = {"controls": []}
+    baseline = _reuse_metric_row(0.0) | {
+        "model_id": "m1",
+        "role": "baseline",
+        "revenue@10": 1.0,
+    }
+    prepared = SimpleNamespace(
+        out_dir=tmp_path,
+        baseline_row=baseline,
+        baseline_metrics=baseline,
+        baseline_per_user={
+            "recall": np.zeros(2),
+            "ndcg": np.zeros(2),
+            "revenue": np.zeros(2),
+            "arp": np.zeros(2),
+        },
+        input_manifest={"transactions": {}, "item_metadata": {}},
+        baseline_state_hash="base-state",
+        base_cfg={"N_BOOT": 10, "K_LIST": [10, 20, 50]},
+        data={"data_stats": {}},
+        context={
+            "user_profile": SimpleNamespace(feature_names=("u0",)),
+            "item_profile": SimpleNamespace(numeric_names=("i0",)),
+            "artifact": SimpleNamespace(diagnostics={}),
+        },
+        source_revision="test-revision",
+    )
+    monkeypatch.setattr(single, "_prepare_validation_context", lambda cfg: prepared)
+
+    def fake_variant(prepared, cfg, model_id):
+        calls["controls"].append(model_id)
+        revenue = full_revenue if model_id == "single_full" else 1.01
+        rows = []
+        per_user = {}
+        for lam in cfg.lambda_eval:
+            row = _reuse_metric_row(float(lam)) | {
+                "model_id": model_id,
+                "role": "model" if model_id == "single_full" else "control",
+                "revenue@10": revenue if lam == 1.0 else 1.0,
+            }
+            rows.append(row)
+            per_user[float(lam)] = prepared.baseline_per_user
+        return single.VariantRun(
+            model_id=model_id,
+            rows=tuple(rows),
+            per_user=per_user,
+            training={"base_updates_at_best": 3},
+            diagnostics={"parameter_match_ratio": 1.0},
+            checkpoint=str(tmp_path / f"{model_id}.pt"),
+            reuse_provenance=None,
+        )
+
+    monkeypatch.setattr(single, "_train_evaluate_variant", fake_variant)
+    pref_row = baseline | {
+        "model_id": "pref_continue",
+        "role": "control",
+        "lambda": 0.0,
+        "revenue@10": 1.0,
+    }
+    monkeypatch.setattr(single, "_run_pref_continue", lambda *args, **kwargs: pref_row)
+    return calls
+
+
 def test_default_single_screening_is_seed42_validation_only():
     import lightgcn_clv_single as single
 
@@ -284,3 +350,78 @@ def test_reuse_rejects_metric_round_trip_mismatch(reuse_fixture):
             context=reuse_fixture.context,
             data=reuse_fixture.data,
         )
+
+
+def test_runner_trains_full_then_all_controls_only_after_success(
+    monkeypatch, tmp_path
+):
+    import lightgcn_clv_single as single
+
+    calls = _install_tiny_runner_stubs(monkeypatch, tmp_path, full_revenue=1.10)
+    cfg = single.configure_single_run("dunnhumby", out_dir=str(tmp_path))
+    frame = single.run_experiment(cfg)
+    assert calls["controls"] == [
+        "single_full",
+        "single_zero_user",
+        "single_shuffled_user",
+        "single_base_only",
+        "single_zero_item",
+    ]
+    assert set(frame.model_id) >= {
+        "m1",
+        "single_full",
+        *single.REQUIRED_CONTROLS,
+        *single.MECHANISM_CONTROLS,
+        "pref_continue",
+    }
+    assert frame.attrs["screening_decision"]["success"] is True
+
+
+def test_runner_stops_after_full_when_primary_selection_fails(monkeypatch, tmp_path):
+    import lightgcn_clv_single as single
+
+    calls = _install_tiny_runner_stubs(monkeypatch, tmp_path, full_revenue=0.99)
+    cfg = single.configure_single_run("dunnhumby", out_dir=str(tmp_path))
+    frame = single.run_experiment(cfg)
+    assert calls["controls"] == ["single_full"]
+    assert set(frame.model_id) == {"m1", "single_full"}
+    assert frame.attrs["screening_decision"]["success"] is False
+
+
+def test_runner_persists_authoritative_json_and_exposure_metrics(
+    monkeypatch, tmp_path
+):
+    import lightgcn_clv_single as single
+
+    _install_tiny_runner_stubs(monkeypatch, tmp_path, full_revenue=1.10)
+    frame = single.run_experiment(
+        single.configure_single_run("dunnhumby", out_dir=str(tmp_path))
+    )
+    payload = json.loads(next(tmp_path.glob("clv_single_*.json")).read_text())
+    assert payload["screening_decision"] == frame.attrs["screening_decision"]
+    assert (
+        payload["variant_definitions"]["single_zero_user"]["user_profile"]
+        == "zero"
+    )
+    assert {
+        "n_distinct@10",
+        "exposure_entropy@10",
+        "eff_catalog@10",
+        "top10_share@10",
+        "top100_share@10",
+    }.issubset(payload["absolute_rows"][0])
+
+
+def test_run_experiment_revalidates_before_data_access(monkeypatch):
+    import lightgcn_clv_single as single
+
+    monkeypatch.setattr(
+        single,
+        "_prepare_validation_context",
+        lambda cfg: (_ for _ in ()).throw(AssertionError("data touched")),
+    )
+    bad = dataclasses.replace(
+        single.configure_single_run("dunnhumby"), seed_list=(42, 43)
+    )
+    with pytest.raises(ValueError, match="seed 42"):
+        single.run_experiment(bad)
