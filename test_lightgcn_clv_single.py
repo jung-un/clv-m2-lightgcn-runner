@@ -790,20 +790,46 @@ def test_colab_has_pinned_source_preflight_gate_and_final_decision():
 
 def test_hm_w60_colab_has_pinned_preset_preflight_gate_and_result_views():
     notebook = json.loads(Path("clv_single_adapter_hm_w60_colab.ipynb").read_text())
-    source = "\n".join(
-        "".join(cell.get("source", [])) for cell in notebook["cells"]
-    )
-
-    assert "configure_hm_60day_run" in source
-    assert "results_clv_single_hm_w60" in source
-    assert "results_v3_hm_w60" in source
-    assert "ACKNOWLEDGE_HIGH_COST = False" in source
-    assert "window_days == 60" in source
-    assert "input_days == 14" in source
-    assert "anchor_offsets == (21, 14, 7)" in source
-    assert "eval_test" in source and "eval_holdout" in source
+    code_cells = [
+        "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if cell["cell_type"] == "code"
+    ]
+    source = "\n".join(code_cells)
     assert "TO_BE_PINNED" not in source
-    assert re.search(
-        r"REVIEWED_SHA = '[0-9a-f]{40}'",
-        source,
+
+    clone_cell = next(cell for cell in code_cells if "REVIEWED_SHA" in cell)
+    assert "REVIEWED_SHA = '95cc4ea3b24f13581f215e595b0d8bbdf6b93338'" in clone_cell
+    assert re.search(r"REVIEWED_SHA = '[0-9a-f]{40}'", clone_cell)
+    assert "assert not REPO_DIR.exists()" in clone_cell
+    assert "['git', 'clone', REPO_URL, str(REPO_DIR)]" in clone_cell
+    assert "'checkout', '--detach', REVIEWED_SHA" in clone_cell
+    assert "'rev-parse', 'HEAD'" in clone_cell
+    assert "assert actual_sha == REVIEWED_SHA" in clone_cell
+
+    config_cell = next(
+        cell for cell in code_cells if "configure_hm_60day_run" in cell
     )
+    assert "results_clv_single_hm_w60" in config_cell
+    assert "results_v3_hm_w60" in config_cell
+    assert "torch.cuda.is_available()" in config_cell
+    assert "HM_60DAY_FROZEN.items()" in config_cell
+    assert "window_days == 60" in config_cell
+    assert "input_days == 14" in config_cell
+    assert "anchor_offsets == (21, 14, 7)" in config_cell
+    assert "cfg.eval_test is False and cfg.eval_holdout is False" in config_cell
+
+    preflight_cell = next(cell for cell in code_cells if "preflight_summary(cfg)" in cell)
+    assert "summary['eval_test'] is False" in preflight_cell
+    assert "summary['eval_holdout'] is False" in preflight_cell
+
+    run_cell = next(cell for cell in code_cells if "run_experiment(cfg)" in cell)
+    approval = "assert ACKNOWLEDGE_HIGH_COST is True"
+    assert approval in run_cell
+    assert run_cell.index(approval) < run_cell.index("result_df = run_experiment(cfg)")
+
+    results_cell = next(cell for cell in code_cells if "screening_decision" in cell)
+    assert "absolute_curves.plot" in results_cell
+    assert "result_paths']['delta_csv']" in results_cell
+    assert "screening_decision = result_df.attrs['screening_decision']" in results_cell
+    assert "result_paths'].items()" in results_cell
