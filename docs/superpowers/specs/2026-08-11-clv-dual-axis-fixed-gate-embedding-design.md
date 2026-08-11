@@ -108,14 +108,12 @@ S(u,i) = S_base(u,i)
 |---|---|
 | M1 | 외부 순수 LightGCN 기준 |
 | `dual_clv_fixed` | 두 CLV 사용자 표현 + 두 아이템 표현 + 고정 게이트 |
-| `dual_equal_gate` | `g_N=g_V=1`; 사용자별 CLV 강도 배분의 효과 식별 |
 | `dual_shuffled_gate` | 두 게이트 쌍을 유효 사용자 간 seed 42 순열 |
 | `dual_base_only` | 두 사용자·아이템 추가입력을 0으로 두고 같은 어댑터 용량만 유지 |
-| `dual_zero_N` | 거래활동 전문가를 제거해 거래가치 축 단독효과 확인 |
-| `dual_zero_V` | 거래가치 전문가를 제거해 거래활동 축 단독효과 확인 |
 
 기존 51차원 `single_full`은 일반 행동프로필 비교모형으로만 보고하며 새 CLV 제안모형의
-필수 대조군으로 사용하지 않는다.
+필수 대조군으로 사용하지 않는다. `dual_equal_gate`, `dual_zero_N`, `dual_zero_V`도
+현재 빠른 screening 범위에서 제외하고 후속 메커니즘 분석 후보로만 남긴다.
 
 ## 7. validation 선택과 성공 판정
 
@@ -129,8 +127,7 @@ S(u,i) = S_base(u,i)
 - 위 조건을 통과하면서 M1보다 가격·구매금액 가중 적중값@10이 큰 양의 lambda 중 해당
   지표가 가장 큰 값을 선택한다. 없으면 lambda 0으로 돌아가되 성공으로 적지 않는다.
 - 최종 screening 성공은 `dual_clv_fixed`가 M1 조건을 통과하고, 선택된 경제지표가
-  `dual_equal_gate`, `dual_shuffled_gate`, `dual_base_only`보다 크다는 두 조건을
-  모두 요구한다. `dual_zero_N/V`는 성공 차단용이 아니라 축별 기여 해석용이다.
+  `dual_shuffled_gate`, `dual_base_only`보다 크다는 두 조건을 모두 요구한다.
 
 ## 8. 저장·보고
 
