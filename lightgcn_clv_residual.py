@@ -57,6 +57,8 @@ class AnchorExamples:
     valid: np.ndarray
     purchase_target: np.ndarray
     amount_target: np.ndarray
+    transaction_target: np.ndarray | None = None
+    mean_transaction_value_target: np.ndarray | None = None
 
 
 @dataclass
@@ -297,6 +299,17 @@ def build_anchor_examples(
         )
         future = target.groupby("u_idx").v.sum().clip(lower=0.0)
         amount = np.asarray([future.get(u, 0.0) for u in users], dtype=np.float32)
+        target_basket_key = "b_raw" if "b_raw" in target.columns else "t"
+        future_transactions = target.groupby("u_idx")[target_basket_key].nunique()
+        transaction_count = np.asarray(
+            [future_transactions.get(u, 0.0) for u in users], dtype=np.float32
+        )
+        mean_transaction_value = np.divide(
+            amount,
+            transaction_count,
+            out=np.zeros_like(amount),
+            where=transaction_count > 0,
+        )
         anchors.append(
             AnchorExamples(
                 offset,
@@ -309,6 +322,8 @@ def build_anchor_examples(
                 valid,
                 (amount > 0).astype(np.float32),
                 amount,
+                transaction_count,
+                mean_transaction_value,
             )
         )
     return AnchorDataset(anchors=anchors, train_end=train_end, n_users=n_users)
