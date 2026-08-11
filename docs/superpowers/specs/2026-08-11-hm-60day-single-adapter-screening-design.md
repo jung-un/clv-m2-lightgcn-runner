@@ -29,14 +29,16 @@ plain BPR을 유지해 M3 그래프 가중과 M4 손실 가중을 포함하지 �
 60일 원자료에서는 365일 입력·90일 예측 encoder를 만들 수 없으므로 H&M 60일 전용으로
 다음 설정을 사용한다.
 
-- 행동입력 최대 lookback: 28일
+- 행동입력 lookback: 14일
 - 미래가치 예측 horizon: 7일
 - train 내부 anchor offset: 21일, 14일, 7일
-- 최종 추천모형 입력 snapshot: train 종료시점 이전 최대 28일
+- 최종 추천모형 입력 snapshot: train 종료시점 이전 14일
 
-가장 이른 anchor는 60일 전체창과 평가 예약기간 때문에 28일을 모두 관찰하지 못할 수 있다.
-기존 `observed_days`와 변수별 validity mask가 실제 관찰량을 표현하며, preflight와 결과에
-anchor별 유효 표본 수·관찰기간 분포를 남긴다. 이 제약은 60일 탐색 결과의 한계로 보고한다.
+현재 encoder는 `input_days + max(anchor_offsets)`만큼의 연속 train 관찰기간을 요구한다.
+`14 + 21 = 35일`은 약 39일 train 안에 들어오며, 세 7일 target 구간도 서로 겹치지 않는다.
+기존 `observed_days`와 변수별 validity mask가 사용자별 실제 관찰량을 표현하고, 결과에
+anchor별 유효 표본 수·관찰기간 분포를 남긴다. 14일 행동표현이라는 짧은 기간은 60일 탐색
+결과의 한계로 보고한다.
 
 ## 4. 비교 모형과 선택 규칙
 
