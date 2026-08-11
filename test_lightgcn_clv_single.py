@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -622,6 +623,8 @@ def test_colab_has_pinned_source_preflight_gate_and_final_decision():
         "".join(cell.get("source", [])) for cell in notebook["cells"]
     )
     assert "configure_single_run" in source
+    assert re.search(r"REVIEWED_SHA = '[0-9a-f]{40}'", source)
+    assert "TO_BE_PINNED" not in source
     assert "preflight_summary" in source
     assert "reuse_full_result_json" in source
     assert "reuse_full_checkpoint_sha256" in source
