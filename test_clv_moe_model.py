@@ -19,6 +19,15 @@ class _Base(torch.nn.Module):
         return self.E_u.weight, self.E_i.weight, None, None
 
 
+class _BaseWithUnusedValueParameter(_Base):
+    def __init__(self):
+        super().__init__()
+        self.unused_value = torch.nn.Parameter(torch.ones(17))
+
+    def pref_params(self):
+        return [self.E_u.weight, self.E_i.weight]
+
+
 def _artifacts(invalid_last=False):
     rng = np.random.default_rng(4)
     valid = np.ones(4, bool)
@@ -142,6 +151,18 @@ def test_single_variant_audit_hashes_inputs_masks_and_capacity():
     assert len(audit["valid_item_sha256"]) == 64
     assert audit["adapter_parameter_count"] > 0
     assert audit["joint_trainable_parameter_count"] > audit["adapter_parameter_count"]
+
+
+def test_single_variant_audit_counts_only_optimizer_base_parameters():
+    from lightgcn_clv_single import _variant_audit
+
+    model = _model(control="single_full", base=_BaseWithUnusedValueParameter())
+    audit = _variant_audit(model, "m1-state")
+    expected_base = model.base_model.E_u.weight.numel() + model.base_model.E_i.weight.numel()
+    assert audit["base_parameter_count"] == expected_base
+    assert audit["joint_trainable_parameter_count"] == (
+        audit["adapter_parameter_count"] + expected_base
+    )
 
 
 def test_three_experts_generate_user_and_item_embeddings():

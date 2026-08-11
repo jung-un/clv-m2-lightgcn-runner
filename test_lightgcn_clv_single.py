@@ -12,6 +12,7 @@ import torch
 @dataclass
 class ReuseFixture:
     result_json: Path
+    checkpoint_sha256: str
     current_manifest: dict
     base_hash: str
     cfg: object
@@ -147,6 +148,7 @@ def reuse_fixture(tmp_path, monkeypatch):
     monkeypatch.setattr(moe, "_flat_evaluation", fake_flat)
     return ReuseFixture(
         result_json=result_json,
+        checkpoint_sha256=moe.file_sha256(checkpoint),
         current_manifest=manifest,
         base_hash="base-state",
         cfg=cfg,
@@ -364,6 +366,28 @@ def test_validate_rejects_changed_accuracy_tolerance():
         )
 
 
+@pytest.mark.parametrize(
+    ("trusted_sha", "message"),
+    [(None, "trusted checkpoint SHA"), ("0" * 64, "checkpoint SHA mismatch")],
+)
+def test_reuse_requires_and_verifies_trusted_checkpoint_sha(
+    reuse_fixture, trusted_sha, message
+):
+    import lightgcn_clv_single as single
+
+    with pytest.raises(RuntimeError, match=message):
+        single.load_reusable_single_full(
+            reuse_fixture.result_json,
+            expected_checkpoint_sha256=trusted_sha,
+            current_manifest=reuse_fixture.current_manifest,
+            baseline_state_hash=reuse_fixture.base_hash,
+            cfg=reuse_fixture.cfg,
+            base_cfg=reuse_fixture.base_cfg,
+            context=reuse_fixture.context,
+            data=reuse_fixture.data,
+        )
+
+
 def test_reuse_rejects_input_manifest_mismatch(reuse_fixture):
     import lightgcn_clv_single as single
 
@@ -374,6 +398,7 @@ def test_reuse_rejects_input_manifest_mismatch(reuse_fixture):
     with pytest.raises(RuntimeError, match="input manifest"):
         single.load_reusable_single_full(
             fixture.result_json,
+            expected_checkpoint_sha256=fixture.checkpoint_sha256,
             current_manifest=changed,
             baseline_state_hash=fixture.base_hash,
             cfg=fixture.cfg,
@@ -389,6 +414,7 @@ def test_reuse_rejects_m1_state_or_feature_schema_mismatch(reuse_fixture):
     with pytest.raises(RuntimeError, match="M1 state"):
         single.load_reusable_single_full(
             reuse_fixture.result_json,
+            expected_checkpoint_sha256=reuse_fixture.checkpoint_sha256,
             current_manifest=reuse_fixture.current_manifest,
             baseline_state_hash="wrong",
             cfg=reuse_fixture.cfg,
@@ -407,6 +433,7 @@ def test_reuse_rejects_base_training_config_mismatch(reuse_fixture):
     with pytest.raises(RuntimeError, match="base config"):
         single.load_reusable_single_full(
             reuse_fixture.result_json,
+            expected_checkpoint_sha256=reuse_fixture.checkpoint_sha256,
             current_manifest=reuse_fixture.current_manifest,
             baseline_state_hash=reuse_fixture.base_hash,
             cfg=reuse_fixture.cfg,
@@ -445,6 +472,7 @@ def test_reuse_rejects_checkpoint_input_or_mask_mismatch(
     with pytest.raises(RuntimeError, match="checkpoint feature values"):
         single.load_reusable_single_full(
             reuse_fixture.result_json,
+            expected_checkpoint_sha256=single.moe.file_sha256(checkpoint_path),
             current_manifest=reuse_fixture.current_manifest,
             baseline_state_hash=reuse_fixture.base_hash,
             cfg=reuse_fixture.cfg,
@@ -459,6 +487,7 @@ def test_reuse_accepts_exact_legacy_full_and_relabels_rows(reuse_fixture):
 
     reused = single.load_reusable_single_full(
         reuse_fixture.result_json,
+        expected_checkpoint_sha256=reuse_fixture.checkpoint_sha256,
         current_manifest=reuse_fixture.current_manifest,
         baseline_state_hash=reuse_fixture.base_hash,
         cfg=reuse_fixture.cfg,
@@ -485,6 +514,7 @@ def test_reuse_rejects_metric_round_trip_mismatch(reuse_fixture):
     with pytest.raises(RuntimeError, match="metric round-trip"):
         single.load_reusable_single_full(
             reuse_fixture.result_json,
+            expected_checkpoint_sha256=reuse_fixture.checkpoint_sha256,
             current_manifest=reuse_fixture.current_manifest,
             baseline_state_hash=reuse_fixture.base_hash,
             cfg=reuse_fixture.cfg,
@@ -594,6 +624,7 @@ def test_colab_has_pinned_source_preflight_gate_and_final_decision():
     assert "configure_single_run" in source
     assert "preflight_summary" in source
     assert "reuse_full_result_json" in source
+    assert "reuse_full_checkpoint_sha256" in source
     assert "ACKNOWLEDGE_HIGH_COST = False" in source
     assert "assert ACKNOWLEDGE_HIGH_COST" in source
     assert "screening_decision" in source

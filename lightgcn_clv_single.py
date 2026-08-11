@@ -129,7 +129,9 @@ def _variant_audit(
         return array_sha256(value.detach().cpu().numpy())
 
     adapter_count = sum(parameter.numel() for parameter in model.adapter_parameters())
-    base_count = sum(parameter.numel() for parameter in model.base_parameters())
+    base_count = sum(
+        parameter.numel() for parameter in moe._base_parameters(model.base_model)
+    )
     return {
         "starting_base_state_hash": starting_base_state_hash,
         "original_profile_sha256": tensor_hash(model.original_profile),
@@ -282,6 +284,7 @@ def _require_reuse_payload(payload: dict) -> None:
 def load_reusable_single_full(
     result_json: str | Path,
     *,
+    expected_checkpoint_sha256: str | None,
     current_manifest: dict,
     baseline_state_hash: str,
     cfg: moe.MoEConfig,
@@ -332,6 +335,16 @@ def load_reusable_single_full(
     checkpoint_path = Path(checkpoint_value)
     if not checkpoint_path.is_file():
         raise RuntimeError(f"single_adapter checkpoint does not exist: {checkpoint_path}")
+    trusted_sha = str(expected_checkpoint_sha256 or "").lower()
+    if len(trusted_sha) != 64 or any(
+        character not in "0123456789abcdef" for character in trusted_sha
+    ):
+        raise RuntimeError(
+            "trusted checkpoint SHA is required for legacy single-adapter reuse"
+        )
+    actual_checkpoint_sha = moe.file_sha256(checkpoint_path)
+    if actual_checkpoint_sha != trusted_sha:
+        raise RuntimeError("checkpoint SHA mismatch; refusing single-adapter reuse")
     try:
         checkpoint_payload = torch.load(
             checkpoint_path, map_location="cpu", weights_only=False
@@ -419,7 +432,7 @@ def load_reusable_single_full(
         result_json_sha256=result_sha,
         legacy_source_revision=str(payload["source_revision"]),
         legacy_checkpoint=str(checkpoint_path),
-        legacy_checkpoint_sha256=moe.file_sha256(checkpoint_path),
+        legacy_checkpoint_sha256=actual_checkpoint_sha,
     )
 
 
@@ -683,11 +696,13 @@ def _reuse_or_train_full(
     prepared: PreparedSingleContext,
     cfg: moe.MoEConfig,
     reuse_full_result_json: str | Path | None,
+    reuse_full_checkpoint_sha256: str | None,
 ) -> VariantRun:
     if reuse_full_result_json is None:
         return _train_evaluate_variant(prepared, cfg, PRIMARY_MODEL_ID)
     reused = load_reusable_single_full(
         reuse_full_result_json,
+        expected_checkpoint_sha256=reuse_full_checkpoint_sha256,
         current_manifest=prepared.input_manifest,
         baseline_state_hash=prepared.baseline_state_hash,
         cfg=cfg,
@@ -713,6 +728,7 @@ def _reuse_or_train_full(
         "legacy_source_revision": reused.legacy_source_revision,
         "legacy_checkpoint": reused.legacy_checkpoint,
         "legacy_checkpoint_sha256": reused.legacy_checkpoint_sha256,
+        "trusted_checkpoint_sha256": reuse_full_checkpoint_sha256,
         "validation_metric_round_trip": True,
     }
     diagnostics = {
@@ -965,11 +981,17 @@ def run_experiment(
     cfg: moe.MoEConfig | None = None,
     *,
     reuse_full_result_json: str | Path | None = None,
+    reuse_full_checkpoint_sha256: str | None = None,
 ) -> pd.DataFrame:
     cfg = validate_single_config(cfg or configure_single_run("dunnhumby"))
     prepared = _prepare_validation_context(cfg)
     rows = [prepared.baseline_row]
-    full = _reuse_or_train_full(prepared, cfg, reuse_full_result_json)
+    full = _reuse_or_train_full(
+        prepared,
+        cfg,
+        reuse_full_result_json,
+        reuse_full_checkpoint_sha256,
+    )
     rows.extend(full.rows)
     selected, selection_success, selection_tables = _select_models(
         rows, prepared.baseline_metrics, (PRIMARY_MODEL_ID,)
