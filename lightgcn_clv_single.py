@@ -27,9 +27,21 @@ ALL_SINGLE_MODELS = (PRIMARY_MODEL_ID, *REQUIRED_CONTROLS, *MECHANISM_CONTROLS)
 CODE_VERSION = "clv-single-identification-v1.0"
 LAMBDA_GRID = (0.0, 0.1, 0.25, 0.5, 1.0, 2.0)
 ACCURACY_TOLERANCE = 0.01
+HM_60DAY_FROZEN = {
+    "window_days": 60,
+    "seed_list": (42,),
+    "input_days": 14,
+    "target_days": 7,
+    "anchor_offsets": (21, 14, 7),
+    "eval_test": False,
+    "eval_holdout": False,
+    "lambda_eval": LAMBDA_GRID,
+    "accuracy_tolerance": ACCURACY_TOLERANCE,
+}
 REUSE_CONFIG_KEYS = (
     "dataset",
     "seed_list",
+    "window_days",
     "input_days",
     "target_days",
     "anchor_offsets",
@@ -166,6 +178,13 @@ def configure_single_run(dataset: str, **overrides) -> moe.MoEConfig:
     return validate_single_config(
         moe.configure_moe_run(dataset, **(defaults | overrides))
     )
+
+
+def configure_hm_60day_run(**overrides) -> moe.MoEConfig:
+    for key, expected in HM_60DAY_FROZEN.items():
+        if key in overrides and overrides[key] != expected:
+            raise ValueError(f"H&M 60-day 고정설정 변경 금지: {key}")
+    return configure_single_run("hm", **(HM_60DAY_FROZEN | overrides))
 
 
 def validate_single_config(cfg: moe.MoEConfig) -> moe.MoEConfig:
@@ -311,9 +330,10 @@ def load_reusable_single_full(
     current_config = asdict(cfg)
     saved_config = payload["config"]
     for key in REUSE_CONFIG_KEYS:
-        if key not in saved_config or not _same_json_value(
-            saved_config[key], current_config[key]
-        ):
+        saved_value = (
+            saved_config.get(key) if key == "window_days" else saved_config[key]
+        )
+        if not _same_json_value(saved_value, current_config[key]):
             raise RuntimeError(f"saved config mismatch for {key}")
     saved_base_config = payload["base_config"]
     for key in REUSE_BASE_CONFIG_KEYS:

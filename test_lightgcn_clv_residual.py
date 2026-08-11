@@ -84,6 +84,31 @@ def test_anchor_requires_full_635_day_history():
         residual.build_anchor_examples(_transactions(days=620), n_users=2, is_date=True)
 
 
+def test_short_window_anchors_fit_and_have_ordered_target_windows():
+    train = pd.concat(
+        [
+            _transactions(days=40),
+            pd.DataFrame(
+                [(0, 0, pd.Timestamp("2020-02-09"), 10.0, 10.0, 4, 0)],
+                columns=["u_idx", "i_idx", "t", "v", "up", "b_raw", "cat_idx"],
+            ),
+        ],
+        ignore_index=True,
+    )
+    ds = residual.build_anchor_examples(
+        train,
+        n_users=2,
+        is_date=True,
+        input_days=14,
+        target_days=7,
+        anchor_offsets=(21, 14, 7),
+    )
+    assert [anchor.offset_days for anchor in ds.anchors] == [21, 14, 7]
+    windows = [(anchor.target_start, anchor.target_end) for anchor in ds.anchors]
+    assert windows[0][1] < windows[1][0]
+    assert windows[1][1] < windows[2][0]
+
+
 def test_integer_day_and_datetime_use_identical_feature_schema():
     date_train = _transactions()
     int_train = date_train.copy()

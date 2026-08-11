@@ -253,6 +253,31 @@ def test_default_single_screening_is_seed42_validation_only():
     assert summary["loss_mode"] == "plain"
 
 
+def test_hm_60day_preset_is_validation_only_and_fits_train_window():
+    import lightgcn_clv_single as single
+
+    cfg = single.configure_hm_60day_run()
+    assert cfg.dataset == "hm"
+    assert cfg.window_days == 60
+    assert cfg.seed_list == (42,)
+    assert (cfg.input_days, cfg.target_days) == (14, 7)
+    assert cfg.anchor_offsets == (21, 14, 7)
+    assert cfg.input_days + max(cfg.anchor_offsets) == 35
+    assert not cfg.eval_test
+    assert not cfg.eval_holdout
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("window_days", 61), ("input_days", 28), ("eval_test", True)],
+)
+def test_hm_60day_preset_rejects_frozen_overrides(key, value):
+    import lightgcn_clv_single as single
+
+    with pytest.raises(ValueError, match="H&M 60-day"):
+        single.configure_hm_60day_run(**{key: value})
+
+
 def test_lambda_diagnostics_store_effective_residual_strength():
     import lightgcn_clv_single as single
 
@@ -499,6 +524,85 @@ def test_reuse_accepts_exact_legacy_full_and_relabels_rows(reuse_fixture):
     assert {row["model_id"] for row in reused.rows} == {"single_full"}
     assert tuple(row["lambda"] for row in reused.rows) == reuse_fixture.cfg.lambda_eval
     assert reused.result_json_sha256
+
+
+def test_reuse_treats_missing_legacy_window_as_full_window(reuse_fixture):
+    import lightgcn_clv_single as single
+
+    payload = json.loads(reuse_fixture.result_json.read_text())
+    del payload["config"]["window_days"]
+    reuse_fixture.result_json.write_text(json.dumps(payload))
+
+    reused = single.load_reusable_single_full(
+        reuse_fixture.result_json,
+        expected_checkpoint_sha256=reuse_fixture.checkpoint_sha256,
+        current_manifest=reuse_fixture.current_manifest,
+        baseline_state_hash=reuse_fixture.base_hash,
+        cfg=reuse_fixture.cfg,
+        base_cfg=reuse_fixture.base_cfg,
+        context=reuse_fixture.context,
+        data=reuse_fixture.data,
+    )
+    assert {row["model_id"] for row in reused.rows} == {"single_full"}
+
+
+def test_reuse_rejects_full_window_result_for_short_window_config(reuse_fixture):
+    import lightgcn_clv_single as single
+
+    short_cfg = dataclasses.replace(reuse_fixture.cfg, window_days=60)
+    with pytest.raises(RuntimeError, match="saved config mismatch for window_days"):
+        single.load_reusable_single_full(
+            reuse_fixture.result_json,
+            expected_checkpoint_sha256=reuse_fixture.checkpoint_sha256,
+            current_manifest=reuse_fixture.current_manifest,
+            baseline_state_hash=reuse_fixture.base_hash,
+            cfg=short_cfg,
+            base_cfg=reuse_fixture.base_cfg,
+            context=reuse_fixture.context,
+            data=reuse_fixture.data,
+        )
+
+
+def test_reuse_accepts_exact_short_window_result(reuse_fixture):
+    import lightgcn_clv_single as single
+
+    short_cfg = dataclasses.replace(reuse_fixture.cfg, window_days=60)
+    short_base_cfg = reuse_fixture.base_cfg | {"WINDOW_DAYS": 60}
+    payload = json.loads(reuse_fixture.result_json.read_text())
+    payload["config"]["window_days"] = 60
+    payload["base_config"]["WINDOW_DAYS"] = 60
+    reuse_fixture.result_json.write_text(json.dumps(payload))
+
+    reused = single.load_reusable_single_full(
+        reuse_fixture.result_json,
+        expected_checkpoint_sha256=reuse_fixture.checkpoint_sha256,
+        current_manifest=reuse_fixture.current_manifest,
+        baseline_state_hash=reuse_fixture.base_hash,
+        cfg=short_cfg,
+        base_cfg=short_base_cfg,
+        context=reuse_fixture.context,
+        data=reuse_fixture.data,
+    )
+    assert {row["model_id"] for row in reused.rows} == {"single_full"}
+
+
+def test_window_changes_result_fingerprint_and_m1_checkpoint_hash():
+    import lightgcn_clv_moe as moe
+    import lightgcn_clv_single as single
+    import lightgcn_clv_v3 as v3
+
+    full_cfg = single.configure_single_run("hm")
+    short_cfg = single.configure_hm_60day_run()
+    full_base_cfg = moe._pure_m1_config(full_cfg, "/tmp/m1-hm")
+    short_base_cfg = moe._pure_m1_config(short_cfg, "/tmp/m1-hm")
+    manifest = {"transactions": {"path": "/tx", "bytes": 2, "sha256": "aa"}}
+
+    assert moe._result_fingerprint(full_cfg, full_base_cfg, manifest) != moe._result_fingerprint(
+        short_cfg, short_base_cfg, manifest
+    )
+    assert v3.cfg_hash(full_base_cfg, v3.DCFG, "pref_only", 42) != v3.cfg_hash(
+        short_base_cfg, v3.DCFG, "pref_only", 42
+    )
 
 
 def test_reuse_rejects_metric_round_trip_mismatch(reuse_fixture):
