@@ -425,3 +425,17 @@ def test_run_experiment_revalidates_before_data_access(monkeypatch):
     )
     with pytest.raises(ValueError, match="seed 42"):
         single.run_experiment(bad)
+
+
+def test_colab_has_pinned_source_preflight_gate_and_final_decision():
+    notebook = json.loads(Path("clv_single_adapter_colab.ipynb").read_text())
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+    assert "configure_single_run" in source
+    assert "preflight_summary" in source
+    assert "reuse_full_result_json" in source
+    assert "ACKNOWLEDGE_HIGH_COST = False" in source
+    assert "assert ACKNOWLEDGE_HIGH_COST" in source
+    assert "screening_decision" in source
+    assert "eval_test=False" in source and "eval_holdout=False" in source
