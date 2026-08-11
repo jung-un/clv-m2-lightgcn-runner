@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,9 @@ def test_colab_has_only_two_presets_four_models_and_no_acknowledgement_gate():
     assert "DATASET_PRESET = 'hm_w60'" in source
     assert "'dunnhumby'" in source
     assert "ACKNOWLEDGE_HIGH_COST" not in source
+    reviewed = re.search(r"REVIEWED_SHA = '([0-9a-f]{40})'", source)
+    assert reviewed is not None
+    assert reviewed.group(1) == "cd1bb457a3e78b420539979d41c5ba8f5cc2ac70"
     for model_id in (
         "dual_clv_fixed",
         "dual_shuffled_gate",
