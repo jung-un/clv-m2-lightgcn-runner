@@ -1,6 +1,107 @@
 import dataclasses
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
+
+
+@dataclass
+class ReuseFixture:
+    result_json: Path
+    current_manifest: dict
+    base_hash: str
+    cfg: object
+    base_cfg: dict
+    context: dict
+    data: dict
+    rows_by_lambda: dict
+
+
+def _reuse_metric_row(lam):
+    row = {
+        "seed": 42,
+        "model_id": "single_adapter",
+        "split": "val",
+        "lambda": lam,
+        "role": "control",
+        "revenue@10": 1.0 + 0.01 * lam,
+        "arp@10": 0.2,
+    }
+    for k in (10, 20, 50):
+        row[f"recall@{k}"] = 0.1
+        row[f"ndcg@{k}"] = 0.1
+        row[f"n_distinct@{k}"] = 3
+        row[f"exposure_entropy@{k}"] = 1.0
+        row[f"eff_catalog@{k}"] = 2.7
+        row[f"top10_share@{k}"] = 0.5
+        row[f"top100_share@{k}"] = 1.0
+    return row
+
+
+@pytest.fixture
+def reuse_fixture(tmp_path, monkeypatch):
+    import lightgcn_clv_moe as moe
+    import lightgcn_clv_single as single
+
+    cfg = single.configure_single_run("dunnhumby", out_dir=str(tmp_path))
+    manifest = {
+        "transactions": {"path": "/tx", "bytes": 2, "sha256": "aa"},
+        "item_metadata": {"path": "/item", "bytes": 2, "sha256": "bb"},
+    }
+    ev_all = np.array([1.0, 2.0], dtype=np.float32)
+    checkpoint = tmp_path / "single_adapter.pt"
+    torch.save({"ev_all": ev_all}, checkpoint)
+    rows = {float(lam): _reuse_metric_row(float(lam)) for lam in cfg.lambda_eval}
+    payload = {
+        "source_revision": "legacy-revision",
+        "input_manifest": manifest,
+        "config": asdict(cfg),
+        "baseline_state_hashes": {"42": "base-state"},
+        "feature_schema": {
+            "user": ["u0"],
+            "item_numeric": ["i0"],
+        },
+        "checkpoint_paths": {"single_adapter_s42": str(checkpoint)},
+        "absolute_rows": list(rows.values()),
+        "training": {"single_adapter_s42": {"base_updates_at_best": 3}},
+        "moe_diagnostics": {
+            "single_adapter_s42": {"parameter_match_ratio": 1.0}
+        },
+    }
+    result_json = tmp_path / "legacy.json"
+    result_json.write_text(json.dumps(payload), encoding="utf-8")
+    context = {
+        "artifact": SimpleNamespace(ev_all=ev_all),
+        "user_profile": SimpleNamespace(feature_names=("u0",)),
+        "item_profile": SimpleNamespace(numeric_names=("i0",)),
+        "caches": {"val": object()},
+    }
+    monkeypatch.setattr(moe, "load_moe_checkpoint", lambda *args, **kwargs: object())
+
+    def fake_flat(model, lam, *args, **kwargs):
+        row = rows[float(lam)]
+        metrics = {
+            key: value
+            for key, value in row.items()
+            if key not in {"seed", "model_id", "split", "lambda", "role"}
+        }
+        return metrics, None
+
+    monkeypatch.setattr(moe, "_flat_evaluation", fake_flat)
+    return ReuseFixture(
+        result_json=result_json,
+        current_manifest=manifest,
+        base_hash="base-state",
+        cfg=cfg,
+        base_cfg={"K_LIST": [10, 20, 50]},
+        context=context,
+        data={"n_items": 2},
+        rows_by_lambda=rows,
+    )
 
 
 def test_default_single_screening_is_seed42_validation_only():
@@ -108,4 +209,78 @@ def test_validate_rejects_changed_lambda_grid():
     with pytest.raises(ValueError, match="lambda grid"):
         single.validate_single_config(
             dataclasses.replace(cfg, lambda_eval=(0.0, 1.0))
+        )
+
+
+def test_reuse_rejects_input_manifest_mismatch(reuse_fixture):
+    import lightgcn_clv_single as single
+
+    fixture = reuse_fixture
+    changed = fixture.current_manifest | {
+        "transactions": {"path": "/x", "bytes": 1, "sha256": "changed"}
+    }
+    with pytest.raises(RuntimeError, match="input manifest"):
+        single.load_reusable_single_full(
+            fixture.result_json,
+            current_manifest=changed,
+            baseline_state_hash=fixture.base_hash,
+            cfg=fixture.cfg,
+            base_cfg=fixture.base_cfg,
+            context=fixture.context,
+            data=fixture.data,
+        )
+
+
+def test_reuse_rejects_m1_state_or_feature_schema_mismatch(reuse_fixture):
+    import lightgcn_clv_single as single
+
+    with pytest.raises(RuntimeError, match="M1 state"):
+        single.load_reusable_single_full(
+            reuse_fixture.result_json,
+            current_manifest=reuse_fixture.current_manifest,
+            baseline_state_hash="wrong",
+            cfg=reuse_fixture.cfg,
+            base_cfg=reuse_fixture.base_cfg,
+            context=reuse_fixture.context,
+            data=reuse_fixture.data,
+        )
+
+
+def test_reuse_accepts_exact_legacy_full_and_relabels_rows(reuse_fixture):
+    import lightgcn_clv_single as single
+
+    reused = single.load_reusable_single_full(
+        reuse_fixture.result_json,
+        current_manifest=reuse_fixture.current_manifest,
+        baseline_state_hash=reuse_fixture.base_hash,
+        cfg=reuse_fixture.cfg,
+        base_cfg=reuse_fixture.base_cfg,
+        context=reuse_fixture.context,
+        data=reuse_fixture.data,
+    )
+    assert {row["model_id"] for row in reused.rows} == {"single_full"}
+    assert tuple(row["lambda"] for row in reused.rows) == reuse_fixture.cfg.lambda_eval
+    assert reused.result_json_sha256
+
+
+def test_reuse_rejects_metric_round_trip_mismatch(reuse_fixture):
+    import lightgcn_clv_single as single
+
+    payload = json.loads(reuse_fixture.result_json.read_text())
+    row = next(
+        row
+        for row in payload["absolute_rows"]
+        if row["model_id"] == "single_adapter"
+    )
+    row["revenue@10"] += 0.01
+    reuse_fixture.result_json.write_text(json.dumps(payload))
+    with pytest.raises(RuntimeError, match="metric round-trip"):
+        single.load_reusable_single_full(
+            reuse_fixture.result_json,
+            current_manifest=reuse_fixture.current_manifest,
+            baseline_state_hash=reuse_fixture.base_hash,
+            cfg=reuse_fixture.cfg,
+            base_cfg=reuse_fixture.base_cfg,
+            context=reuse_fixture.context,
+            data=reuse_fixture.data,
         )
