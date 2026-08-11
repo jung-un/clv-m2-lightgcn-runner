@@ -10,6 +10,23 @@ import torch.nn.functional as F
 from clv_moe_features import ItemProfileArtifact, UserProfileArtifact
 
 
+SINGLE_VARIANTS = frozenset(
+    {
+        "single_full",
+        "single_zero_user",
+        "single_shuffled_user",
+        "single_zero_item",
+        "single_base_only",
+    }
+)
+
+
+def canonical_single_variant(control: str) -> str | None:
+    if control == "single_adapter":
+        return "single_full"
+    return control if control in SINGLE_VARIANTS else None
+
+
 class EmbeddingExpert(nn.Module):
     def __init__(
         self,
@@ -38,7 +55,13 @@ class EmbeddingExpert(nn.Module):
 class CLVMixtureEmbeddingModel(nn.Module):
     """Mix expert embedding spaces with a user-level CLV behavior gate."""
 
-    CONTROLS = {"clv", "constant_gate", "shuffled_clv", "single_adapter"}
+    CONTROLS = {
+        "clv",
+        "constant_gate",
+        "shuffled_clv",
+        "single_adapter",
+        *SINGLE_VARIANTS,
+    }
 
     def __init__(
         self,
@@ -60,22 +83,23 @@ class CLVMixtureEmbeddingModel(nn.Module):
             raise ValueError("expert_count는 1 이상이어야 합니다")
         self.base_model = base_model
         self.control = control
+        self.single_variant = canonical_single_variant(control)
+        is_single = self.single_variant is not None
         requested_expert_count = int(expert_count)
-        self.expert_count = 1 if control == "single_adapter" else requested_expert_count
+        self.expert_count = 1 if is_single else requested_expert_count
         self.expert_dim = int(expert_dim)
         values = torch.as_tensor(user_profile.values, dtype=torch.float32)
         valid_user = torch.as_tensor(user_profile.valid_user, dtype=torch.bool)
-        item_numeric = torch.as_tensor(item_profile.numeric, dtype=torch.float32)
-        item_categories = torch.as_tensor(item_profile.category_ids, dtype=torch.long)
+        item_numeric = torch.as_tensor(item_profile.numeric, dtype=torch.float32).clone()
+        item_categories = torch.as_tensor(
+            item_profile.category_ids, dtype=torch.long
+        ).clone()
         valid_item = torch.as_tensor(item_profile.valid_item, dtype=torch.bool)
         self.register_buffer("original_profile", values.clone())
         self.register_buffer("has_profile", valid_user)
-        self.register_buffer("item_numeric", item_numeric)
-        self.register_buffer("item_category_ids", item_categories)
-        self.register_buffer("valid_item", valid_item)
 
         routed = values.clone()
-        if control == "shuffled_clv":
+        if control == "shuffled_clv" or self.single_variant == "single_shuffled_user":
             generator = torch.Generator(device="cpu")
             generator.manual_seed(seed)
             valid_indices = torch.where(valid_user)[0]
@@ -84,7 +108,15 @@ class CLVMixtureEmbeddingModel(nn.Module):
                     torch.randperm(len(valid_indices), generator=generator)
                 ]
                 routed[valid_indices] = values[permutation]
+        if self.single_variant in {"single_zero_user", "single_base_only"}:
+            routed.zero_()
+        if self.single_variant in {"single_zero_item", "single_base_only"}:
+            item_numeric.zero_()
+            item_categories.zero_()
         self.register_buffer("routed_profile", routed)
+        self.register_buffer("item_numeric", item_numeric)
+        self.register_buffer("item_category_ids", item_categories)
+        self.register_buffer("valid_item", valid_item)
 
         base_user, base_item, *_ = self.base_model.embeddings(need_value=False)
         user_input_dim = int(base_user.shape[1] + values.shape[1])
@@ -104,7 +136,7 @@ class CLVMixtureEmbeddingModel(nn.Module):
             + category_parameters
         )
         selected_hidden = expert_hidden_dim
-        if control == "single_adapter":
+        if is_single:
             selected_hidden = min(
                 range(1, 513),
                 key=lambda hidden: abs(
@@ -139,7 +171,7 @@ class CLVMixtureEmbeddingModel(nn.Module):
             )
             self.gate_net = (
                 None
-                if control in {"single_adapter", "constant_gate"}
+                if is_single or control == "constant_gate"
                 else nn.Sequential(
                     nn.Linear(values.shape[1], 32),
                     nn.GELU(),
@@ -164,7 +196,7 @@ class CLVMixtureEmbeddingModel(nn.Module):
         return [parameter for parameter in self.parameters() if id(parameter) not in base_ids]
 
     def routing_weights(self, users: torch.Tensor) -> torch.Tensor:
-        if self.control == "single_adapter":
+        if self.single_variant is not None:
             return torch.ones(
                 (len(users), 1), device=self.routed_profile.device, dtype=torch.float32
             )

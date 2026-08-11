@@ -46,6 +46,89 @@ def _model(control="clv", seed=42, invalid_last=False, base=None):
     )
 
 
+def _single(control, seed=42):
+    return _model(control=control, seed=seed)
+
+
+def test_single_full_is_exact_legacy_single_adapter_alias():
+    legacy = _single("single_adapter")
+    full = _single("single_full")
+    assert legacy.single_variant == full.single_variant == "single_full"
+    torch.testing.assert_close(legacy.routed_profile, full.routed_profile)
+    torch.testing.assert_close(legacy.item_numeric, full.item_numeric)
+    torch.testing.assert_close(
+        legacy.score_all(torch.arange(4), 1.0),
+        full.score_all(torch.arange(4), 1.0),
+    )
+
+
+def test_single_zero_user_preserves_mask_and_zeros_only_user_profile():
+    full = _single("single_full")
+    zero = _single("single_zero_user")
+    torch.testing.assert_close(zero.routed_profile, torch.zeros_like(zero.routed_profile))
+    torch.testing.assert_close(zero.item_numeric, full.item_numeric)
+    assert torch.equal(zero.has_profile, full.has_profile)
+
+
+def test_single_zero_item_preserves_mask_and_zeros_item_side_features():
+    full = _single("single_full")
+    zero = _single("single_zero_item")
+    torch.testing.assert_close(zero.item_numeric, torch.zeros_like(zero.item_numeric))
+    assert torch.equal(zero.item_category_ids, torch.zeros_like(zero.item_category_ids))
+    assert torch.equal(zero.valid_item, full.valid_item)
+    torch.testing.assert_close(zero.routed_profile, full.routed_profile)
+
+
+def test_single_base_only_zeros_both_added_inputs_without_disabling_residual():
+    model = _single("single_base_only")
+    assert torch.count_nonzero(model.routed_profile) == 0
+    assert torch.count_nonzero(model.item_numeric) == 0
+    assert torch.count_nonzero(model.item_category_ids) == 0
+    assert model.has_profile.all() and model.valid_item.all()
+    assert not torch.equal(
+        model.score_all(torch.arange(4), 1.0),
+        model.base_score_all(torch.arange(4)),
+    )
+
+
+def test_single_shuffled_user_is_seeded_permutation_of_valid_profiles():
+    full = _single("single_full")
+    a = _single("single_shuffled_user", seed=42)
+    b = _single("single_shuffled_user", seed=42)
+    torch.testing.assert_close(a.routed_profile, b.routed_profile)
+    assert not torch.equal(a.routed_profile, full.routed_profile)
+    assert sorted(a.routed_profile[:, 0].tolist()) == sorted(
+        full.routed_profile[:, 0].tolist()
+    )
+
+
+def test_all_single_variants_have_identical_parameter_names_and_shapes():
+    controls = [
+        "single_full",
+        "single_zero_user",
+        "single_shuffled_user",
+        "single_zero_item",
+        "single_base_only",
+    ]
+    signatures = []
+    for control in controls:
+        model = _single(control)
+        signatures.append(
+            [
+                (name, tuple(parameter.shape))
+                for name, parameter in model.named_parameters()
+            ]
+        )
+        assert model.expert_count == 1
+        torch.testing.assert_close(
+            model.score_all(torch.arange(4), 0.0),
+            model.base_score_all(torch.arange(4)),
+            rtol=0,
+            atol=0,
+        )
+    assert signatures.count(signatures[0]) == len(signatures)
+
+
 def test_three_experts_generate_user_and_item_embeddings():
     model = _model()
     user_experts, item_experts, gate = model.expert_embeddings(torch.arange(4))
