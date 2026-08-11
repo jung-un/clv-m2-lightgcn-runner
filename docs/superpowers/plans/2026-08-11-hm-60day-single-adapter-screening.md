@@ -424,4 +424,3 @@
 - [ ] **Step 6: 사용자에게 실행 경계 인계**
 
   다운로드할 notebook의 절대 경로와 GitHub/Colab 링크를 제공한다. `ACKNOWLEDGE_HIGH_COST=False` 상태에서는 학습이 시작되지 않으며, 사용자가 preflight 전체를 한 번 검토한 뒤에만 `True`로 바꾸도록 안내한다. 고비용 결과가 없으므로 성능 개선 여부는 보고하지 않는다.
-
