@@ -115,6 +115,7 @@ class PreparedSingleContext:
     encoder_checkpoint: str
     m1_checkpoint: str
     run_fingerprint: str
+    anchor_diagnostics: tuple[dict, ...]
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,32 @@ def array_sha256(values) -> str:
     array = np.ascontiguousarray(np.asarray(values))
     payload = array.dtype.str.encode() + str(array.shape).encode() + array.tobytes()
     return hashlib.sha256(payload).hexdigest()
+
+
+def summarize_anchor_dataset(
+    dataset: moe.residual.AnchorDataset,
+) -> tuple[dict, ...]:
+    """Return JSON-safe train-only input diagnostics for each encoder anchor."""
+    observed_days_index = moe.residual.NUMERIC_FEATURES.index("observed_days")
+    summaries = []
+    for anchor in dataset.anchors:
+        observed_days = anchor.numeric[:, observed_days_index]
+        summaries.append(
+            {
+                "offset_days": int(anchor.offset_days),
+                "n_users": int(len(anchor.user_ids)),
+                "observation_start": str(anchor.observation_start),
+                "observation_end": str(anchor.observation_end),
+                "target_start": str(anchor.target_start),
+                "target_end": str(anchor.target_end),
+                "observed_days_p10": float(np.quantile(observed_days, 0.1)),
+                "observed_days_median": float(np.quantile(observed_days, 0.5)),
+                "observed_days_p90": float(np.quantile(observed_days, 0.9)),
+                "purchase_rate": float(np.mean(anchor.purchase_target)),
+                "future_amount_mean": float(np.mean(anchor.amount_target)),
+            }
+        )
+    return tuple(summaries)
 
 
 def _variant_audit(
@@ -526,6 +553,7 @@ def _prepare_validation_context(cfg: moe.MoEConfig) -> PreparedSingleContext:
         cfg.target_days,
         cfg.anchor_offsets,
     )
+    anchor_diagnostics = summarize_anchor_dataset(anchors)
     snapshot = moe.residual.build_final_snapshot(
         data["train"], data["n_users"], v3.DCFG["is_date"], cfg.input_days
     )
@@ -547,6 +575,7 @@ def _prepare_validation_context(cfg: moe.MoEConfig) -> PreparedSingleContext:
             "ev_all": artifact.ev_all,
             "best_epoch": artifact.best_epoch,
             "diagnostics": artifact.diagnostics,
+            "anchor_diagnostics": anchor_diagnostics,
         },
         encoder_path,
     )
@@ -629,6 +658,7 @@ def _prepare_validation_context(cfg: moe.MoEConfig) -> PreparedSingleContext:
         encoder_checkpoint=str(encoder_path),
         m1_checkpoint=str(m1_checkpoint),
         run_fingerprint=run_fingerprint,
+        anchor_diagnostics=anchor_diagnostics,
     )
 
 
@@ -972,6 +1002,7 @@ def _persist_result(
         "encoder_diagnostics": {
             "42": getattr(prepared.context["artifact"], "diagnostics", {})
         },
+        "anchor_diagnostics": list(getattr(prepared, "anchor_diagnostics", ())),
         "training": training,
         "diagnostics": diagnostics,
         "checkpoint_paths": checkpoints,

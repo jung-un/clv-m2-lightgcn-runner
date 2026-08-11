@@ -189,6 +189,11 @@ def _install_tiny_runner_stubs(monkeypatch, tmp_path, full_revenue):
             "artifact": SimpleNamespace(diagnostics={}),
         },
         source_revision="test-revision",
+        anchor_diagnostics=(
+            {"offset_days": 21, "n_users": 2},
+            {"offset_days": 14, "n_users": 2},
+            {"offset_days": 7, "n_users": 2},
+        ),
     )
     monkeypatch.setattr(single, "_prepare_validation_context", lambda cfg: prepared)
 
@@ -276,6 +281,46 @@ def test_hm_60day_preset_rejects_frozen_overrides(key, value):
 
     with pytest.raises(ValueError, match="H&M 60-day"):
         single.configure_hm_60day_run(**{key: value})
+
+
+def test_anchor_diagnostics_summarize_observation_and_future_targets():
+    import lightgcn_clv_residual as residual
+    import lightgcn_clv_single as single
+
+    observed_days = residual.NUMERIC_FEATURES.index("observed_days")
+    numeric = np.zeros((2, len(residual.NUMERIC_FEATURES)), dtype=np.float32)
+    numeric[:, observed_days] = [4.0, 14.0]
+    anchor = residual.AnchorExamples(
+        offset_days=21,
+        observation_start="2020-01-01",
+        observation_end="2020-01-14",
+        target_start="2020-01-15",
+        target_end="2020-01-21",
+        user_ids=np.array([3, 8]),
+        numeric=numeric,
+        valid=np.ones_like(numeric, dtype=bool),
+        purchase_target=np.array([0.0, 1.0], dtype=np.float32),
+        amount_target=np.array([0.0, 30.0], dtype=np.float32),
+    )
+    dataset = residual.AnchorDataset(
+        anchors=[anchor], train_end="2020-01-21", n_users=10
+    )
+
+    assert single.summarize_anchor_dataset(dataset) == (
+        {
+            "offset_days": 21,
+            "n_users": 2,
+            "observation_start": "2020-01-01",
+            "observation_end": "2020-01-14",
+            "target_start": "2020-01-15",
+            "target_end": "2020-01-21",
+            "observed_days_p10": 5.0,
+            "observed_days_median": 9.0,
+            "observed_days_p90": 13.0,
+            "purchase_rate": 0.5,
+            "future_amount_mean": 15.0,
+        },
+    )
 
 
 def test_lambda_diagnostics_store_effective_residual_strength():
@@ -674,6 +719,11 @@ def test_runner_persists_authoritative_json_and_exposure_metrics(
     cfg = single.configure_single_run("dunnhumby", out_dir=str(tmp_path))
     frame = single.run_experiment(cfg)
     payload = json.loads(next(tmp_path.glob("clv_single_*.json")).read_text())
+    assert [row["offset_days"] for row in payload["anchor_diagnostics"]] == [
+        21,
+        14,
+        7,
+    ]
     assert payload["screening_decision"] == frame.attrs["screening_decision"]
     assert (
         payload["variant_definitions"]["single_zero_user"]["user_profile"]
