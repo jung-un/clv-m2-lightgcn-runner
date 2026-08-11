@@ -102,7 +102,7 @@ def test_colab_runs_both_datasets_sequentially_with_four_models():
     assert "ACKNOWLEDGE_HIGH_COST" not in source
     reviewed = re.search(r"REVIEWED_SHA = '([0-9a-f]{40})'", source)
     assert reviewed is not None
-    assert reviewed.group(1) == "cd1bb457a3e78b420539979d41c5ba8f5cc2ac70"
+    assert reviewed.group(1) == "7049d363137b66f190603dcef83a529585d5ff5c"
     for model_id in (
         "dual_clv_fixed",
         "dual_shuffled_user",
