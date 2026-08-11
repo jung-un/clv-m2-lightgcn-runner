@@ -1080,7 +1080,7 @@ def test_hm_w60_colab_has_pinned_preset_preflight_gate_and_result_views():
         for index, cell in indexed_code_cells
         if "REVIEWED_SHA" in cell
     )
-    assert "REVIEWED_SHA = '95cc4ea3b24f13581f215e595b0d8bbdf6b93338'" in clone_cell
+    assert "REVIEWED_SHA = '3807e000df923ea857dee716cb60703b7c469902'" in clone_cell
     assert re.search(r"REVIEWED_SHA = '[0-9a-f]{40}'", clone_cell)
     assert "assert not REPO_DIR.exists()" in clone_cell
     assert "['git', 'clone', REPO_URL, str(REPO_DIR)]" in clone_cell

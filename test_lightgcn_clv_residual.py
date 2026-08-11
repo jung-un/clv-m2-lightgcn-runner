@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -295,6 +296,26 @@ def test_configure_screening_is_validation_only_and_uses_two_year_window():
     assert cfg.eval_test is False and cfg.eval_holdout is False
     assert cfg.input_days == 365 and cfg.target_days == 90
     assert cfg.lambda_eval == (0.0, 0.05, 0.1, 0.25, 0.5, 1.0)
+
+
+def test_residual_colab_pins_reviewed_detached_commit_and_protected_screening():
+    notebook = json.loads(Path("clv_residual_colab.ipynb").read_text())
+    code = "\n".join(
+        "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if cell["cell_type"] == "code"
+    )
+
+    assert "REVIEWED_SHA = '3807e000df923ea857dee716cb60703b7c469902'" in code
+    assert re.search(r"REVIEWED_SHA = '[0-9a-f]{40}'", code)
+    assert "'checkout', '--detach', REVIEWED_SHA" in code
+    assert "'rev-parse', 'HEAD'" in code
+    assert "assert actual_sha == REVIEWED_SHA" in code
+    assert "GIT_REF" not in code
+    assert " switch " not in code
+    assert "pull --ff-only" not in code
+    assert "ACKNOWLEDGE_HIGH_COST = False" in code
+    assert "eval_test=False" in code and "eval_holdout=False" in code
 
 
 def _provenance_base_config():
