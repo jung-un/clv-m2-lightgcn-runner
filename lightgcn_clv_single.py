@@ -26,6 +26,7 @@ MECHANISM_CONTROLS = ("single_zero_item",)
 ALL_SINGLE_MODELS = (PRIMARY_MODEL_ID, *REQUIRED_CONTROLS, *MECHANISM_CONTROLS)
 CODE_VERSION = "clv-single-identification-v1.0"
 LAMBDA_GRID = (0.0, 0.1, 0.25, 0.5, 1.0, 2.0)
+ACCURACY_TOLERANCE = 0.01
 REUSE_CONFIG_KEYS = (
     "dataset",
     "seed_list",
@@ -49,6 +50,30 @@ REUSE_CONFIG_KEYS = (
     "lambda_eval",
     "accuracy_tolerance",
 )
+REUSE_BASE_CONFIG_KEYS = (
+    "DIM",
+    "N_LAYERS",
+    "BATCH_SIZE",
+    "EPOCHS",
+    "EARLY_STOP",
+    "LR",
+    "REG_MODE",
+    "PREF_REG",
+    "WD",
+    "NEG_MODE",
+    "WINDOW_DAYS",
+    "VAL_DAYS",
+    "TEST_DAYS",
+    "HOLDOUT_DAYS",
+    "MIN_USER_INTER",
+    "MIN_ITEM_INTER",
+    "K_LIST",
+    "SEG_EDGES",
+    "EVAL_BATCH",
+    "GRAPH_MODE",
+    "LOSS_MODE",
+    "N_BOOT",
+)
 
 
 @dataclass(frozen=True)
@@ -60,6 +85,7 @@ class ReusableSingleFull:
     result_json_sha256: str
     legacy_source_revision: str
     legacy_checkpoint: str
+    legacy_checkpoint_sha256: str
 
 
 @dataclass
@@ -96,6 +122,36 @@ def array_sha256(values) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _variant_audit(
+    model: CLVMixtureEmbeddingModel, starting_base_state_hash: str
+) -> dict:
+    def tensor_hash(value: torch.Tensor) -> str:
+        return array_sha256(value.detach().cpu().numpy())
+
+    adapter_count = sum(parameter.numel() for parameter in model.adapter_parameters())
+    base_count = sum(parameter.numel() for parameter in model.base_parameters())
+    return {
+        "starting_base_state_hash": starting_base_state_hash,
+        "original_profile_sha256": tensor_hash(model.original_profile),
+        "routed_profile_sha256": tensor_hash(model.routed_profile),
+        "item_numeric_sha256": tensor_hash(model.item_numeric),
+        "item_category_ids_sha256": tensor_hash(model.item_category_ids),
+        "has_profile_sha256": tensor_hash(model.has_profile),
+        "valid_item_sha256": tensor_hash(model.valid_item),
+        "adapter_parameter_count": int(adapter_count),
+        "base_parameter_count": int(base_count),
+        "joint_trainable_parameter_count": int(adapter_count + base_count),
+    }
+
+
+def _diagnostic_columns_for_lambda(diagnostics: dict, lam: float) -> dict:
+    columns = moe._diagnostic_columns(diagnostics)
+    columns["effective_residual_to_base_score_std"] = abs(float(lam)) * float(
+        diagnostics["residual_to_base_score_std"]
+    )
+    return columns
+
+
 def configure_single_run(dataset: str, **overrides) -> moe.MoEConfig:
     defaults = {
         "seed_list": (42,),
@@ -120,6 +176,12 @@ def validate_single_config(cfg: moe.MoEConfig) -> moe.MoEConfig:
         raise ValueError("single-adapter screening-only runner requires seed 42")
     if tuple(cfg.lambda_eval) != LAMBDA_GRID:
         raise ValueError("single-adapter lambda grid is frozen by the approved design")
+    if not np.isclose(
+        float(cfg.accuracy_tolerance), ACCURACY_TOLERANCE, rtol=0.0, atol=1e-12
+    ):
+        raise ValueError(
+            "single-adapter accuracy tolerance is frozen by the approved design"
+        )
     return cfg
 
 
@@ -204,6 +266,7 @@ def _require_reuse_payload(payload: dict) -> None:
         "source_revision",
         "input_manifest",
         "config",
+        "base_config",
         "baseline_state_hashes",
         "feature_schema",
         "checkpoint_paths",
@@ -249,6 +312,12 @@ def load_reusable_single_full(
             saved_config[key], current_config[key]
         ):
             raise RuntimeError(f"saved config mismatch for {key}")
+    saved_base_config = payload["base_config"]
+    for key in REUSE_BASE_CONFIG_KEYS:
+        if key not in saved_base_config or key not in base_cfg or not _same_json_value(
+            saved_base_config[key], base_cfg[key]
+        ):
+            raise RuntimeError(f"saved base config mismatch for {key}")
 
     expected_schema = {
         "user": list(context["user_profile"].feature_names),
@@ -269,6 +338,28 @@ def load_reusable_single_full(
         )
     except (OSError, RuntimeError) as error:
         raise RuntimeError("single_adapter checkpoint cannot be read") from error
+    expected_arrays = {
+        "user_profile": context["user_profile"].values,
+        "user_valid": context["user_profile"].valid_user,
+        "item_numeric": context["item_profile"].numeric,
+        "item_category_ids": context["item_profile"].category_ids,
+        "item_valid": context["item_profile"].valid_item,
+    }
+    for key, expected in expected_arrays.items():
+        if key not in checkpoint_payload or array_sha256(
+            checkpoint_payload[key]
+        ) != array_sha256(expected):
+            raise RuntimeError(
+                f"checkpoint feature values mismatch for {key}; refusing reuse"
+            )
+    checkpoint_schema = {
+        "user": list(checkpoint_payload.get("user_feature_names", ())),
+        "item_numeric": list(checkpoint_payload.get("item_numeric_names", ())),
+    }
+    if checkpoint_schema != expected_schema or int(
+        checkpoint_payload.get("item_n_categories", -1)
+    ) != int(context["item_profile"].n_categories):
+        raise RuntimeError("checkpoint feature schema mismatch; refusing reuse")
     if "ev_all" not in checkpoint_payload or array_sha256(
         checkpoint_payload["ev_all"]
     ) != array_sha256(context["artifact"].ev_all):
@@ -328,6 +419,7 @@ def load_reusable_single_full(
         result_json_sha256=result_sha,
         legacy_source_revision=str(payload["source_revision"]),
         legacy_checkpoint=str(checkpoint_path),
+        legacy_checkpoint_sha256=moe.file_sha256(checkpoint_path),
     )
 
 
@@ -542,7 +634,10 @@ def _train_evaluate_variant(
     )
     if moe.state_hash(prepared.context["artifact"].model) != encoder_hash:
         raise RuntimeError("single-adapter training changed the frozen encoder")
-    diagnostics = moe.moe_diagnostics(model, seed=seed)
+    diagnostics = {
+        **moe.moe_diagnostics(model, seed=seed),
+        **_variant_audit(model, prepared.baseline_state_hash),
+    }
     checkpoint = prepared.out_dir / (
         f"{model_id}_{cfg.dataset}_s{seed}_{prepared.run_fingerprint}.pt"
     )
@@ -569,7 +664,7 @@ def _train_evaluate_variant(
                 "split": "val",
                 "lambda": float(lam),
                 "role": "model" if model_id == PRIMARY_MODEL_ID else "control",
-                **moe._diagnostic_columns(diagnostics),
+                **_diagnostic_columns_for_lambda(diagnostics, float(lam)),
                 **flat,
             }
         )
@@ -617,14 +712,24 @@ def _reuse_or_train_full(
         "legacy_result_json_sha256": reused.result_json_sha256,
         "legacy_source_revision": reused.legacy_source_revision,
         "legacy_checkpoint": reused.legacy_checkpoint,
+        "legacy_checkpoint_sha256": reused.legacy_checkpoint_sha256,
         "validation_metric_round_trip": True,
     }
+    diagnostics = {
+        **reused.diagnostics,
+        **_variant_audit(reused.model, prepared.baseline_state_hash),
+    }
+    rows = tuple(
+        row
+        | _diagnostic_columns_for_lambda(diagnostics, float(row["lambda"]))
+        for row in reused.rows
+    )
     return VariantRun(
         model_id=PRIMARY_MODEL_ID,
-        rows=reused.rows,
+        rows=rows,
         per_user=per_user,
         training=reused.training,
-        diagnostics=reused.diagnostics,
+        diagnostics=diagnostics,
         checkpoint=reused.legacy_checkpoint,
         reuse_provenance=provenance,
     )
@@ -652,7 +757,7 @@ def _select_models(
             .to_dict("records")
         )
         selected_lambda, selection = moe.select_lambda(
-            mean_rows, baseline, tolerance=0.01
+            mean_rows, baseline, tolerance=ACCURACY_TOLERANCE
         )
         selected[model_id] = float(selected_lambda)
         success[model_id] = bool(selection.attrs["success"])
@@ -746,21 +851,22 @@ def _persist_result(
     frame = pd.DataFrame(rows)
     delta_records = []
     runs = {PRIMARY_MODEL_ID: full, **controls}
-    for model_id, lam in selected.items():
-        if model_id == "pref_continue":
-            per_user = getattr(prepared, "pref_continue_per_user", None)
-        else:
-            run = runs.get(model_id)
-            per_user = None if run is None else run.per_user.get(float(lam))
-        if per_user is None:
-            continue
+    delta_inputs = [
+        (model_id, float(lam), per_user)
+        for model_id, run in runs.items()
+        for lam, per_user in sorted(run.per_user.items())
+    ]
+    pref_per_user = getattr(prepared, "pref_continue_per_user", None)
+    if pref_per_user is not None:
+        delta_inputs.append(("pref_continue", 0.0, pref_per_user))
+    for model_id, lam, per_user in delta_inputs:
         for metric in ("recall", "ndcg", "revenue", "arp"):
             diff = per_user[metric] - prepared.baseline_per_user[metric]
             delta_records.append(
                 {
                     "model_id": model_id,
                     "split": "val",
-                    "lambda": float(lam),
+                    "lambda": lam,
                     "metric": metric,
                     **v3.paired_bootstrap([diff], prepared.base_cfg["N_BOOT"]),
                 }
@@ -802,6 +908,11 @@ def _persist_result(
     if pref_checkpoint:
         checkpoints["pref_continue_s42"] = pref_checkpoint
         training["pref_continue_s42"] = prepared.pref_continue_training
+    checkpoint_sha256 = {
+        key: moe.file_sha256(path)
+        for key, path in checkpoints.items()
+        if Path(path).is_file()
+    }
     payload = {
         "code_version": CODE_VERSION,
         "source_revision": prepared.source_revision,
@@ -828,6 +939,7 @@ def _persist_result(
         "training": training,
         "diagnostics": diagnostics,
         "checkpoint_paths": checkpoints,
+        "checkpoint_sha256": checkpoint_sha256,
         "reuse_provenance": full.reuse_provenance,
         "absolute_rows": frame.to_dict("records"),
         "delta": delta_records,

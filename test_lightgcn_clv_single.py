@@ -53,13 +53,56 @@ def reuse_fixture(tmp_path, monkeypatch):
         "item_metadata": {"path": "/item", "bytes": 2, "sha256": "bb"},
     }
     ev_all = np.array([1.0, 2.0], dtype=np.float32)
+    user_values = np.array([[0.5], [1.5]], dtype=np.float32)
+    user_valid = np.array([True, True])
+    item_numeric = np.array([[0.2], [0.8]], dtype=np.float32)
+    item_category_ids = np.array([1, 2], dtype=np.int64)
+    item_valid = np.array([True, True])
     checkpoint = tmp_path / "single_adapter.pt"
-    torch.save({"ev_all": ev_all}, checkpoint)
+    torch.save(
+        {
+            "ev_all": ev_all,
+            "user_profile": user_values,
+            "user_valid": user_valid,
+            "user_feature_names": ("u0",),
+            "item_numeric": item_numeric,
+            "item_category_ids": item_category_ids,
+            "item_valid": item_valid,
+            "item_numeric_names": ("i0",),
+            "item_n_categories": 3,
+        },
+        checkpoint,
+    )
+    base_cfg = {
+        "DIM": 64,
+        "N_LAYERS": 3,
+        "BATCH_SIZE": 1024,
+        "EPOCHS": 100,
+        "EARLY_STOP": 20,
+        "LR": 0.001,
+        "REG_MODE": "layer0",
+        "PREF_REG": 0.0001,
+        "WD": 0.0,
+        "NEG_MODE": "uniform",
+        "WINDOW_DAYS": None,
+        "VAL_DAYS": 30,
+        "TEST_DAYS": 30,
+        "HOLDOUT_DAYS": 30,
+        "MIN_USER_INTER": 1,
+        "MIN_ITEM_INTER": 1,
+        "K_LIST": [10, 20, 50],
+        "SEG_EDGES": [0.2, 0.8],
+        "EVAL_BATCH": 256,
+        "GRAPH_MODE": "binary",
+        "LOSS_MODE": "plain",
+        "N_BOOT": 10,
+    }
     rows = {float(lam): _reuse_metric_row(float(lam)) for lam in cfg.lambda_eval}
     payload = {
         "source_revision": "legacy-revision",
         "input_manifest": manifest,
         "config": asdict(cfg),
+        "base_config": base_cfg,
         "baseline_state_hashes": {"42": "base-state"},
         "feature_schema": {
             "user": ["u0"],
@@ -76,8 +119,18 @@ def reuse_fixture(tmp_path, monkeypatch):
     result_json.write_text(json.dumps(payload), encoding="utf-8")
     context = {
         "artifact": SimpleNamespace(ev_all=ev_all),
-        "user_profile": SimpleNamespace(feature_names=("u0",)),
-        "item_profile": SimpleNamespace(numeric_names=("i0",)),
+        "user_profile": SimpleNamespace(
+            values=user_values,
+            valid_user=user_valid,
+            feature_names=("u0",),
+        ),
+        "item_profile": SimpleNamespace(
+            numeric=item_numeric,
+            category_ids=item_category_ids,
+            valid_item=item_valid,
+            numeric_names=("i0",),
+            n_categories=3,
+        ),
         "caches": {"val": object()},
     }
     monkeypatch.setattr(moe, "load_moe_checkpoint", lambda *args, **kwargs: object())
@@ -97,7 +150,7 @@ def reuse_fixture(tmp_path, monkeypatch):
         current_manifest=manifest,
         base_hash="base-state",
         cfg=cfg,
-        base_cfg={"K_LIST": [10, 20, 50]},
+        base_cfg=base_cfg,
         context=context,
         data={"n_items": 2},
         rows_by_lambda=rows,
@@ -149,13 +202,22 @@ def _install_tiny_runner_stubs(monkeypatch, tmp_path, full_revenue):
             }
             rows.append(row)
             per_user[float(lam)] = prepared.baseline_per_user
+        checkpoint = tmp_path / f"{model_id}.pt"
+        torch.save({"model_id": model_id}, checkpoint)
         return single.VariantRun(
             model_id=model_id,
             rows=tuple(rows),
             per_user=per_user,
             training={"base_updates_at_best": 3},
-            diagnostics={"parameter_match_ratio": 1.0},
-            checkpoint=str(tmp_path / f"{model_id}.pt"),
+            diagnostics={
+                "parameter_match_ratio": 1.0,
+                "starting_base_state_hash": "base-state",
+                "routed_profile_sha256": "a" * 64,
+                "has_profile_sha256": "b" * 64,
+                "adapter_parameter_count": 10,
+                "joint_trainable_parameter_count": 20,
+            },
+            checkpoint=str(checkpoint),
             reuse_provenance=None,
         )
 
@@ -186,6 +248,20 @@ def test_default_single_screening_is_seed42_validation_only():
     assert summary["mechanism_controls"] == ["single_zero_item"]
     assert summary["graph_mode"] == "binary"
     assert summary["loss_mode"] == "plain"
+
+
+def test_lambda_diagnostics_store_effective_residual_strength():
+    import lightgcn_clv_single as single
+
+    diagnostics = {
+        "gate_entropy_mean": 0.0,
+        "residual_to_base_score_std": 0.2,
+        "parameter_match_ratio": 1.0,
+        "expert_usage_mean": [1.0],
+    }
+    columns = single._diagnostic_columns_for_lambda(diagnostics, 0.5)
+    assert columns["residual_to_base_score_std"] == 0.2
+    assert columns["effective_residual_to_base_score_std"] == 0.1
 
 
 @pytest.mark.parametrize("field", ["eval_test", "eval_holdout"])
@@ -278,6 +354,16 @@ def test_validate_rejects_changed_lambda_grid():
         )
 
 
+def test_validate_rejects_changed_accuracy_tolerance():
+    import lightgcn_clv_single as single
+
+    cfg = single.configure_single_run("dunnhumby")
+    with pytest.raises(ValueError, match="accuracy tolerance"):
+        single.validate_single_config(
+            dataclasses.replace(cfg, accuracy_tolerance=0.02)
+        )
+
+
 def test_reuse_rejects_input_manifest_mismatch(reuse_fixture):
     import lightgcn_clv_single as single
 
@@ -305,6 +391,62 @@ def test_reuse_rejects_m1_state_or_feature_schema_mismatch(reuse_fixture):
             reuse_fixture.result_json,
             current_manifest=reuse_fixture.current_manifest,
             baseline_state_hash="wrong",
+            cfg=reuse_fixture.cfg,
+            base_cfg=reuse_fixture.base_cfg,
+            context=reuse_fixture.context,
+            data=reuse_fixture.data,
+        )
+
+
+def test_reuse_rejects_base_training_config_mismatch(reuse_fixture):
+    import lightgcn_clv_single as single
+
+    changed = reuse_fixture.base_cfg | {
+        "BATCH_SIZE": reuse_fixture.base_cfg["BATCH_SIZE"] * 2
+    }
+    with pytest.raises(RuntimeError, match="base config"):
+        single.load_reusable_single_full(
+            reuse_fixture.result_json,
+            current_manifest=reuse_fixture.current_manifest,
+            baseline_state_hash=reuse_fixture.base_hash,
+            cfg=reuse_fixture.cfg,
+            base_cfg=changed,
+            context=reuse_fixture.context,
+            data=reuse_fixture.data,
+        )
+
+
+@pytest.mark.parametrize(
+    "checkpoint_key",
+    [
+        "user_profile",
+        "user_valid",
+        "item_numeric",
+        "item_category_ids",
+        "item_valid",
+    ],
+)
+def test_reuse_rejects_checkpoint_input_or_mask_mismatch(
+    reuse_fixture, checkpoint_key
+):
+    import lightgcn_clv_single as single
+
+    payload = json.loads(reuse_fixture.result_json.read_text())
+    checkpoint_path = Path(payload["checkpoint_paths"]["single_adapter_s42"])
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    changed = np.asarray(checkpoint[checkpoint_key]).copy()
+    changed.reshape(-1)[0] = (
+        not bool(changed.reshape(-1)[0])
+        if changed.dtype == np.bool_
+        else changed.reshape(-1)[0] + 1
+    )
+    checkpoint[checkpoint_key] = changed
+    torch.save(checkpoint, checkpoint_path)
+    with pytest.raises(RuntimeError, match="checkpoint feature values"):
+        single.load_reusable_single_full(
+            reuse_fixture.result_json,
+            current_manifest=reuse_fixture.current_manifest,
+            baseline_state_hash=reuse_fixture.base_hash,
             cfg=reuse_fixture.cfg,
             base_cfg=reuse_fixture.base_cfg,
             context=reuse_fixture.context,
@@ -394,9 +536,8 @@ def test_runner_persists_authoritative_json_and_exposure_metrics(
     import lightgcn_clv_single as single
 
     _install_tiny_runner_stubs(monkeypatch, tmp_path, full_revenue=1.10)
-    frame = single.run_experiment(
-        single.configure_single_run("dunnhumby", out_dir=str(tmp_path))
-    )
+    cfg = single.configure_single_run("dunnhumby", out_dir=str(tmp_path))
+    frame = single.run_experiment(cfg)
     payload = json.loads(next(tmp_path.glob("clv_single_*.json")).read_text())
     assert payload["screening_decision"] == frame.attrs["screening_decision"]
     assert (
@@ -410,6 +551,24 @@ def test_runner_persists_authoritative_json_and_exposure_metrics(
         "top10_share@10",
         "top100_share@10",
     }.issubset(payload["absolute_rows"][0])
+    full_revenue_delta_lambdas = {
+        float(row["lambda"])
+        for row in payload["delta"]
+        if row["model_id"] == "single_full" and row["metric"] == "revenue"
+    }
+    assert full_revenue_delta_lambdas == set(cfg.lambda_eval)
+    audit = payload["diagnostics"]["single_full_s42"]
+    assert audit["starting_base_state_hash"] == "base-state"
+    assert audit["adapter_parameter_count"] == 10
+    assert len(audit["routed_profile_sha256"]) == 64
+    assert set(payload["checkpoint_sha256"]) >= {
+        "single_full_s42",
+        "single_zero_user_s42",
+        "single_shuffled_user_s42",
+        "single_base_only_s42",
+        "single_zero_item_s42",
+    }
+    assert all(len(value) == 64 for value in payload["checkpoint_sha256"].values())
 
 
 def test_run_experiment_revalidates_before_data_access(monkeypatch):

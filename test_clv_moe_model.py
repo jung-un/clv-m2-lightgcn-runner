@@ -129,6 +129,21 @@ def test_all_single_variants_have_identical_parameter_names_and_shapes():
     assert signatures.count(signatures[0]) == len(signatures)
 
 
+def test_single_variant_audit_hashes_inputs_masks_and_capacity():
+    from lightgcn_clv_single import _variant_audit
+
+    model = _single("single_shuffled_user", seed=42)
+    audit = _variant_audit(model, "m1-state")
+    assert audit["starting_base_state_hash"] == "m1-state"
+    assert audit["routed_profile_sha256"] != audit["original_profile_sha256"]
+    assert len(audit["item_numeric_sha256"]) == 64
+    assert len(audit["item_category_ids_sha256"]) == 64
+    assert len(audit["has_profile_sha256"]) == 64
+    assert len(audit["valid_item_sha256"]) == 64
+    assert audit["adapter_parameter_count"] > 0
+    assert audit["joint_trainable_parameter_count"] > audit["adapter_parameter_count"]
+
+
 def test_three_experts_generate_user_and_item_embeddings():
     model = _model()
     user_experts, item_experts, gate = model.expert_embeddings(torch.arange(4))
