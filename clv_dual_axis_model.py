@@ -15,8 +15,9 @@ from clv_moe_features import UserProfileArtifact
 
 
 CONTROLS = frozenset(
-    {"dual_clv_fixed", "dual_shuffled_gate", "dual_base_only"}
+    {"dual_clv_fixed", "dual_shuffled_user", "dual_adapter_only"}
 )
+GATE_SHAPES = ("high", "equal", "low")
 
 
 @dataclass(frozen=True)
@@ -36,10 +37,10 @@ def _midrank_percentile(values: np.ndarray) -> np.ndarray:
     )
 
 
-def fixed_percentile_gates(
+def fixed_percentile_ranks(
     n_hat: np.ndarray, v_hat: np.ndarray, valid_user: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return monotone, mean-one fixed gates on valid train-history users."""
+    """Return midrank CLV-axis percentiles for valid train-history users."""
     n_hat = np.asarray(n_hat, dtype=np.float64)
     v_hat = np.asarray(v_hat, dtype=np.float64)
     valid = np.asarray(valid_user, dtype=bool)
@@ -47,11 +48,23 @@ def fixed_percentile_gates(
         raise ValueError("N_hat, V_hat, valid_user shape이 다릅니다")
     if not np.isfinite(n_hat[valid]).all() or not np.isfinite(v_hat[valid]).all():
         raise ValueError("유효 사용자의 N_hat/V_hat이 유한해야 합니다")
-    g_n = np.zeros(len(valid), np.float32)
-    g_v = np.zeros(len(valid), np.float32)
-    g_n[valid] = 2.0 * _midrank_percentile(n_hat[valid])
-    g_v[valid] = 2.0 * _midrank_percentile(v_hat[valid])
-    return g_n, g_v
+    q_n = np.zeros(len(valid), np.float32)
+    q_v = np.zeros(len(valid), np.float32)
+    q_n[valid] = _midrank_percentile(n_hat[valid])
+    q_v[valid] = _midrank_percentile(v_hat[valid])
+    return q_n, q_v
+
+
+def apply_gate_shape(percentiles: np.ndarray, shape: str) -> np.ndarray:
+    """Map percentiles to one of three pre-specified mean-one gate directions."""
+    q = np.asarray(percentiles, dtype=np.float32)
+    if shape == "high":
+        return 2.0 * q
+    if shape == "equal":
+        return np.ones_like(q)
+    if shape == "low":
+        return 2.0 * (1.0 - q)
+    raise ValueError(f"지원하지 않는 gate shape: {shape}")
 
 
 def _modal(values: pd.Series):
@@ -105,12 +118,6 @@ def build_dual_item_profiles(
     item["repeat_gap_valid"] = item["repeat_gap"].notna().astype(np.float32)
     item["repeat_gap"] = item["repeat_gap"].fillna(0.0).clip(lower=0.0)
 
-    item["user_percentile"] = _midrank_percentile(
-        item.users.to_numpy(dtype=float)
-    )
-    item["category_frequency_percentile"] = item.groupby("category")["rows"].rank(
-        pct=True, method="average"
-    )
     item["price_percentile"] = _midrank_percentile(
         item.mean_price.to_numpy(dtype=float)
     )
@@ -136,10 +143,8 @@ def build_dual_item_profiles(
     activity_numeric = _standardize(
         np.column_stack(
             [
-                item.user_percentile,
                 item.repeat_share,
                 np.log1p(item.repeat_gap),
-                item.category_frequency_percentile,
             ]
         )
     )
@@ -170,10 +175,8 @@ def build_dual_item_profiles(
         value,
         valid_item,
         (
-            "unique_buyer_percentile",
             "repeat_purchase_share",
             "log_median_repeat_gap",
-            "category_frequency_percentile",
             "repeat_gap_valid",
         ),
         (
@@ -223,8 +226,8 @@ class CLVDualAxisEmbeddingModel(nn.Module):
         base_model: nn.Module,
         user_profile: UserProfileArtifact,
         item_profile: DualItemProfile,
-        g_n: np.ndarray,
-        g_v: np.ndarray,
+        q_n: np.ndarray,
+        q_v: np.ndarray,
         *,
         control: str = "dual_clv_fixed",
         seed: int = 42,
@@ -249,26 +252,28 @@ class CLVDualAxisEmbeddingModel(nn.Module):
         user_value = values[:, value_idx].clone()
         item_activity = torch.as_tensor(item_profile.activity, dtype=torch.float32)
         item_value = torch.as_tensor(item_profile.value, dtype=torch.float32)
-        gate_n = torch.as_tensor(g_n, dtype=torch.float32).clone()
-        gate_v = torch.as_tensor(g_v, dtype=torch.float32).clone()
+        rank_n = torch.as_tensor(q_n, dtype=torch.float32).clone()
+        rank_v = torch.as_tensor(q_v, dtype=torch.float32).clone()
         valid_user = torch.as_tensor(user_profile.valid_user, dtype=torch.bool)
-        if len(gate_n) != len(values) or len(gate_v) != len(values):
+        if len(rank_n) != len(values) or len(rank_v) != len(values):
             raise ValueError("gate와 user profile 행 수가 다릅니다")
-        if control == "dual_shuffled_gate":
+        if control == "dual_shuffled_user":
             generator = torch.Generator(device="cpu")
             generator.manual_seed(seed)
             indices = torch.where(valid_user)[0]
             if len(indices) > 1:
                 source = indices[torch.randperm(len(indices), generator=generator)]
-                gate_n[indices] = gate_n[source].clone()
-                gate_v[indices] = gate_v[source].clone()
-        elif control == "dual_base_only":
+                user_activity[indices] = user_activity[source].clone()
+                user_value[indices] = user_value[source].clone()
+                rank_n[indices] = rank_n[source].clone()
+                rank_v[indices] = rank_v[source].clone()
+        elif control == "dual_adapter_only":
             user_activity.zero_()
             user_value.zero_()
             item_activity.zero_()
             item_value.zero_()
-            gate_n[valid_user] = 1.0
-            gate_v[valid_user] = 1.0
+            rank_n[valid_user] = 0.5
+            rank_v[valid_user] = 0.5
         self.register_buffer("user_activity", user_activity)
         self.register_buffer("user_value", user_value)
         self.register_buffer("item_activity", item_activity)
@@ -277,8 +282,9 @@ class CLVDualAxisEmbeddingModel(nn.Module):
         self.register_buffer(
             "valid_item", torch.as_tensor(item_profile.valid_item, dtype=torch.bool)
         )
-        self.register_buffer("g_n", gate_n)
-        self.register_buffer("g_v", gate_v)
+        self.register_buffer("q_n", rank_n)
+        self.register_buffer("q_v", rank_v)
+        self.eval_gate_shape = "equal"
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(seed)
             self.activity_expert = _AxisExpert(
@@ -296,6 +302,24 @@ class CLVDualAxisEmbeddingModel(nn.Module):
 
     def adapter_parameters(self) -> list[nn.Parameter]:
         return [*self.activity_expert.parameters(), *self.value_expert.parameters()]
+
+    def set_gate_shape(self, shape: str) -> None:
+        if shape not in GATE_SHAPES:
+            raise ValueError(f"지원하지 않는 gate shape: {shape}")
+        self.eval_gate_shape = shape
+
+    def gate_values(self, shape: str | None = None):
+        shape = shape or self.eval_gate_shape
+        if shape not in GATE_SHAPES:
+            raise ValueError(f"지원하지 않는 gate shape: {shape}")
+        if self.control == "dual_adapter_only" or shape == "equal":
+            g_n = torch.ones_like(self.q_n)
+            g_v = torch.ones_like(self.q_v)
+        elif shape == "high":
+            g_n, g_v = 2.0 * self.q_n, 2.0 * self.q_v
+        else:
+            g_n, g_v = 2.0 * (1.0 - self.q_n), 2.0 * (1.0 - self.q_v)
+        return g_n, g_v
 
     def _axis_embeddings(self, users=None, items=None):
         if users is None:
@@ -331,22 +355,26 @@ class CLVDualAxisEmbeddingModel(nn.Module):
     def base_score_all(self, users: torch.Tensor) -> torch.Tensor:
         return self.base_user[users] @ self.base_item.T
 
-    def score_all(self, users: torch.Tensor, lam: float) -> torch.Tensor:
+    def score_all(
+        self, users: torch.Tensor, lam: float, gate_shape: str | None = None
+    ) -> torch.Tensor:
         base = self.base_score_all(users)
         if float(lam) == 0.0:
             return base
         u_n, i_n, u_v, i_v = self._axis_embeddings(users=users)
-        residual = self.g_n[users, None] * (u_n @ i_n.T)
-        residual += self.g_v[users, None] * (u_v @ i_v.T)
+        g_n, g_v = self.gate_values(gate_shape)
+        residual = g_n[users, None] * (u_n @ i_n.T)
+        residual += g_v[users, None] * (u_v @ i_v.T)
         return base + float(lam) * self.has_profile[users, None] * residual
 
-    def score_pairs(self, users, items, lam: float):
+    def score_pairs(self, users, items, lam: float, gate_shape: str | None = None):
         base = (self.base_user[users] * self.base_item[items]).sum(dim=1)
         if float(lam) == 0.0:
             return base
         u_n, i_n, u_v, i_v = self._axis_embeddings(users, items)
-        residual = self.g_n[users] * (u_n * i_n).sum(dim=1)
-        residual += self.g_v[users] * (u_v * i_v).sum(dim=1)
+        g_n, g_v = self.gate_values(gate_shape)
+        residual = g_n[users] * (u_n * i_n).sum(dim=1)
+        residual += g_v[users] * (u_v * i_v).sum(dim=1)
         return base + float(lam) * self.has_profile[users] * residual
 
     def embeddings(self, need_value: bool = True):
@@ -354,13 +382,54 @@ class CLVDualAxisEmbeddingModel(nn.Module):
             return self.base_user, self.base_item, None, None
         u_n, i_n, u_v, i_v = self._axis_embeddings()
         mask = self.has_profile[:, None]
+        g_n, g_v = self.gate_values()
         value_user = torch.cat(
-            [self.g_n[:, None] * u_n * mask, self.g_v[:, None] * u_v * mask], dim=1
+            [g_n[:, None] * u_n * mask, g_v[:, None] * u_v * mask], dim=1
         )
         value_item = torch.cat([i_n, i_v], dim=1)
         return self.base_user, self.base_item, value_user, value_item
 
     def bpr_loss(self, users, positives, negatives, lam: float = 1.0):
-        positive = self.score_pairs(users, positives, lam)
-        negative = self.score_pairs(users, negatives, lam)
+        positive = self.score_pairs(users, positives, lam, gate_shape="equal")
+        negative = self.score_pairs(users, negatives, lam, gate_shape="equal")
         return -F.logsigmoid(positive - negative).mean()
+
+    @torch.no_grad()
+    def axis_diagnostics(self, gate_shape: str, max_users=256, max_items=512):
+        users = torch.where(self.has_profile)[0][:max_users]
+        items = torch.where(self.valid_item)[0][:max_items]
+        if not len(users) or not len(items):
+            return {
+                "effective_n_ratio": float("nan"),
+                "effective_v_ratio": float("nan"),
+                "effective_total_ratio": float("nan"),
+                "expert_score_corr": float("nan"),
+                "expert_top10_jaccard": float("nan"),
+            }
+        base = self.base_user[users] @ self.base_item[items].T
+        u_n, i_n, u_v, i_v = self._axis_embeddings(users, items)
+        g_n, g_v = self.gate_values(gate_shape)
+        score_n = g_n[users, None] * (u_n @ i_n.T)
+        score_v = g_v[users, None] * (u_v @ i_v.T)
+        base_std = base.std(unbiased=False).clamp_min(1e-12)
+        flat_n, flat_v = score_n.flatten(), score_v.flatten()
+        if flat_n.std(unbiased=False) > 0 and flat_v.std(unbiased=False) > 0:
+            corr = torch.corrcoef(torch.stack([flat_n, flat_v]))[0, 1]
+        else:
+            corr = torch.tensor(float("nan"), device=base.device)
+        k = min(10, len(items))
+        top_n = score_n.topk(k, dim=1).indices
+        top_v = score_v.topk(k, dim=1).indices
+        overlaps = []
+        for left, right in zip(top_n.cpu().tolist(), top_v.cpu().tolist()):
+            intersection = len(set(left).intersection(right))
+            overlaps.append(intersection / (2 * k - intersection))
+        return {
+            "effective_n_ratio": float(score_n.std(unbiased=False) / base_std),
+            "effective_v_ratio": float(score_v.std(unbiased=False) / base_std),
+            "effective_total_ratio": float(
+                (score_n + score_v).std(unbiased=False) / base_std
+            ),
+            "expert_score_corr": float(corr),
+            "expert_top10_jaccard": float(np.mean(overlaps)),
+        }
