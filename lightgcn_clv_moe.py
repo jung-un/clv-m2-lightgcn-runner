@@ -126,6 +126,7 @@ def validate_or_write_m1_manifest(
 class MoEConfig:
     dataset: str = "dunnhumby"
     seed_list: tuple[int, ...] = (42,)
+    window_days: int | None = None
     input_days: int = 365
     target_days: int = 90
     anchor_offsets: tuple[int, ...] = (270, 180, 90)
@@ -168,6 +169,10 @@ def validate_moe_config(cfg: MoEConfig) -> MoEConfig:
     """Validate every public entry path before any data or split is touched."""
     if cfg.dataset not in {"hm", "dunnhumby"}:
         raise ValueError("dataset은 'hm' 또는 'dunnhumby'여야 합니다")
+    if cfg.window_days is not None and (
+        type(cfg.window_days) is not int or cfg.window_days <= 0
+    ):
+        raise ValueError("window_days는 None 또는 양의 built-in int여야 합니다")
     if tuple(cfg.seed_list) != (42,):
         raise ValueError(
             "screening-only runner는 seed 42 하나만 허용합니다. 추가 seed는 양 "
@@ -276,11 +281,24 @@ def validate_result_metrics(flat: dict, ks=(10, 20, 50)) -> None:
 
 
 def preflight_summary(cfg: MoEConfig) -> dict:
+    estimated_train_days = (
+        None if cfg.window_days is None else cfg.window_days - (7 + 7 + 7)
+    )
     return {
         "code_version": CODE_VERSION,
         "dataset": cfg.dataset,
         "seed_list": list(cfg.seed_list),
-        "window": "full official train (~2 years)",
+        "window": (
+            "full official train (~2 years)"
+            if cfg.window_days is None
+            else (
+                f"last {cfg.window_days} calendar days "
+                "(estimated train days after fixed 7+7+7 split reservations; "
+                "not observed row count)"
+            )
+        ),
+        "window_days": cfg.window_days,
+        "estimated_train_days": estimated_train_days,
         "encoder_windows": {
             "input_days": cfg.input_days,
             "target_days": cfg.target_days,
@@ -561,7 +579,7 @@ def _pure_m1_config(cfg: MoEConfig, m1_dir: str) -> dict:
         out_dir=m1_dir,
         ARCH="pref_only",
         SEED_LIST=list(cfg.seed_list),
-        WINDOW_DAYS=None,
+        WINDOW_DAYS=cfg.window_days,
         GRAPH_MODE="binary",
         LOSS_MODE="plain",
         GATE_MODE="clv",

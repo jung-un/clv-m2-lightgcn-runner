@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from clv_moe_features import ItemProfileArtifact, UserProfileArtifact
@@ -347,6 +348,48 @@ def test_preflight_exposes_m2_boundaries_and_high_cost_settings():
     assert summary["loss_mode"] == "plain"
     assert summary["expert_count"] == 3
     assert summary["window"] == "full official train (~2 years)"
+
+
+@pytest.mark.parametrize("window_days", [0, -1, True, "60", 60.0])
+def test_window_days_must_be_none_or_positive_builtin_int(window_days):
+    import lightgcn_clv_moe as moe
+
+    with pytest.raises(ValueError, match="window_days"):
+        moe.configure_moe_run("hm", window_days=window_days)
+
+
+def test_pure_m1_receives_screening_window(monkeypatch):
+    import lightgcn_clv_moe as moe
+
+    captured = {}
+
+    def fake_configure_run(**kwargs):
+        captured.update(kwargs)
+        return {
+            **kwargs,
+            "ARCH": "pref_only",
+            "GRAPH_MODE": "binary",
+            "LOSS_MODE": "plain",
+            "NEG_MODE": "uniform",
+        }
+
+    monkeypatch.setattr(moe.v3, "configure_run", fake_configure_run)
+    cfg = moe.configure_moe_run("hm", window_days=60)
+    base_cfg = moe._pure_m1_config(cfg, "/tmp/m1-hm-w60")
+    assert captured["WINDOW_DAYS"] == 60
+    assert base_cfg["WINDOW_DAYS"] == 60
+
+
+def test_preflight_distinguishes_full_and_bounded_hm_windows():
+    import lightgcn_clv_moe as moe
+
+    full = moe.preflight_summary(moe.configure_moe_run("hm"))
+    short = moe.preflight_summary(moe.configure_moe_run("hm", window_days=60))
+    assert "full official" in full["window"]
+    assert short["window_days"] == 60
+    assert short["estimated_train_days"] == 39
+    assert "last 60 calendar days" in short["window"]
+    assert "not observed row count" in short["window"]
 
 
 def test_validate_result_metrics_requires_exposure_outputs():
