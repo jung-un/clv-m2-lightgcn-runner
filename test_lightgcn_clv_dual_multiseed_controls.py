@@ -1,4 +1,7 @@
 import dataclasses
+import json
+import re
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -139,3 +142,20 @@ def test_new_seed_trains_only_two_controls_from_reused_prepared_context(monkeypa
     assert calls == ["dual_shuffled_user", "dual_adapter_only"]
     assert [row["model_id"] for row in result["rows"]] == list(cfg.control_ids)
 
+
+def test_control_colab_runs_both_datasets_without_protected_splits():
+    notebook = json.loads(
+        Path("clv_dual_multiseed_controls_colab.ipynb").read_text()
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+    assert re.search(r"REVIEWED_SHA = '[0-9a-f]{40}'", source)
+    assert "run_multiseed_controls" in source
+    assert "results_clv_dual_dunnhumby" in source
+    assert "results_clv_dual_hm_w60" in source
+    assert "dual_shuffled_user" in source
+    assert "dual_adapter_only" in source
+    assert "control_reproducibility_decision" in source
+    for forbidden in ("eval_test=True", "eval_holdout=True", "run_experiment"):
+        assert forbidden not in source
