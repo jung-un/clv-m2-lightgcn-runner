@@ -129,3 +129,6 @@ def test_colab_runs_both_checkpoint_diagnostics_without_training():
     assert "train_clv" not in source
     assert "results_clv_dual_dunnhumby" in source
     assert "results_clv_dual_hm_w60" in source
+    assert "TO_BE_PINNED" not in source
+    reviewed = source.split("REVIEWED_SHA = '", 1)[1].split("'", 1)[0]
+    assert len(reviewed) == 40

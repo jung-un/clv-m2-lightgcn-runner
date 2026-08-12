@@ -111,6 +111,8 @@ def quadrant_metrics(
 
 
 def _validate_payload(payload: dict) -> None:
+    if payload.get("code_version") != dual.CODE_VERSION:
+        raise ValueError("지원하지 않는 dual 결과 code_version입니다")
     config = payload.get("config", {})
     if config.get("eval_test") or config.get("eval_holdout"):
         raise ValueError("checkpoint 진단은 validation-only입니다")
@@ -181,7 +183,9 @@ def _load_models(payload, paths, data, base_cfg, x_item, item_cat):
     clv_proxy = np.asarray(encoder_blob["clv_proxy_all"], np.float32)
 
     base = v3.build_model(data, data["x_val_u"], x_item, item_cat, base_cfg)
-    base_blob = torch.load(paths["m1_s42"], map_location=v3.DEVICE)
+    base_blob = torch.load(
+        paths["m1_s42"], map_location=v3.DEVICE, weights_only=False
+    )
     base.load_state_dict(base_blob["state"])
     base.eval()
 
