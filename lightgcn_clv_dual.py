@@ -402,7 +402,38 @@ def _train_variant(
     }
 
 
-def _prepare(cfg, seed=42):
+def _load_encoder_artifact(path, n_users):
+    blob = torch.load(path, map_location=v3.DEVICE, weights_only=False)
+    transform = core.residual.FeatureTransform(
+        np.asarray(blob["transform_mean"], np.float32),
+        np.asarray(blob["transform_std"], np.float32),
+        tuple(blob["feature_names"]),
+    )
+    model = core.CLVCoreEncoder(
+        len(core._axis_indices(core.REPURCHASE_FEATURES)),
+        len(core._axis_indices(core.MONETARY_FEATURES)),
+    ).to(v3.DEVICE)
+    model.load_state_dict(blob["state"])
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    n_hat = np.asarray(blob["n_hat_all"], np.float32)
+    v_hat = np.asarray(blob["v_hat_all"], np.float32)
+    if len(n_hat) != n_users or len(v_hat) != n_users:
+        raise RuntimeError("재사용 encoder의 사용자 수가 현재 데이터와 다릅니다")
+    return core.CLVCoreArtifact(
+        model=model,
+        transform=transform,
+        best_epoch=int(blob.get("diagnostics", {}).get("best_epoch", 0)),
+        diagnostics=blob.get("diagnostics", {}),
+        h_all=np.zeros((n_users, 16), np.float32),
+        ev_all=n_hat * v_hat,
+        n_hat_all=n_hat,
+        v_hat_all=v_hat,
+    )
+
+
+def _prepare(cfg, seed=42, encoder_checkpoint=None):
     out_dir = Path(cfg.out_dir or f"{v3.default_out_dir(cfg.dataset)}_clv_dual")
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = moe.build_input_manifest(v3.SCHEMA[cfg.dataset])
@@ -422,15 +453,19 @@ def _prepare(cfg, seed=42):
     snapshot = moe.residual.build_final_snapshot(
         data["train"], data["n_users"], v3.DCFG["is_date"], cfg.input_days
     )
-    artifact = core.train_clv_core_encoder(
-        anchors,
-        snapshot,
-        encoder_epochs=cfg.encoder_epochs,
-        encoder_patience=cfg.encoder_patience,
-        encoder_batch_size=cfg.encoder_batch_size,
-        encoder_lr=cfg.encoder_lr,
-        seed=seed,
-        device=v3.DEVICE,
+    artifact = (
+        _load_encoder_artifact(encoder_checkpoint, data["n_users"])
+        if encoder_checkpoint is not None
+        else core.train_clv_core_encoder(
+            anchors,
+            snapshot,
+            encoder_epochs=cfg.encoder_epochs,
+            encoder_patience=cfg.encoder_patience,
+            encoder_batch_size=cfg.encoder_batch_size,
+            encoder_lr=cfg.encoder_lr,
+            seed=seed,
+            device=v3.DEVICE,
+        )
     )
     user_profile = core.compose_clv_core_profiles(artifact, snapshot, v3.DEVICE)
     item_profile = build_dual_item_profiles(
@@ -486,23 +521,24 @@ def _prepare(cfg, seed=42):
         baseline_model, 0.0, cache, meta, data, base_cfg, per_user=True
     )
     fingerprint = _fingerprint(cfg, manifest, baseline_hash, revision)
-    encoder_checkpoint = out_dir / (
-        f"clv_core_encoder_{cfg.dataset}_s{seed}_{fingerprint}.pt"
-    )
-    torch.save(
-        {
-            "state": artifact.model.state_dict(),
-            "transform_mean": artifact.transform.mean,
-            "transform_std": artifact.transform.std,
-            "feature_names": artifact.transform.feature_names,
-            "n_hat_all": artifact.n_hat_all,
-            "v_hat_all": artifact.v_hat_all,
-            "clv_proxy_all": artifact.ev_all,
-            "diagnostics": artifact.diagnostics,
-            "source_revision": revision,
-        },
-        encoder_checkpoint,
-    )
+    if encoder_checkpoint is None:
+        encoder_checkpoint = out_dir / (
+            f"clv_core_encoder_{cfg.dataset}_s{seed}_{fingerprint}.pt"
+        )
+        torch.save(
+            {
+                "state": artifact.model.state_dict(),
+                "transform_mean": artifact.transform.mean,
+                "transform_std": artifact.transform.std,
+                "feature_names": artifact.transform.feature_names,
+                "n_hat_all": artifact.n_hat_all,
+                "v_hat_all": artifact.v_hat_all,
+                "clv_proxy_all": artifact.ev_all,
+                "diagnostics": artifact.diagnostics,
+                "source_revision": revision,
+            },
+            encoder_checkpoint,
+        )
     return {
         "out_dir": out_dir,
         "manifest": manifest,
