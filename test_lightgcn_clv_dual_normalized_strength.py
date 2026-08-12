@@ -235,3 +235,17 @@ def test_normalized_colab_clears_stale_project_modules_after_reclone():
     assert "sys.modules" in setup_source
     assert "name.startswith('lightgcn_clv')" in setup_source
     assert setup_source.index("sys.modules") > setup_source.index("git', 'checkout")
+
+
+def test_normalized_colab_reloads_runner_at_execution_boundary():
+    notebook = json.loads(
+        Path("clv_dual_normalized_strength_colab.ipynb").read_text()
+    )
+    config_source = "".join(notebook["cells"][2].get("source", []))
+    run_source = "".join(notebook["cells"][4].get("source", []))
+
+    assert "from lightgcn_clv_dual_normalized_strength import" not in config_source
+    assert "import lightgcn_clv_dual_normalized_strength as normalized" in config_source
+    assert "importlib.reload(normalized)" in run_source
+    assert "inspect.signature(normalized._load_model)" in run_source
+    assert "normalized.run_normalized_strength" in run_source
