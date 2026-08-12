@@ -18,6 +18,7 @@ CONTROLS = frozenset(
     {"dual_clv_fixed", "dual_shuffled_user", "dual_adapter_only"}
 )
 GATE_SHAPES = ("high", "equal", "low")
+EVAL_AXIS_MODES = ("n_only", "v_only", "n_plus_v")
 
 
 @dataclass(frozen=True)
@@ -285,6 +286,7 @@ class CLVDualAxisEmbeddingModel(nn.Module):
         self.register_buffer("q_n", rank_n)
         self.register_buffer("q_v", rank_v)
         self.eval_gate_shape = "equal"
+        self.eval_axis_mode = "n_plus_v"
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(seed)
             self.activity_expert = _AxisExpert(
@@ -307,6 +309,11 @@ class CLVDualAxisEmbeddingModel(nn.Module):
         if shape not in GATE_SHAPES:
             raise ValueError(f"지원하지 않는 gate shape: {shape}")
         self.eval_gate_shape = shape
+
+    def set_eval_axes(self, axis_mode: str) -> None:
+        if axis_mode not in EVAL_AXIS_MODES:
+            raise ValueError(f"지원하지 않는 axis mode: {axis_mode}")
+        self.eval_axis_mode = axis_mode
 
     def gate_values(self, shape: str | None = None):
         shape = shape or self.eval_gate_shape
@@ -363,8 +370,9 @@ class CLVDualAxisEmbeddingModel(nn.Module):
             return base
         u_n, i_n, u_v, i_v = self._axis_embeddings(users=users)
         g_n, g_v = self.gate_values(gate_shape)
-        residual = g_n[users, None] * (u_n @ i_n.T)
-        residual += g_v[users, None] * (u_v @ i_v.T)
+        score_n = g_n[users, None] * (u_n @ i_n.T)
+        score_v = g_v[users, None] * (u_v @ i_v.T)
+        residual = self._selected_residual(score_n, score_v)
         return base + float(lam) * self.has_profile[users, None] * residual
 
     def score_pairs(self, users, items, lam: float, gate_shape: str | None = None):
@@ -373,9 +381,17 @@ class CLVDualAxisEmbeddingModel(nn.Module):
             return base
         u_n, i_n, u_v, i_v = self._axis_embeddings(users, items)
         g_n, g_v = self.gate_values(gate_shape)
-        residual = g_n[users] * (u_n * i_n).sum(dim=1)
-        residual += g_v[users] * (u_v * i_v).sum(dim=1)
+        score_n = g_n[users] * (u_n * i_n).sum(dim=1)
+        score_v = g_v[users] * (u_v * i_v).sum(dim=1)
+        residual = self._selected_residual(score_n, score_v)
         return base + float(lam) * self.has_profile[users] * residual
+
+    def _selected_residual(self, score_n, score_v):
+        if self.eval_axis_mode == "n_only":
+            return score_n
+        if self.eval_axis_mode == "v_only":
+            return score_v
+        return score_n + score_v
 
     def embeddings(self, need_value: bool = True):
         if not need_value:
@@ -390,9 +406,14 @@ class CLVDualAxisEmbeddingModel(nn.Module):
         return self.base_user, self.base_item, value_user, value_item
 
     def bpr_loss(self, users, positives, negatives, lam: float = 1.0):
-        positive = self.score_pairs(users, positives, lam, gate_shape="equal")
-        negative = self.score_pairs(users, negatives, lam, gate_shape="equal")
-        return -F.logsigmoid(positive - negative).mean()
+        previous = self.eval_axis_mode
+        try:
+            self.eval_axis_mode = "n_plus_v"
+            positive = self.score_pairs(users, positives, lam, gate_shape="equal")
+            negative = self.score_pairs(users, negatives, lam, gate_shape="equal")
+            return -F.logsigmoid(positive - negative).mean()
+        finally:
+            self.eval_axis_mode = previous
 
     @torch.no_grad()
     def axis_diagnostics(self, gate_shape: str, max_users=256, max_items=512):

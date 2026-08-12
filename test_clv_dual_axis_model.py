@@ -228,3 +228,34 @@ def test_training_is_gate_neutral_but_evaluation_gate_changes_scores():
     assert diagnostics["effective_total_ratio"] > 0
     assert -1 <= diagnostics["expert_score_corr"] <= 1
     assert 0 <= diagnostics["expert_top10_jaccard"] <= 1
+
+
+def test_eval_axis_mask_reuses_same_experts_without_retraining():
+    from clv_dual_axis_model import (
+        CLVDualAxisEmbeddingModel,
+        build_dual_item_profiles,
+        fixed_percentile_ranks,
+    )
+
+    profile = _user_profile()
+    model = CLVDualAxisEmbeddingModel(
+        _Base(),
+        profile,
+        build_dual_item_profiles(_train(), 4, False),
+        *fixed_percentile_ranks(
+            np.array([1.0, 2.0, 3.0]),
+            np.array([3.0, 2.0, 1.0]),
+            profile.valid_user,
+        ),
+    )
+    users = torch.tensor([0, 1])
+    base = model.base_score_all(users)
+    full = model.score_all(users, 1.0, "equal")
+    model.set_eval_axes("n_only")
+    n_only = model.score_all(users, 1.0, "equal")
+    model.set_eval_axes("v_only")
+    v_only = model.score_all(users, 1.0, "equal")
+
+    torch.testing.assert_close(full - base, (n_only - base) + (v_only - base))
+    model.set_eval_axes("n_plus_v")
+    torch.testing.assert_close(model.score_all(users, 1.0, "equal"), full)
