@@ -2,6 +2,7 @@ import dataclasses
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -116,6 +117,68 @@ def test_seed_run_config_preserves_training_budget_but_stays_validation_only(tmp
     assert run_cfg.max_epochs == 77
     assert run_cfg.encoder_epochs == 66
     assert run_cfg.eval_test is run_cfg.eval_holdout is False
+
+
+def test_load_model_takes_gate_shape_from_normalized_protocol(monkeypatch):
+    import lightgcn_clv_dual_normalized_strength as normalized
+
+    observed = {}
+
+    class FakeModel:
+        def __init__(self, *args, **kwargs):
+            observed["hidden_dim"] = kwargs["hidden_dim"]
+            observed["expert_dim"] = kwargs["expert_dim"]
+
+        def to(self, _device):
+            return self
+
+        def load_state_dict(self, state):
+            observed["state"] = state
+
+        def eval(self):
+            return self
+
+        def set_gate_shape(self, gate_shape):
+            observed["gate_shape"] = gate_shape
+
+        def set_eval_axes(self, axes):
+            observed["axes"] = axes
+
+    monkeypatch.setattr(normalized, "CLVDualAxisEmbeddingModel", FakeModel)
+    monkeypatch.setattr(normalized.dual, "_fresh_base", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        normalized.torch,
+        "load",
+        lambda *_args, **_kwargs: {
+            "baseline_state_hash": "baseline",
+            "state": {"weight": 1},
+        },
+    )
+    prepared = {
+        "user_profile": object(),
+        "item_profile": object(),
+        "q_n": object(),
+        "q_v": object(),
+        "baseline_hash": "baseline",
+    }
+    run_cfg = SimpleNamespace(expert_hidden_dim=32, expert_dim=16)
+
+    normalized._load_model(
+        prepared,
+        run_cfg,
+        "high",
+        seed=42,
+        model_id="dual_clv_fixed",
+        checkpoint=Path("adapter.pt"),
+    )
+
+    assert observed == {
+        "hidden_dim": 32,
+        "expert_dim": 16,
+        "state": {"weight": 1},
+        "gate_shape": "high",
+        "axes": "n_plus_v",
+    }
 
 
 def test_normalized_decision_selects_best_common_rho_with_guards_and_controls():

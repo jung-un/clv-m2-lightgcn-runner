@@ -138,7 +138,7 @@ def _run_cfg(cfg, seed42_payload, seed):
     return controls._run_cfg(proxy, seed42_payload, seed)
 
 
-def _load_model(prepared, cfg, seed, model_id, checkpoint):
+def _load_model(prepared, run_cfg, gate_shape, seed, model_id, checkpoint):
     model = CLVDualAxisEmbeddingModel(
         dual._fresh_base(prepared, seed=seed),
         prepared["user_profile"],
@@ -147,15 +147,15 @@ def _load_model(prepared, cfg, seed, model_id, checkpoint):
         prepared["q_v"],
         control=model_id,
         seed=seed,
-        hidden_dim=cfg.expert_hidden_dim,
-        expert_dim=cfg.expert_dim,
+        hidden_dim=run_cfg.expert_hidden_dim,
+        expert_dim=run_cfg.expert_dim,
     ).to(v3.DEVICE)
     blob = torch.load(checkpoint, map_location=v3.DEVICE, weights_only=False)
     if blob.get("baseline_state_hash") != prepared["baseline_hash"]:
         raise RuntimeError("adapter와 M1 기준상태가 다릅니다")
     model.load_state_dict(blob["state"])
     model.eval()
-    model.set_gate_shape(cfg.gate_shape)
+    model.set_gate_shape(gate_shape)
     model.set_eval_axes("n_plus_v")
     return model
 
@@ -186,7 +186,14 @@ def _evaluate_seed(cfg, seed42, multiseed, control_payload, seed):
         checkpoint = _model_checkpoint(
             seed42, multiseed, control_payload, seed, model_id
         )
-        model = _load_model(prepared, run_cfg, seed, model_id, checkpoint)
+        model = _load_model(
+            prepared,
+            run_cfg,
+            cfg.gate_shape,
+            seed,
+            model_id,
+            checkpoint,
+        )
         diagnostics = model.axis_diagnostics(cfg.gate_shape)
         ratio = float(diagnostics["effective_total_ratio"])
         per_user[model_id] = {}
