@@ -1,5 +1,7 @@
 import dataclasses
 import json
+import re
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -248,3 +250,29 @@ def test_new_seed_reuses_exact_seed42_training_budget(monkeypatch, tmp_path):
     assert captured["cfg"].seed_list == (43,)
     assert captured["cfg"].lambda_eval == (2.0,)
     assert captured["cfg"].window_days is None
+
+
+def test_multiseed_colab_runs_only_two_frozen_validation_presets():
+    notebook = json.loads(
+        Path("clv_dual_multiseed_validation_colab.ipynb").read_text()
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+    reviewed = re.search(r"REVIEWED_SHA = '([0-9a-f]{40})'", source)
+    assert reviewed is not None
+    assert "run_multiseed_validation" in source
+    assert "results_clv_dual_dunnhumby" in source
+    assert "results_clv_dual_hm_w60" in source
+    assert "short_hm=True" in source
+    assert "reproducibility_decision" in source
+    assert "failed_conditions" in source
+    for forbidden in (
+        "eval_test=True",
+        "eval_holdout=True",
+        "dual_shuffled_user",
+        "dual_adapter_only",
+        "run_experiment",
+        "H&M 2년 실행",
+    ):
+        assert forbidden not in source
