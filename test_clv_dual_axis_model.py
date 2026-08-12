@@ -253,8 +253,14 @@ def test_eval_axis_mask_reuses_same_experts_without_retraining():
     full = model.score_all(users, 1.0, "equal")
     model.set_eval_axes("n_only")
     n_only = model.score_all(users, 1.0, "equal")
+    _, _, n_user, n_item = model.embeddings()
+    assert torch.count_nonzero(n_user[:, n_user.shape[1] // 2 :]) == 0
+    assert torch.count_nonzero(n_item[:, n_item.shape[1] // 2 :]) == 0
     model.set_eval_axes("v_only")
     v_only = model.score_all(users, 1.0, "equal")
+    _, _, v_user, v_item = model.embeddings()
+    assert torch.count_nonzero(v_user[:, : v_user.shape[1] // 2]) == 0
+    assert torch.count_nonzero(v_item[:, : v_item.shape[1] // 2]) == 0
 
     torch.testing.assert_close(full - base, (n_only - base) + (v_only - base))
     model.set_eval_axes("n_plus_v")

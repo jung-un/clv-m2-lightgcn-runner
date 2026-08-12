@@ -399,10 +399,14 @@ class CLVDualAxisEmbeddingModel(nn.Module):
         u_n, i_n, u_v, i_v = self._axis_embeddings()
         mask = self.has_profile[:, None]
         g_n, g_v = self.gate_values()
-        value_user = torch.cat(
-            [g_n[:, None] * u_n * mask, g_v[:, None] * u_v * mask], dim=1
-        )
-        value_item = torch.cat([i_n, i_v], dim=1)
+        user_n, user_v = g_n[:, None] * u_n * mask, g_v[:, None] * u_v * mask
+        item_n, item_v = i_n, i_v
+        if self.eval_axis_mode == "n_only":
+            user_v, item_v = torch.zeros_like(user_v), torch.zeros_like(item_v)
+        elif self.eval_axis_mode == "v_only":
+            user_n, item_n = torch.zeros_like(user_n), torch.zeros_like(item_n)
+        value_user = torch.cat([user_n, user_v], dim=1)
+        value_item = torch.cat([item_n, item_v], dim=1)
         return self.base_user, self.base_item, value_user, value_item
 
     def bpr_loss(self, users, positives, negatives, lam: float = 1.0):
