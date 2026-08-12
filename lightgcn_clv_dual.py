@@ -302,7 +302,16 @@ def _diagnostics(model, artifact):
     }
 
 
-def _train_variant(model_id, base_model, prepared, cfg):
+def _train_variant(
+    model_id,
+    base_model,
+    prepared,
+    cfg,
+    *,
+    seed=42,
+    gate_shapes=GATE_SHAPES,
+    lambda_eval=None,
+):
     model = CLVDualAxisEmbeddingModel(
         base_model,
         prepared["user_profile"],
@@ -310,7 +319,7 @@ def _train_variant(model_id, base_model, prepared, cfg):
         prepared["q_n"],
         prepared["q_v"],
         control=model_id,
-        seed=42,
+        seed=seed,
         hidden_dim=cfg.expert_hidden_dim,
         expert_dim=cfg.expert_dim,
     ).to(v3.DEVICE)
@@ -332,13 +341,13 @@ def _train_variant(model_id, base_model, prepared, cfg):
         prepared["data"],
         prepared["base_cfg"],
         cfg,
-        42,
+        seed,
         validation_recall,
         freeze_base=True,
     )
     diagnostics = _diagnostics(model, prepared["artifact"])
     checkpoint = prepared["out_dir"] / (
-        f"{model_id}_{cfg.dataset}_s42_{prepared['fingerprint']}.pt"
+        f"{model_id}_{cfg.dataset}_s{seed}_{prepared['fingerprint']}.pt"
     )
     torch.save(
         {
@@ -354,10 +363,11 @@ def _train_variant(model_id, base_model, prepared, cfg):
         checkpoint,
     )
     rows, per_user = [], {}
-    for gate_shape in GATE_SHAPES:
+    lambdas = tuple(cfg.lambda_eval if lambda_eval is None else lambda_eval)
+    for gate_shape in tuple(gate_shapes):
         model.set_gate_shape(gate_shape)
         axis_diag = diagnostics["gate_shape_diagnostics"][gate_shape]
-        for lam in cfg.lambda_eval:
+        for lam in lambdas:
             flat, user_metrics = moe._flat_evaluation(
                 model,
                 float(lam),
@@ -369,7 +379,7 @@ def _train_variant(model_id, base_model, prepared, cfg):
             )
             rows.append(
                 {
-                    "seed": 42,
+                    "seed": seed,
                     "model_id": model_id,
                     "split": "val",
                     "gate_shape": gate_shape,
@@ -392,7 +402,7 @@ def _train_variant(model_id, base_model, prepared, cfg):
     }
 
 
-def _prepare(cfg):
+def _prepare(cfg, seed=42):
     out_dir = Path(cfg.out_dir or f"{v3.default_out_dir(cfg.dataset)}_clv_dual")
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = moe.build_input_manifest(v3.SCHEMA[cfg.dataset])
@@ -419,7 +429,7 @@ def _prepare(cfg):
         encoder_patience=cfg.encoder_patience,
         encoder_batch_size=cfg.encoder_batch_size,
         encoder_lr=cfg.encoder_lr,
-        seed=42,
+        seed=seed,
         device=v3.DEVICE,
     )
     user_profile = core.compose_clv_core_profiles(artifact, snapshot, v3.DEVICE)
@@ -457,16 +467,18 @@ def _prepare(cfg):
         "caches": {"val": cache},
     }
     m1_checkpoint = Path(base_cfg["OUT_DIR"]) / (
-        f"ckpt_pref_only_{cfg.dataset}_s42_"
-        f"{v3.cfg_hash(base_cfg, v3.DCFG, 'pref_only', 42)}.pt"
+        f"ckpt_pref_only_{cfg.dataset}_s{seed}_"
+        f"{v3.cfg_hash(base_cfg, v3.DCFG, 'pref_only', seed)}.pt"
     )
     existed = m1_checkpoint.exists()
-    baseline_model, _ = moe._fresh_external_m1(base_context, 42, data, base_cfg)
+    baseline_model, _ = moe._fresh_external_m1(
+        base_context, seed, data, base_cfg
+    )
     baseline_hash = moe.state_hash(baseline_model)
     moe.validate_or_write_m1_manifest(
         m1_checkpoint,
         manifest,
-        config_hash=v3.cfg_hash(base_cfg, v3.DCFG, "pref_only", 42),
+        config_hash=v3.cfg_hash(base_cfg, v3.DCFG, "pref_only", seed),
         state_hash_value=baseline_hash,
         existed_before=existed,
     )
@@ -474,7 +486,9 @@ def _prepare(cfg):
         baseline_model, 0.0, cache, meta, data, base_cfg, per_user=True
     )
     fingerprint = _fingerprint(cfg, manifest, baseline_hash, revision)
-    encoder_checkpoint = out_dir / f"clv_core_encoder_{cfg.dataset}_s42_{fingerprint}.pt"
+    encoder_checkpoint = out_dir / (
+        f"clv_core_encoder_{cfg.dataset}_s{seed}_{fingerprint}.pt"
+    )
     torch.save(
         {
             "state": artifact.model.state_dict(),
@@ -514,9 +528,9 @@ def _prepare(cfg):
     }
 
 
-def _fresh_base(prepared):
+def _fresh_base(prepared, seed=42):
     model, _ = moe._fresh_external_m1(
-        prepared["base_context"], 42, prepared["data"], prepared["base_cfg"]
+        prepared["base_context"], seed, prepared["data"], prepared["base_cfg"]
     )
     if moe.state_hash(model) != prepared["baseline_hash"]:
         raise RuntimeError("dual variant가 공통 M1 state에서 시작하지 않았습니다")

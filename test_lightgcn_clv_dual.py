@@ -1,9 +1,112 @@
 import dataclasses
+import inspect
 import json
 import re
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+
+
+def test_train_variant_uses_requested_seed_and_fixed_point(monkeypatch, tmp_path):
+    import lightgcn_clv_dual as dual
+
+    calls = {}
+
+    class FakeModel:
+        q_n = q_v = has_profile = None
+
+        def to(self, _device):
+            return self
+
+        def set_gate_shape(self, shape):
+            calls.setdefault("shapes", []).append(shape)
+
+        def state_dict(self):
+            return {"weight": 1}
+
+    def fake_constructor(*_args, seed, **_kwargs):
+        calls["constructor_seed"] = seed
+        return FakeModel()
+
+    def fake_train(*_args, **kwargs):
+        calls["train_seed"] = _args[4]
+        assert kwargs["freeze_base"] is True
+        return {"best_epoch": 1}
+
+    monkeypatch.setattr(dual, "CLVDualAxisEmbeddingModel", fake_constructor)
+    monkeypatch.setattr(dual.moe, "train_moe", fake_train)
+    monkeypatch.setattr(
+        dual,
+        "_diagnostics",
+        lambda *_: {
+            "gate_shape_diagnostics": {
+                "equal": {"effective_total_ratio": 0.5}
+            }
+        },
+    )
+    monkeypatch.setattr(
+        dual.moe,
+        "_flat_evaluation",
+        lambda *_args, **_kwargs: ({"recall@10": 0.1}, {"recall": [0.1]}),
+    )
+    monkeypatch.setattr(dual.torch, "save", lambda _blob, path: calls.setdefault("path", path))
+
+    prepared = {
+        "user_profile": SimpleNamespace(feature_names=("u",)),
+        "item_profile": SimpleNamespace(
+            activity_names=("n",), value_names=("v",)
+        ),
+        "q_n": [0.5],
+        "q_v": [0.5],
+        "data": {},
+        "base_cfg": {"K_LIST": [10]},
+        "cache": object(),
+        "meta": {},
+        "artifact": object(),
+        "out_dir": tmp_path,
+        "fingerprint": "fixture",
+        "revision": "revision",
+        "baseline_hash": "baseline",
+    }
+    cfg = SimpleNamespace(
+        dataset="dunnhumby",
+        expert_hidden_dim=4,
+        expert_dim=2,
+        lambda_train=1.0,
+        lambda_eval=(0.0, 1.0),
+    )
+
+    result = dual._train_variant(
+        dual.PRIMARY_MODEL,
+        object(),
+        prepared,
+        cfg,
+        seed=43,
+        gate_shapes=("equal",),
+        lambda_eval=(2.0,),
+    )
+
+    assert calls["constructor_seed"] == 43
+    assert calls["train_seed"] == 43
+    assert calls["shapes"] == ["equal"]
+    assert "_s43_" in str(calls["path"])
+    assert [(row["seed"], row["gate_shape"], row["lambda"]) for row in result["rows"]] == [
+        (43, "equal", 2.0)
+    ]
+
+
+def test_prepare_and_fresh_base_accept_requested_seed():
+    import lightgcn_clv_dual as dual
+
+    assert inspect.signature(dual._prepare).parameters["seed"].default == 42
+    assert inspect.signature(dual._fresh_base).parameters["seed"].default == 42
+    prepare_source = inspect.getsource(dual._prepare)
+    fresh_source = inspect.getsource(dual._fresh_base)
+    assert "seed=seed" in prepare_source
+    assert "s{seed}" in prepare_source
+    assert "'pref_only', seed" in prepare_source
+    assert "prepared[\"base_context\"], seed" in fresh_source
 
 
 def test_dual_runner_is_seed42_validation_only_and_has_four_models():
