@@ -224,3 +224,14 @@ def test_normalized_colab_runs_both_datasets_without_training_or_protected_split
         "run_experiment",
     ):
         assert forbidden not in source
+
+
+def test_normalized_colab_clears_stale_project_modules_after_reclone():
+    notebook = json.loads(
+        Path("clv_dual_normalized_strength_colab.ipynb").read_text()
+    )
+    setup_source = "".join(notebook["cells"][1].get("source", []))
+
+    assert "sys.modules" in setup_source
+    assert "name.startswith('lightgcn_clv')" in setup_source
+    assert setup_source.index("sys.modules") > setup_source.index("git', 'checkout")
