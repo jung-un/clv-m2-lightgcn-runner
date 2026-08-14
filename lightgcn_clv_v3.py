@@ -1163,7 +1163,20 @@ def sample_negatives(u_arr, pos_arr, n_items, pos_key, rng, mode="uniform",
     return neg
 
 
-def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, meta):
+def train_phase(
+    model,
+    params,
+    d,
+    gate_t,
+    lam_train,
+    cfg,
+    seed,
+    tag,
+    val_cache,
+    meta,
+    *,
+    progress_store=None,
+):
     """BPR로 params만 학습. 조기종료가 수렴점을 결정한다(상한 EPOCHS).
     학습량(업데이트 수·샘플 수·시간)을 함께 기록해 아키텍처 간 비교에 쓴다."""
     # REG_MODE="batch_l2"면 optimizer에 감쇠를 주지 않는다(정규화는 loss 안에서).
@@ -1175,8 +1188,29 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, 
     n_train = len(tr_u); n_batch = math.ceil(n_train / cfg["BATCH_SIZE"])
     best, best_ep, best_state, bad = -1.0, -1, None, 0
     updates, samples, t_start = 0, 0, time.time()
+    history, start_ep, resumed_from = [], 1, 0
+    previous_wall = 0.0
+    if progress_store is not None:
+        restored = progress_store.restore_epoch(model, opt, rng)
+        if restored is not None:
+            start_ep = int(restored["next_epoch"])
+            resumed_from = start_ep - 1
+            best = float(restored["best_metric"])
+            best_ep = int(restored["best_epoch"])
+            best_state = restored["best_state"]
+            bad = int(restored["bad"])
+            updates = int(restored["updates"])
+            samples = int(restored["samples"])
+            history = list(restored.get("history", []))
+            previous_wall = float(restored.get("wall_clock_sec", 0.0))
+            print(f"  [{tag}] epoch {resumed_from}에서 자동 재개")
+        progress_store.mark_stage(
+            "running", epoch=resumed_from, max_epoch=int(cfg["EPOCHS"])
+        )
 
-    for ep in range(1, cfg["EPOCHS"] + 1):
+    last_ep = resumed_from
+    for ep in range(start_ep, cfg["EPOCHS"] + 1):
+        last_ep = ep
         model.train(); t0 = time.time()
         perm = rng.permutation(n_train); tot = tot_bpr = tot_pc = 0.0
         for b in range(n_batch):
@@ -1194,6 +1228,14 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, 
             opt.zero_grad(); loss.backward(); opt.step()
             tot += loss.item(); tot_bpr += dg["bpr"]; tot_pc += dg["p_correct"]
             updates += 1; samples += len(idx)
+            if progress_store is not None:
+                progress_store.heartbeat(
+                    epoch=ep,
+                    max_epoch=int(cfg["EPOCHS"]),
+                    batch=b + 1,
+                    batches=n_batch,
+                    loss=tot / (b + 1),
+                )
         model.eval()
         r = evaluate(model, lam_train, gate_t, val_cache, meta, [cfg["SELECT_K"]],
                      d["csr_ptr"], d["csr_items"], cfg)
@@ -1210,9 +1252,33 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, 
         with torch.no_grad():
             nu = float(model.E_u.weight.norm(dim=1).mean())
             ni = float(model.E_i.weight.norm(dim=1).mean())
+        epoch_sec = time.time() - t0
+        history.append({
+            "epoch": int(ep),
+            "loss": float(tot / n_batch),
+            "bpr": float(tot_bpr / n_batch),
+            "p_correct": float(tot_pc / n_batch),
+            "val_metric": float(score),
+            "epoch_sec": float(epoch_sec),
+        })
         print(f"  [{tag}] ep {ep:3d} | loss {tot/n_batch:.4f} bpr {tot_bpr/n_batch:.4f} "
               f"P(pos>neg) {tot_pc/n_batch:.3f} | ‖E_u‖ {nu:.4f} ‖E_i‖ {ni:.4f} | "
-              f"val {cfg['SELECT_METRIC']}@{cfg['SELECT_K']} {score:.5f} | {time.time()-t0:.0f}s{star}")
+              f"val {cfg['SELECT_METRIC']}@{cfg['SELECT_K']} {score:.5f} | {epoch_sec:.0f}s{star}")
+        if progress_store is not None:
+            progress_store.save_epoch(
+                model,
+                opt,
+                rng,
+                epoch=int(ep),
+                best_epoch=int(best_ep),
+                best_metric=float(best),
+                best_state=best_state,
+                bad=int(bad),
+                updates=int(updates),
+                samples=int(samples),
+                history=history,
+                wall_clock_sec=previous_wall + time.time() - t_start,
+            )
         if bad >= cfg["EARLY_STOP"]:
             print(f"  [{tag}] early stop"); break
 
@@ -1220,11 +1286,14 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, 
         model.load_state_dict(best_state)
     # 값은 전부 순수 파이썬 타입으로 — numpy 스칼라가 섞이면 체크포인트를
     # torch.load(weights_only=True)로 되읽을 수 없다.
-    stats = {"phase": tag, "best_epoch": int(best_ep), "epochs_run": int(ep),
+    stats = {"phase": tag, "best_epoch": int(best_ep), "epochs_run": int(last_ep),
              f"best_val_{cfg['SELECT_METRIC']}@{cfg['SELECT_K']}": float(best),
              "updates": int(updates), "samples": int(samples),
-             "wall_clock_sec": round(time.time() - t_start, 1)}
-    print(f"  [{tag}] 완료 — best ep {best_ep}/{ep}, val {best:.5f}, "
+             "wall_clock_sec": round(previous_wall + time.time() - t_start, 1),
+             "resumed_from_epoch": int(resumed_from),
+             "new_epochs_run": int(max(0, last_ep - resumed_from)),
+             "history": history}
+    print(f"  [{tag}] 완료 — best ep {best_ep}/{last_ep}, val {best:.5f}, "
           f"업데이트 {updates:,}회, 샘플 {samples:,}건, {stats['wall_clock_sec']:.0f}s")
     return stats
 
@@ -1234,7 +1303,20 @@ def build_model(d, x_val_u, x_item, item_cat, cfg):
                              x_val_u, x_item, item_cat, cfg, d["adj"]).to(DEVICE)
 
 
-def get_or_train(arch, seed, d, gate_t, x_val_u, x_item, item_cat, meta, val_cache, cfg):
+def get_or_train(
+    arch,
+    seed,
+    d,
+    gate_t,
+    x_val_u,
+    x_item,
+    item_cat,
+    meta,
+    val_cache,
+    cfg,
+    *,
+    progress_store=None,
+):
     """arch별 학습. pref_only 체크포인트는 two_stage가 stage2 초기값으로 재사용한다."""
     out = Path(cfg["OUT_DIR"]); out.mkdir(parents=True, exist_ok=True)
     ck = out / f"ckpt_{arch}_{cfg['DATASET']}_s{seed}_{cfg_hash(cfg, DCFG, arch, seed)}.pt"
@@ -1249,7 +1331,8 @@ def get_or_train(arch, seed, d, gate_t, x_val_u, x_item, item_cat, meta, val_cac
     if arch == "pref_only":
         model = build_model(d, x_val_u, x_item, item_cat, cfg)
         stats = [train_phase(model, model.pref_params(), d, gate_t, 0.0, cfg, seed,
-                             "pref_only", val_cache, meta)]
+                             "pref_only", val_cache, meta,
+                             progress_store=progress_store)]
     elif arch == "two_stage":
         # stage1 = pref_only 체크포인트를 그대로 재사용 (없으면 여기서 학습됨)
         base, base_stats = get_or_train("pref_only", seed, d, gate_t, x_val_u, x_item,

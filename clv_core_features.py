@@ -9,6 +9,7 @@ recommendation-profile variables such as category entropy and premium share.
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -129,14 +130,47 @@ def _seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _fit_epochs(model, arrays, epochs, batch_size, lr, seed, device):
+def _fit_epochs(
+    model,
+    arrays,
+    epochs,
+    batch_size,
+    lr,
+    seed,
+    device,
+    *,
+    progress_store=None,
+):
     x_n, x_v, y_n, y_v = arrays
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     rng = np.random.default_rng(seed)
-    for _ in range(epochs):
+    start_epoch, resumed_from = 1, 0
+    updates = samples = 0
+    history = []
+    previous_wall = 0.0
+    started = time.time()
+    if progress_store is not None:
+        restored = progress_store.restore_epoch(model, optimizer, rng)
+        if restored is not None:
+            start_epoch = int(restored["next_epoch"])
+            resumed_from = start_epoch - 1
+            updates = int(restored["updates"])
+            samples = int(restored["samples"])
+            history = list(restored.get("history", []))
+            previous_wall = float(restored.get("wall_clock_sec", 0.0))
+        progress_store.mark_stage(
+            "running", epoch=resumed_from, max_epoch=int(epochs)
+        )
+    n_batches = int(np.ceil(len(y_n) / batch_size))
+    last_epoch = resumed_from
+    for epoch in range(start_epoch, epochs + 1):
+        last_epoch = epoch
         model.train()
         order = rng.permutation(len(y_n))
-        for start in range(0, len(order), batch_size):
+        total_loss = 0.0
+        for batch_index, start in enumerate(
+            range(0, len(order), batch_size), start=1
+        ):
             idx = order[start : start + batch_size]
             batch = [
                 torch.as_tensor(values[idx], dtype=torch.float32, device=device)
@@ -147,6 +181,48 @@ def _fit_epochs(model, arrays, epochs, batch_size, lr, seed, device):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            updates += 1
+            samples += len(idx)
+            total_loss += float(loss.detach())
+            if progress_store is not None:
+                progress_store.heartbeat(
+                    epoch=epoch,
+                    max_epoch=int(epochs),
+                    batch=batch_index,
+                    batches=n_batches,
+                    loss=total_loss / batch_index,
+                )
+        history.append({
+            "epoch": int(epoch),
+            "loss": float(total_loss / max(1, n_batches)),
+        })
+        if progress_store is not None:
+            state = {
+                name: value.detach().cpu().clone()
+                for name, value in model.state_dict().items()
+            }
+            progress_store.save_epoch(
+                model,
+                optimizer,
+                rng,
+                epoch=int(epoch),
+                best_epoch=int(epoch),
+                best_metric=float(-total_loss / max(1, n_batches)),
+                best_state=state,
+                bad=0,
+                updates=int(updates),
+                samples=int(samples),
+                history=history,
+                wall_clock_sec=previous_wall + time.time() - started,
+            )
+    return {
+        "epochs_run": int(last_epoch),
+        "resumed_from_epoch": int(resumed_from),
+        "new_epochs_run": int(max(0, last_epoch - resumed_from)),
+        "updates": int(updates),
+        "samples": int(samples),
+        "history": history,
+    }
 
 
 def _evaluate_loss(model, arrays, device) -> float:
@@ -207,6 +283,7 @@ def train_clv_core_encoder(
     encoder_lr: float,
     seed: int,
     device: torch.device,
+    progress_stores: dict | None = None,
 ) -> CLVCoreArtifact:
     if len(dataset.anchors) != 3:
         raise ValueError("CLV-core encoder는 학습 anchor 2개와 내부 validation 1개를 요구합니다")
@@ -220,10 +297,38 @@ def train_clv_core_encoder(
     optimizer = torch.optim.Adam(model.parameters(), lr=encoder_lr)
     rng = np.random.default_rng(seed)
     best_loss, best_epoch, best_state, bad = float("inf"), 0, None, 0
-    for epoch in range(1, encoder_epochs + 1):
+    select_store = None if progress_stores is None else progress_stores.get("select")
+    start_epoch, resumed_from = 1, 0
+    updates = samples = 0
+    history = []
+    previous_wall = 0.0
+    started = time.time()
+    if select_store is not None:
+        restored = select_store.restore_epoch(model, optimizer, rng)
+        if restored is not None:
+            start_epoch = int(restored["next_epoch"])
+            resumed_from = start_epoch - 1
+            best_loss = -float(restored["best_metric"])
+            best_epoch = int(restored["best_epoch"])
+            best_state = restored["best_state"]
+            bad = int(restored["bad"])
+            updates = int(restored["updates"])
+            samples = int(restored["samples"])
+            history = list(restored.get("history", []))
+            previous_wall = float(restored.get("wall_clock_sec", 0.0))
+        select_store.mark_stage(
+            "running", epoch=resumed_from, max_epoch=int(encoder_epochs)
+        )
+    n_batches = int(np.ceil(len(train_arrays[2]) / encoder_batch_size))
+    last_epoch = resumed_from
+    for epoch in range(start_epoch, encoder_epochs + 1):
+        last_epoch = epoch
         model.train()
         order = rng.permutation(len(train_arrays[2]))
-        for start in range(0, len(order), encoder_batch_size):
+        total_loss = 0.0
+        for batch_index, start in enumerate(
+            range(0, len(order), encoder_batch_size), start=1
+        ):
             idx = order[start : start + encoder_batch_size]
             batch = [
                 torch.as_tensor(values[idx], dtype=torch.float32, device=device)
@@ -234,6 +339,17 @@ def train_clv_core_encoder(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            updates += 1
+            samples += len(idx)
+            total_loss += float(loss.detach())
+            if select_store is not None:
+                select_store.heartbeat(
+                    epoch=epoch,
+                    max_epoch=int(encoder_epochs),
+                    batch=batch_index,
+                    batches=n_batches,
+                    loss=total_loss / batch_index,
+                )
         val_loss = _evaluate_loss(model, val_arrays, device)
         if val_loss < best_loss - 1e-10:
             best_loss, best_epoch, bad = val_loss, epoch, 0
@@ -243,13 +359,38 @@ def train_clv_core_encoder(
             }
         else:
             bad += 1
+        history.append({
+            "epoch": int(epoch),
+            "train_loss": float(total_loss / max(1, n_batches)),
+            "val_loss": float(val_loss),
+        })
+        if select_store is not None:
+            select_store.save_epoch(
+                model,
+                optimizer,
+                rng,
+                epoch=int(epoch),
+                best_epoch=int(best_epoch),
+                best_metric=float(-best_loss),
+                best_state=best_state,
+                bad=int(bad),
+                updates=int(updates),
+                samples=int(samples),
+                history=history,
+                wall_clock_sec=previous_wall + time.time() - started,
+            )
         if bad >= encoder_patience:
             break
     if best_state is None:
         raise RuntimeError("CLV-core encoder의 최적 epoch를 선택하지 못했습니다")
     model.load_state_dict(best_state)
     diagnostics = _diagnostics(model, dataset.anchors[-1], transform, device)
-    diagnostics.update(best_epoch=best_epoch, best_val_loss=best_loss)
+    diagnostics.update(
+        best_epoch=best_epoch,
+        best_val_loss=best_loss,
+        resumed_from_epoch=resumed_from,
+        selection_epochs_run=int(last_epoch),
+    )
 
     final_transform = residual.fit_feature_transform(dataset.anchors)
     all_arrays = _stack(dataset.anchors, final_transform)
@@ -257,7 +398,7 @@ def train_clv_core_encoder(
     final_model = CLVCoreEncoder(all_arrays[0].shape[1], all_arrays[1].shape[1]).to(
         device
     )
-    _fit_epochs(
+    final_fit = _fit_epochs(
         final_model,
         all_arrays,
         best_epoch,
@@ -265,7 +406,11 @@ def train_clv_core_encoder(
         encoder_lr,
         seed,
         device,
+        progress_store=(
+            None if progress_stores is None else progress_stores.get("final")
+        ),
     )
+    diagnostics["final_fit"] = final_fit
     snapshot_n, snapshot_v = _axis_inputs(final_snapshot, final_transform)
     final_model.eval()
     with torch.no_grad():

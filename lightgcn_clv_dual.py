@@ -311,6 +311,7 @@ def _train_variant(
     seed=42,
     gate_shapes=GATE_SHAPES,
     lambda_eval=None,
+    progress_store=None,
 ):
     model = CLVDualAxisEmbeddingModel(
         base_model,
@@ -344,6 +345,7 @@ def _train_variant(
         seed,
         validation_recall,
         freeze_base=True,
+        progress_store=progress_store,
     )
     diagnostics = _diagnostics(model, prepared["artifact"])
     checkpoint = prepared["out_dir"] / (
@@ -433,7 +435,7 @@ def _load_encoder_artifact(path, n_users):
     )
 
 
-def _prepare(cfg, seed=42, encoder_checkpoint=None):
+def _prepare(cfg, seed=42, encoder_checkpoint=None, progress_stores=None):
     out_dir = Path(cfg.out_dir or f"{v3.default_out_dir(cfg.dataset)}_clv_dual")
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = moe.build_input_manifest(v3.SCHEMA[cfg.dataset])
@@ -465,6 +467,14 @@ def _prepare(cfg, seed=42, encoder_checkpoint=None):
             encoder_lr=cfg.encoder_lr,
             seed=seed,
             device=v3.DEVICE,
+            progress_stores=(
+                None
+                if progress_stores is None
+                else {
+                    "select": progress_stores.get("encoder_select"),
+                    "final": progress_stores.get("encoder_final"),
+                }
+            ),
         )
     )
     user_profile = core.compose_clv_core_profiles(artifact, snapshot, v3.DEVICE)
@@ -507,7 +517,13 @@ def _prepare(cfg, seed=42, encoder_checkpoint=None):
     )
     existed = m1_checkpoint.exists()
     baseline_model, _ = moe._fresh_external_m1(
-        base_context, seed, data, base_cfg
+        base_context,
+        seed,
+        data,
+        base_cfg,
+        progress_store=(
+            None if progress_stores is None else progress_stores.get("m1")
+        ),
     )
     baseline_hash = moe.state_hash(baseline_model)
     moe.validate_or_write_m1_manifest(

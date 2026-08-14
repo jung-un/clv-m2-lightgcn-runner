@@ -427,6 +427,7 @@ def train_moe(
     seed: int,
     eval_recall,
     freeze_base: bool = False,
+    progress_store=None,
 ) -> dict:
     """Train adapters with plain BPR, then optionally fine-tune M1 embeddings."""
     residual._seed_everything(seed)
@@ -449,14 +450,42 @@ def train_moe(
     samples = 0
     base_updates_by_epoch = []
     started = time.time()
-    for epoch in range(1, cfg.max_epochs + 1):
+    history = []
+    start_epoch = 1
+    resumed_from = 0
+    previous_wall = 0.0
+    if progress_store is not None:
+        restored = progress_store.restore_epoch(model, optimizer, rng)
+        if restored is not None:
+            start_epoch = int(restored["next_epoch"])
+            resumed_from = start_epoch - 1
+            best = float(restored["best_metric"])
+            best_epoch = int(restored["best_epoch"])
+            best_state = restored["best_state"]
+            best_updates = int(restored.get("best_updates", 0))
+            best_base_updates = int(restored.get("best_base_updates", 0))
+            bad = int(restored["bad"])
+            updates = int(restored["updates"])
+            samples = int(restored["samples"])
+            base_updates_by_epoch = list(restored.get("base_updates_by_epoch", []))
+            history = list(restored.get("history", []))
+            previous_wall = float(restored.get("wall_clock_sec", 0.0))
+            print(f"  [adapter] epoch {resumed_from}에서 자동 재개")
+        progress_store.mark_stage(
+            "running", epoch=resumed_from, max_epoch=int(cfg.max_epochs)
+        )
+    n_batches = int(np.ceil(len(data["tr_u"]) / int(base_cfg["BATCH_SIZE"])))
+    last_epoch = resumed_from
+    for epoch in range(start_epoch, cfg.max_epochs + 1):
+        last_epoch = epoch
         base_active = (not freeze_base) and epoch > cfg.frozen_epochs
         _set_base_trainable(model.base_model, base_active)
         model.train()
         base_updates = 0
-        for users, positives, negatives in _plain_bpr_batches(
+        epoch_loss = 0.0
+        for batch_index, (users, positives, negatives) in enumerate(_plain_bpr_batches(
             data, base_cfg, rng, device
-        ):
+        ), start=1):
             loss = model.bpr_loss(users, positives, negatives, cfg.lambda_train)
             if base_active:
                 loss = loss + _base_regularization(
@@ -468,6 +497,15 @@ def train_moe(
             updates += 1
             samples += len(users)
             base_updates += int(base_active)
+            epoch_loss += float(loss.detach())
+            if progress_store is not None:
+                progress_store.heartbeat(
+                    epoch=epoch,
+                    max_epoch=int(cfg.max_epochs),
+                    batch=batch_index,
+                    batches=n_batches,
+                    loss=epoch_loss / batch_index,
+                )
         base_updates_by_epoch.append(base_updates)
         model.eval()
         score = float(eval_recall(model))
@@ -480,6 +518,30 @@ def train_moe(
             bad = 0
         else:
             bad += 1
+        history.append({
+            "epoch": int(epoch),
+            "loss": float(epoch_loss / max(1, n_batches)),
+            "val_recall@10": float(score),
+            "base_updates": int(base_updates),
+        })
+        if progress_store is not None:
+            progress_store.save_epoch(
+                model,
+                optimizer,
+                rng,
+                epoch=int(epoch),
+                best_epoch=int(best_epoch),
+                best_metric=float(best),
+                best_state=best_state,
+                best_updates=int(best_updates),
+                best_base_updates=int(best_base_updates),
+                bad=int(bad),
+                updates=int(updates),
+                samples=int(samples),
+                base_updates_by_epoch=base_updates_by_epoch,
+                history=history,
+                wall_clock_sec=previous_wall + time.time() - started,
+            )
         if bad >= cfg.patience:
             break
     if best_state is None:
@@ -488,7 +550,7 @@ def train_moe(
     return {
         "loss": "plain_bpr",
         "best_epoch": int(best_epoch),
-        "epochs_run": int(epoch),
+        "epochs_run": int(last_epoch),
         "best_val_recall@10": float(best),
         "updates": int(updates),
         "samples": int(samples),
@@ -496,8 +558,11 @@ def train_moe(
         "updates_at_best": int(best_updates),
         "base_updates_at_best": int(best_base_updates),
         "base_updates_by_epoch": base_updates_by_epoch,
-        "wall_clock_sec": float(time.time() - started),
+        "wall_clock_sec": float(previous_wall + time.time() - started),
         "freeze_base": bool(freeze_base),
+        "resumed_from_epoch": int(resumed_from),
+        "new_epochs_run": int(max(0, last_epoch - resumed_from)),
+        "history": history,
     }
 
 
@@ -660,7 +725,14 @@ def _flat_evaluation(
     return flat, per_user_result
 
 
-def _fresh_external_m1(context: dict, seed: int, data: dict, base_cfg: dict):
+def _fresh_external_m1(
+    context: dict,
+    seed: int,
+    data: dict,
+    base_cfg: dict,
+    *,
+    progress_store=None,
+):
     model, stats = v3.get_or_train(
         "pref_only",
         seed,
@@ -672,6 +744,7 @@ def _fresh_external_m1(context: dict, seed: int, data: dict, base_cfg: dict):
         context["meta"],
         context["caches"]["val"],
         base_cfg,
+        progress_store=progress_store,
     )
     model.eval()
     return model, stats
