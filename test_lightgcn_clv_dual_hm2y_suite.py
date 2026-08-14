@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -236,3 +237,27 @@ def test_suite_runs_three_variants_once_then_loads_completed_stages(
     suite.run_hm2y_suite(cfg)
 
     assert trained == list(suite.MODELS[1:])
+
+
+def test_hm2y_suite_colab_is_pinned_and_runs_four_models_without_ack_gate():
+    notebook = json.loads(Path("clv_dual_hm2y_suite_colab.ipynb").read_text())
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert re.search(r"REVIEWED_SHA = '[0-9a-f]{40}'", source)
+    assert "%cd /content" in source
+    assert "configure_hm2y_suite" in source
+    assert "run_hm2y_suite(cfg)" in source
+    assert "read_progress(cfg.out_dir)" in source
+    assert "torch.cuda.is_available()" in source
+    assert "ACKNOWLEDGE_HIGH_COST" not in source
+    assert "eval_test=True" not in source
+    assert "eval_holdout=True" not in source
+    for model_id in (
+        "m1",
+        "dual_clv_fixed",
+        "dual_shuffled_user",
+        "dual_adapter_only",
+    ):
+        assert model_id in source
