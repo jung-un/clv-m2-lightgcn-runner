@@ -435,7 +435,13 @@ def _load_encoder_artifact(path, n_users):
     )
 
 
-def _prepare(cfg, seed=42, encoder_checkpoint=None, progress_stores=None):
+def _prepare(
+    cfg,
+    seed=42,
+    encoder_checkpoint=None,
+    progress_stores=None,
+    batch_selector=None,
+):
     out_dir = Path(cfg.out_dir or f"{v3.default_out_dir(cfg.dataset)}_clv_dual")
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = moe.build_input_manifest(v3.SCHEMA[cfg.dataset])
@@ -444,6 +450,8 @@ def _prepare(cfg, seed=42, encoder_checkpoint=None, progress_stores=None):
     base_cfg = moe._pure_m1_config(cfg, str(m1_root / f"data_{input_id[:12]}"))
     revision = moe.source_revision()
     data = v3.prepare_data(base_cfg, v3.DCFG)
+    if batch_selector is not None:
+        base_cfg["BATCH_SIZE"] = int(batch_selector(data, base_cfg))
     anchors = moe.residual.build_anchor_examples(
         data["train"],
         data["n_users"],
