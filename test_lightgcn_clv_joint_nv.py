@@ -52,6 +52,19 @@ def test_dunnhumby_variable_validity_uses_only_internal_training_windows():
     }
 
 
+def test_progress_paths_are_isolated_by_config_hash(tmp_path):
+    cfg = joint.configure_joint_nv_run("hm", short_hm=True)
+    old = joint._progress_store(
+        tmp_path, "joint_nv", cfg, "old_config", "same_input", "old_source"
+    )
+    current = joint._progress_store(
+        tmp_path, "joint_nv", cfg, "new_config", "same_input", "new_source"
+    )
+
+    assert old.root != current.root
+    assert old.latest_checkpoint != current.latest_checkpoint
+
+
 def test_public_runner_blocks_protected_splits_before_data_access(monkeypatch):
     cfg = replace(joint.configure_joint_nv_run("hm", short_hm=True), eval_test=True)
     touched = False

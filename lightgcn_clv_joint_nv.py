@@ -276,7 +276,7 @@ def _config_hash(cfg: JointNVConfig, input_hash: str, revision: str) -> str:
 
 def _progress_store(root, stage, cfg, config_hash, input_hash, revision):
     return ProgressStore(
-        Path(root) / "progress",
+        Path(root) / "progress" / config_hash,
         RunIdentity(
             stage=stage,
             model_id=stage,
