@@ -3,6 +3,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+import lightgcn_clv_residual as residual
 import lightgcn_clv_joint_nv as joint
 
 
@@ -21,6 +22,11 @@ def test_hm60_preset_is_seed42_validation_only_and_plain_bpr():
     assert summary["eval_test"] is False
     assert summary["eval_holdout"] is False
     assert summary["models"] == ["m1", "joint_nv"]
+    assert joint.variable_validity_plan(cfg) == {
+        "input_days": 14,
+        "target_days": 7,
+        "anchor_offsets": (21, 14, 7),
+    }
 
 
 def test_fast_two_dataset_suite_runs_hm60_then_full_dunnhumby(monkeypatch):
@@ -35,6 +41,15 @@ def test_fast_two_dataset_suite_runs_hm60_then_full_dunnhumby(monkeypatch):
 
     assert seen == [("hm", 60, "high"), ("dunnhumby", None, "equal")]
     assert result == {"hm_w60": "hm", "dunnhumby_full": "dunnhumby"}
+
+
+def test_dunnhumby_variable_validity_uses_only_internal_training_windows():
+    cfg = joint.configure_joint_nv_run("dunnhumby", short_hm=False)
+    assert joint.variable_validity_plan(cfg) == {
+        "input_days": 365,
+        "target_days": 90,
+        "anchor_offsets": (270, 180, 90),
+    }
 
 
 def test_public_runner_blocks_protected_splits_before_data_access(monkeypatch):
@@ -52,25 +67,56 @@ def test_public_runner_blocks_protected_splits_before_data_access(monkeypatch):
     assert touched is False
 
 
-def test_user_axes_are_deterministic_historical_clv_components():
-    values = np.array(
-        [
-            [0.2, 0.4, 0.6, 0.8, 1.0],
-            [0.8, 0.6, 0.4, 0.2, 0.0],
-            [0.5, 0.5, 0.5, 0.5, 0.5],
-        ],
-        np.float32,
+def test_user_axes_use_literature_grounded_current_features_and_masks():
+    numeric = np.zeros((3, len(residual.NUMERIC_FEATURES)), np.float32)
+    valid = np.ones_like(numeric, dtype=bool)
+    values = {
+        "recency_days": [2, 20, 8],
+        "basket_count": [8, 2, 5],
+        "observed_days": [30, 10, 20],
+        "gap_mean": [4, 0, 7],
+        "avg_basket_value": [10, 100, 40],
+    }
+    for name, column in values.items():
+        numeric[:, residual.NUMERIC_FEATURES.index(name)] = column
+    valid[1, residual.NUMERIC_FEATURES.index("gap_mean")] = False
+    snapshot = residual.AnchorExamples(
+        0, 0, 1, 2, 1, np.array([0, 2, 3]), numeric, valid,
+        np.zeros(3, np.float32), np.zeros(3, np.float32),
     )
-    valid = np.array([True, True, True])
-    axes = joint.build_user_axis_inputs(values, valid)
+    axes = joint.build_user_axis_inputs(snapshot, n_users=5)
 
-    np.testing.assert_array_equal(axes["activity"], values[:, :3])
-    np.testing.assert_array_equal(axes["value"], values[:, 3:])
-    np.testing.assert_allclose(axes["n_hat"], [0.4, 0.6, 0.5])
-    np.testing.assert_allclose(axes["v_hat"], [0.9, 0.1, 0.5])
-    np.testing.assert_allclose(axes["clv_proxy"], axes["n_hat"] * axes["v_hat"])
-    assert axes["q_n"].shape == (3,)
-    assert axes["q_v"].shape == (3,)
+    assert axes["activity"].shape == (5, 8)
+    assert axes["value"].shape == (5, 2)
+    assert axes["activity_names"] == (
+        "repeat_transaction_count",
+        "transaction_recency",
+        "customer_age",
+        "mean_transaction_gap",
+        "valid_repeat_transaction_count",
+        "valid_transaction_recency",
+        "valid_customer_age",
+        "valid_mean_transaction_gap",
+    )
+    assert axes["value_names"] == (
+        "mean_transaction_value",
+        "valid_mean_transaction_value",
+    )
+    assert "premium_share" not in axes["value_names"]
+    assert axes["repeat_transaction_count"][0] == 7
+    assert axes["repeat_transaction_count"][2] == 1
+    assert axes["transaction_recency"][0] == 27
+    assert axes["customer_age"][0] == 29
+    assert axes["mean_transaction_value"][2] == 100
+    assert axes["activity"][2, 7] == 0.0
+    assert not axes["valid_user"][1]
+    assert axes["valid_user"][[0, 2, 3]].all()
+    np.testing.assert_allclose(
+        axes["clv_proxy"],
+        axes["n_behavior_score"] * axes["v_behavior_score"],
+    )
+    assert axes["q_n"].shape == (5,)
+    assert axes["q_v"].shape == (5,)
 
 
 def test_result_row_keeps_model_identity_and_full_metric_payload():

@@ -14,11 +14,13 @@ import torch
 from clv_dual_axis_model import build_dual_item_profiles, fixed_percentile_ranks
 from clv_joint_nv_model import JointNVLightGCN
 from clv_run_state import ProgressStore, RunIdentity
+from clv_variable_validity import candidate_variables, validate_anchor
 import lightgcn_clv_moe as moe
+import lightgcn_clv_residual as residual
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m2-joint-nv-lightgcn-v1.0"
+CODE_VERSION = "m2-joint-nv-lightgcn-v1.1"
 PRIMARY_MODEL = "joint_nv"
 CONTROLS = ()
 MODELS = ("m1", PRIMARY_MODEL, *CONTROLS)
@@ -29,6 +31,7 @@ class JointNVConfig:
     dataset: str
     seed: int = 42
     window_days: int | None = None
+    input_days: int = 365
     gate_shape: str = "equal"
     id_dim: int = 64
     axis_dim: int = 16
@@ -57,6 +60,7 @@ def configure_joint_nv_run(
     defaults = {
         "dataset": dataset,
         "window_days": 60 if short_hm else None,
+        "input_days": 14 if short_hm else 365,
         "gate_shape": "high" if dataset == "hm" else "equal",
         "out_dir": f"{v3.default_out_dir(dataset)}_m2_joint_nv_{suffix}",
         "m1_checkpoint_dir": v3.default_out_dir(dataset),
@@ -73,11 +77,34 @@ def validate_joint_nv_config(cfg: JointNVConfig) -> JointNVConfig:
         raise ValueError(f"알 수 없는 dataset: {cfg.dataset}")
     if cfg.gate_shape not in {"high", "equal", "low"}:
         raise ValueError(f"알 수 없는 gate_shape: {cfg.gate_shape}")
-    if min(cfg.id_dim, cfg.axis_dim, cfg.hidden_dim, cfg.batch_size, cfg.max_epochs) <= 0:
+    if min(
+        cfg.input_days,
+        cfg.id_dim,
+        cfg.axis_dim,
+        cfg.hidden_dim,
+        cfg.batch_size,
+        cfg.max_epochs,
+    ) <= 0:
         raise ValueError("모델·학습 크기는 양수여야 합니다")
     if cfg.n_layers < 0 or cfg.early_stop <= 0:
         raise ValueError("n_layers/early_stop 설정이 잘못됐습니다")
     return cfg
+
+
+def variable_validity_plan(cfg: JointNVConfig) -> dict:
+    """Predeclared train-internal windows; official evaluation labels are absent."""
+    cfg = validate_joint_nv_config(cfg)
+    if cfg.dataset == "hm" and cfg.window_days == 60:
+        return {
+            "input_days": 14,
+            "target_days": 7,
+            "anchor_offsets": (21, 14, 7),
+        }
+    return {
+        "input_days": 365,
+        "target_days": 90,
+        "anchor_offsets": (270, 180, 90),
+    }
 
 
 def preflight_summary(cfg: JointNVConfig) -> dict:
@@ -87,6 +114,7 @@ def preflight_summary(cfg: JointNVConfig) -> dict:
         "dataset": cfg.dataset,
         "seed": cfg.seed,
         "window_days": cfg.window_days,
+        "input_days": cfg.input_days,
         "models": list(MODELS),
         "architecture": "ID|N|V layer-0 concat -> one binary LightGCN -> one dot score",
         "gate_shape": cfg.gate_shape,
@@ -96,33 +124,101 @@ def preflight_summary(cfg: JointNVConfig) -> dict:
         "separate_encoder": False,
         "frozen_or_external_base": False,
         "post_score_residual": False,
+        "variable_validity": variable_validity_plan(cfg),
+        "variable_validity_source": "train_internal_only",
         "eval_test": cfg.eval_test,
         "eval_holdout": cfg.eval_holdout,
         "out_dir": cfg.out_dir,
     }
 
 
-def build_user_axis_inputs(x_val_u, valid_user) -> dict:
-    values = np.asarray(x_val_u, dtype=np.float32)
-    valid = np.asarray(valid_user, dtype=bool)
-    if values.ndim != 2 or values.shape[1] != 5 or valid.shape != (len(values),):
-        raise ValueError("사용자 입력은 [F_p,T_p,R_p,AOV_p,Prem_p] 5차원이어야 합니다")
-    if not np.isfinite(values).all():
-        raise ValueError("사용자 입력은 유한해야 합니다")
-    activity = values[:, :3].copy()
-    value = values[:, 3:].copy()
-    n_hat = activity.mean(1)
-    v_hat = value.mean(1)
-    q_n, q_v = fixed_percentile_ranks(n_hat, v_hat, valid)
+def _standardized_axis(raw, masks):
+    raw = np.log1p(np.maximum(np.asarray(raw, np.float32), 0.0))
+    masks = np.asarray(masks, bool)
+    if raw.shape != masks.shape:
+        raise ValueError("axis raw와 validity mask shape이 다릅니다")
+    transformed = np.zeros_like(raw)
+    for column in range(raw.shape[1]):
+        good = masks[:, column] & np.isfinite(raw[:, column])
+        if good.any():
+            mean = float(raw[good, column].mean())
+            std = float(raw[good, column].std())
+            transformed[good, column] = (raw[good, column] - mean) / max(std, 1e-6)
+    return np.concatenate([transformed, masks.astype(np.float32)], axis=1)
+
+
+def build_user_axis_inputs(snapshot, n_users: int) -> dict:
+    activity_names = (
+        "repeat_transaction_count",
+        "transaction_recency",
+        "customer_age",
+        "mean_transaction_gap",
+    )
+    value_names = ("mean_transaction_value",)
+    if len(snapshot.user_ids) != len(snapshot.numeric) or len(snapshot.numeric) != len(snapshot.valid):
+        raise ValueError("snapshot 사용자·특징 크기가 다릅니다")
+    if len(snapshot.user_ids) and (
+        snapshot.user_ids.min() < 0 or snapshot.user_ids.max() >= n_users
+    ):
+        raise ValueError("snapshot user_ids가 n_users 범위를 벗어났습니다")
+
+    candidates = candidate_variables(snapshot)
+    base_valid = np.logical_and.reduce(
+        [
+            snapshot.valid[:, residual.NUMERIC_FEATURES.index(name)]
+            for name in ("basket_count", "recency_days", "observed_days")
+        ]
+    )
+    activity_masks = np.column_stack(
+        [base_valid, base_valid, base_valid, candidates.gap_valid.to_numpy(bool)]
+    )
+    value_masks = candidates.value_valid.to_numpy(bool)[:, None]
+    local_activity = _standardized_axis(
+        candidates.loc[:, activity_names].to_numpy(np.float32), activity_masks
+    )
+    local_value = _standardized_axis(
+        candidates.loc[:, value_names].to_numpy(np.float32), value_masks
+    )
+    local_n = candidates.new_n_behavior.to_numpy(np.float32)
+    local_v = candidates.new_v_behavior.to_numpy(np.float32)
+
+    activity = np.zeros((n_users, local_activity.shape[1]), np.float32)
+    value = np.zeros((n_users, local_value.shape[1]), np.float32)
+    n_behavior_score = np.zeros(n_users, np.float32)
+    v_behavior_score = np.zeros(n_users, np.float32)
+    repeat_transaction_count = np.zeros(n_users, np.float32)
+    transaction_recency = np.zeros(n_users, np.float32)
+    customer_age = np.zeros(n_users, np.float32)
+    mean_transaction_value = np.zeros(n_users, np.float32)
+    valid_user = np.zeros(n_users, bool)
+    ids = np.asarray(snapshot.user_ids, np.int64)
+    activity[ids] = local_activity
+    value[ids] = local_value
+    n_behavior_score[ids] = local_n
+    v_behavior_score[ids] = local_v
+    repeat_transaction_count[ids] = candidates.repeat_transaction_count
+    transaction_recency[ids] = candidates.transaction_recency
+    customer_age[ids] = candidates.customer_age
+    mean_transaction_value[ids] = candidates.mean_transaction_value
+    valid_user[ids] = True
+    q_n, q_v = fixed_percentile_ranks(
+        n_behavior_score, v_behavior_score, valid_user
+    )
     return {
         "activity": activity,
         "value": value,
-        "n_hat": n_hat,
-        "v_hat": v_hat,
-        "clv_proxy": n_hat * v_hat,
+        "n_behavior_score": n_behavior_score,
+        "v_behavior_score": v_behavior_score,
+        "clv_proxy": n_behavior_score * v_behavior_score,
         "q_n": q_n,
         "q_v": q_v,
-        "valid_user": valid,
+        "valid_user": valid_user,
+        "repeat_transaction_count": repeat_transaction_count,
+        "transaction_recency": transaction_recency,
+        "customer_age": customer_age,
+        "mean_transaction_value": mean_transaction_value,
+        "activity_names": activity_names + tuple(f"valid_{name}" for name in activity_names),
+        "value_names": value_names + tuple(f"valid_{name}" for name in value_names),
     }
 
 
@@ -214,8 +310,33 @@ def _prepare(cfg: JointNVConfig) -> dict:
     base_cfg = _base_config(cfg)
     data = v3.prepare_data(base_cfg, v3.DCFG)
     data["loss_w"] = None
-    valid_user = np.isfinite(data["clv"])
-    axes = build_user_axis_inputs(data["x_val_u"], valid_user)
+    validity_plan = variable_validity_plan(cfg)
+    validity_anchors = residual.build_anchor_examples(
+        data["train"],
+        data["n_users"],
+        v3.DCFG["is_date"],
+        **validity_plan,
+    )
+    validity_reports = [
+        validate_anchor(
+            anchor,
+            dataset=cfg.dataset,
+            anchor_label=f"train_internal_T-{anchor.offset_days}",
+        )
+        for anchor in validity_anchors.anchors
+    ]
+    variable_validity = {
+        "metrics": pd.concat(
+            [report["metrics"] for report in validity_reports], ignore_index=True
+        ),
+        "quadrants": pd.concat(
+            [report["quadrants"] for report in validity_reports], ignore_index=True
+        ),
+    }
+    snapshot = residual.build_final_snapshot(
+        data["train"], data["n_users"], v3.DCFG["is_date"], cfg.input_days
+    )
+    axes = build_user_axis_inputs(snapshot, data["n_users"])
     item_profile = build_dual_item_profiles(
         data["train"], data["n_items"], v3.DCFG["is_date"]
     )
@@ -239,6 +360,7 @@ def _prepare(cfg: JointNVConfig) -> dict:
         "cache": cache,
         "x_item": x_item,
         "item_cat": item_cat,
+        "variable_validity": variable_validity,
     }
 
 
@@ -381,8 +503,12 @@ def _persist(prepared, cfg, rows, baseline_per_user, runs, decision):
     csv_path = prepared["out_dir"] / f"{stem}.csv"
     delta_path = prepared["out_dir"] / f"{stem}_delta.csv"
     json_path = prepared["out_dir"] / f"{stem}.json"
+    validity_path = prepared["out_dir"] / f"{stem}_variable_validity.csv"
+    quadrant_path = prepared["out_dir"] / f"{stem}_variable_quadrants.csv"
     frame.to_csv(csv_path, index=False, float_format="%.8f")
     pd.DataFrame(delta_rows).to_csv(delta_path, index=False)
+    prepared["variable_validity"]["metrics"].to_csv(validity_path, index=False)
+    prepared["variable_validity"]["quadrants"].to_csv(quadrant_path, index=False)
     payload = {
         "code_version": CODE_VERSION,
         "source_revision": prepared["revision"],
@@ -391,8 +517,8 @@ def _persist(prepared, cfg, rows, baseline_per_user, runs, decision):
         "preflight": preflight_summary(cfg),
         "data_stats": prepared["data"].get("data_stats", {}),
         "feature_schema": {
-            "user_activity": ["F_p", "T_p", "R_p"],
-            "user_value": ["AOV_p", "Prem_p"],
+            "user_activity": list(prepared["axes"]["activity_names"]),
+            "user_value": list(prepared["axes"]["value_names"]),
             "item_activity": list(prepared["item_profile"].activity_names),
             "item_value": list(prepared["item_profile"].value_names),
         },
@@ -402,6 +528,11 @@ def _persist(prepared, cfg, rows, baseline_per_user, runs, decision):
         "checkpoints": {name: run["checkpoint"] for name, run in runs.items()},
         "absolute_rows": frame.to_dict("records"),
         "paired_delta": delta_rows,
+        "variable_validity": {
+            "source": "train_internal_only",
+            "metrics": prepared["variable_validity"]["metrics"].to_dict("records"),
+            "quadrants": prepared["variable_validity"]["quadrants"].to_dict("records"),
+        },
         "interpretation": {
             "clv": "historical N×V CLV proxy used as conditional representation inputs",
             "revenue": "price/purchase-amount weighted hit, not incremental revenue",
@@ -413,7 +544,11 @@ def _persist(prepared, cfg, rows, baseline_per_user, runs, decision):
     )
     frame.attrs["decision"] = decision
     frame.attrs["result_paths"] = {
-        "csv": str(csv_path), "delta_csv": str(delta_path), "json": str(json_path)
+        "csv": str(csv_path),
+        "delta_csv": str(delta_path),
+        "variable_validity_csv": str(validity_path),
+        "variable_quadrants_csv": str(quadrant_path),
+        "json": str(json_path),
     }
     return frame
 
