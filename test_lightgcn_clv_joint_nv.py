@@ -1,10 +1,26 @@
 from dataclasses import replace
+import json
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 import lightgcn_clv_residual as residual
 import lightgcn_clv_joint_nv as joint
+
+
+def test_colab_drops_stale_repo_modules_before_importing_runner():
+    notebook = json.loads(
+        Path("clv_joint_nv_two_dataset_colab.ipynb").read_text(encoding="utf-8")
+    )
+    import_cell = "".join(notebook["cells"][2]["source"])
+
+    assert "importlib.invalidate_caches()" in import_cell
+    assert "sys.modules" in import_cell
+    assert "str(repo)" in import_cell
+    assert import_cell.index("sys.modules") < import_cell.index(
+        "from lightgcn_clv_joint_nv import"
+    )
 
 
 def test_hm60_preset_is_seed42_validation_only_and_plain_bpr():
