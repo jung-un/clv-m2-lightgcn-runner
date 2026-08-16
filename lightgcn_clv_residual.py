@@ -57,6 +57,8 @@ class AnchorExamples:
     valid: np.ndarray
     purchase_target: np.ndarray
     amount_target: np.ndarray
+    transaction_target: np.ndarray | None = None
+    mean_transaction_value_target: np.ndarray | None = None
 
 
 @dataclass
@@ -297,6 +299,17 @@ def build_anchor_examples(
         )
         future = target.groupby("u_idx").v.sum().clip(lower=0.0)
         amount = np.asarray([future.get(u, 0.0) for u in users], dtype=np.float32)
+        target_basket_key = "b_raw" if "b_raw" in target.columns else "t"
+        future_transactions = target.groupby("u_idx")[target_basket_key].nunique()
+        transaction_count = np.asarray(
+            [future_transactions.get(u, 0.0) for u in users], dtype=np.float32
+        )
+        mean_transaction_value = np.divide(
+            amount,
+            transaction_count,
+            out=np.zeros_like(amount),
+            where=transaction_count > 0,
+        )
         anchors.append(
             AnchorExamples(
                 offset,
@@ -309,6 +322,8 @@ def build_anchor_examples(
                 valid,
                 (amount > 0).astype(np.float32),
                 amount,
+                transaction_count,
+                mean_transaction_value,
             )
         )
     return AnchorDataset(anchors=anchors, train_end=train_end, n_users=n_users)
@@ -862,8 +877,24 @@ def _effective_score_ratio(
     }
 
 
-def _result_fingerprint(cfg: ResidualConfig, base_cfg: dict) -> str:
-    payload = {
+def _input_manifest_hash(input_manifest: dict) -> str:
+    identity = {
+        label: {"bytes": entry["bytes"], "sha256": entry["sha256"]}
+        for label, entry in input_manifest.items()
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True).encode()
+    ).hexdigest()
+
+
+def _provenance_payload(
+    cfg: ResidualConfig,
+    base_cfg: dict,
+    input_manifest: dict,
+    source_revision: str,
+    baseline_state_hashes: dict[str, str],
+) -> dict:
+    return {
         "residual": asdict(cfg),
         "base": {
             k: base_cfg[k]
@@ -877,16 +908,105 @@ def _result_fingerprint(cfg: ResidualConfig, base_cfg: dict) -> str:
                 "WINDOW_DAYS",
                 "VAL_DAYS",
                 "TEST_DAYS",
+                "HOLDOUT_DAYS",
                 "MIN_USER_INTER",
                 "MIN_ITEM_INTER",
+                "NEG_MODE",
+                "GRAPH_MODE",
+                "LOSS_MODE",
             )
         },
         "code": CODE_VERSION,
         "features": NUMERIC_FEATURES,
+        "source_revision": source_revision,
+        "input_manifest_hash": _input_manifest_hash(input_manifest),
+        "baseline_state_hashes": baseline_state_hashes,
     }
+
+
+def _result_fingerprint(
+    cfg: ResidualConfig,
+    base_cfg: dict,
+    input_manifest: dict,
+    source_revision: str,
+    baseline_state_hashes: dict[str, str],
+) -> str:
+    payload = _provenance_payload(
+        cfg,
+        base_cfg,
+        input_manifest,
+        source_revision,
+        baseline_state_hashes,
+    )
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, default=str).encode()
     ).hexdigest()[:10]
+
+
+def _checkpoint_fingerprint(
+    cfg: ResidualConfig,
+    base_cfg: dict,
+    input_manifest: dict,
+    source_revision: str,
+    seed: int,
+    baseline_state_hash: str,
+) -> str:
+    return _result_fingerprint(
+        cfg,
+        base_cfg,
+        input_manifest,
+        source_revision,
+        {str(seed): baseline_state_hash},
+    )
+
+
+def _checkpoint_path(
+    out_dir: str | Path,
+    artifact_name: str,
+    dataset: str,
+    seed: int,
+    fingerprint: str,
+) -> Path:
+    return Path(out_dir) / f"{artifact_name}_{dataset}_s{seed}_{fingerprint}.pt"
+
+
+def _checkpoint_provenance(
+    cfg: ResidualConfig,
+    base_cfg: dict,
+    input_manifest: dict,
+    source_revision: str,
+    seed: int,
+    baseline_state_hash: str,
+    m1_checkpoint: str | Path,
+) -> dict:
+    fingerprint = _checkpoint_fingerprint(
+        cfg,
+        base_cfg,
+        input_manifest,
+        source_revision,
+        seed,
+        baseline_state_hash,
+    )
+    return {
+        "checkpoint_fingerprint": fingerprint,
+        "source_revision": source_revision,
+        "input_manifest": input_manifest,
+        "input_manifest_hash": _input_manifest_hash(input_manifest),
+        "baseline_state_hash": baseline_state_hash,
+        "seed": int(seed),
+        "m1_checkpoint": str(m1_checkpoint),
+        "config": asdict(cfg),
+    }
+
+
+def _save_provenance_checkpoint(
+    path: str | Path,
+    payload: dict,
+    provenance: dict,
+) -> Path:
+    path = Path(path)
+    torch.save(payload | {"provenance": provenance}, path)
+    return path
 
 
 def preflight_summary(cfg: ResidualConfig) -> dict:
@@ -915,12 +1035,17 @@ def run_experiment(cfg: ResidualConfig | None = None) -> pd.DataFrame:
     The default is Dunnhumby, seed 42, validation only.  Test labels are not
     constructed unless ``cfg.eval_test`` is explicitly true.
     """
+    import lightgcn_clv_moe as moe
     import lightgcn_clv_v3 as v3
 
     cfg = cfg or configure_residual_run("dunnhumby")
+    input_manifest = moe.build_input_manifest(v3.SCHEMA[cfg.dataset])
+    input_id = moe.manifest_hash(input_manifest)
+    revision = moe.source_revision()
     out_dir = Path(cfg.out_dir or (v3.default_out_dir(cfg.dataset) + "_clv_residual"))
     out_dir.mkdir(parents=True, exist_ok=True)
-    m1_dir = cfg.m1_checkpoint_dir or v3.default_out_dir(cfg.dataset)
+    m1_root = Path(cfg.m1_checkpoint_dir or v3.default_out_dir(cfg.dataset))
+    m1_dir = m1_root / f"data_{input_id[:12]}"
     base_cfg = v3.configure_run(
         dataset=cfg.dataset,
         out_dir=str(m1_dir),
@@ -958,38 +1083,29 @@ def run_experiment(cfg: ResidualConfig | None = None) -> pd.DataFrame:
     x_item, item_cat = v3.item_value_features(data["train"], data["n_items"])
     meta = v3.item_meta(data["train"], data["n_items"])
     ones_gate = torch.ones(data["n_users"], dtype=torch.float32, device=v3.DEVICE)
-    fingerprint = _result_fingerprint(cfg, base_cfg)
     model_variants = [("clv_residual", False)]
     if cfg.include_constant_control:
         model_variants.append(("constant_control", True))
 
     rows, encoder_records, train_records = [], {}, {}
     val_per_user, base_per_user, checkpoint_paths = {}, {}, {}
+    artifact_checkpoint_paths = {}
+    baseline_state_hashes = {}
+    checkpoint_fingerprints = {}
     baseline_rows_by_seed = {}
     for seed in cfg.seed_list:
         artifact = train_future_value_encoder(anchors, snapshot, cfg, seed, v3.DEVICE)
         encoder_records[str(seed)] = artifact.diagnostics
-        encoder_path = out_dir / f"encoder_{cfg.dataset}_s{seed}_{fingerprint}.pt"
-        torch.save(
-            {
-                "state": artifact.model.state_dict(),
-                "transform": {
-                    "mean": artifact.transform.mean,
-                    "std": artifact.transform.std,
-                    "feature_names": artifact.transform.feature_names,
-                },
-                "h_all": artifact.h_all,
-                "ev_all": artifact.ev_all,
-                "best_epoch": artifact.best_epoch,
-                "diagnostics": artifact.diagnostics,
-            },
-            encoder_path,
-        )
         seg_th = v3.segment_thresholds(artifact.ev_all, base_cfg["SEG_EDGES"])
         caches = {
             name: v3.EvalCache(gt, rev, artifact.ev_all, seg_th, data["n_items"])
             for name, (gt, rev) in data["splits"].items()
         }
+        m1_checkpoint = Path(base_cfg["OUT_DIR"]) / (
+            f"ckpt_pref_only_{cfg.dataset}_s{seed}_"
+            f"{v3.cfg_hash(base_cfg, v3.DCFG, 'pref_only', seed)}.pt"
+        )
+        m1_existed_before = m1_checkpoint.exists()
         base_model, _ = v3.get_or_train(
             "pref_only",
             seed,
@@ -1003,6 +1119,49 @@ def run_experiment(cfg: ResidualConfig | None = None) -> pd.DataFrame:
             base_cfg,
         )
         base_model.eval()
+        baseline_state_hash = state_hash(base_model)
+        baseline_state_hashes[str(seed)] = baseline_state_hash
+        if not m1_checkpoint.exists():
+            raise RuntimeError(f"M1 checkpoint was not saved: {m1_checkpoint}")
+        moe.validate_or_write_m1_manifest(
+            m1_checkpoint,
+            input_manifest,
+            config_hash=v3.cfg_hash(base_cfg, v3.DCFG, "pref_only", seed),
+            state_hash_value=baseline_state_hash,
+            existed_before=m1_existed_before,
+        )
+        checkpoint_provenance = _checkpoint_provenance(
+            cfg,
+            base_cfg,
+            input_manifest,
+            revision,
+            seed,
+            baseline_state_hash,
+            m1_checkpoint,
+        )
+        checkpoint_fingerprint = checkpoint_provenance["checkpoint_fingerprint"]
+        checkpoint_fingerprints[str(seed)] = checkpoint_fingerprint
+        encoder_path = _checkpoint_path(
+            out_dir, "encoder", cfg.dataset, seed, checkpoint_fingerprint
+        )
+        _save_provenance_checkpoint(
+            encoder_path,
+            {
+                "state": artifact.model.state_dict(),
+                "transform": {
+                    "mean": artifact.transform.mean,
+                    "std": artifact.transform.std,
+                    "feature_names": artifact.transform.feature_names,
+                },
+                "h_all": artifact.h_all,
+                "ev_all": artifact.ev_all,
+                "best_epoch": artifact.best_epoch,
+                "diagnostics": artifact.diagnostics,
+            },
+            checkpoint_provenance,
+        )
+        artifact_checkpoint_paths[f"encoder_s{seed}"] = str(encoder_path)
+        artifact_checkpoint_paths[f"m1_s{seed}"] = str(m1_checkpoint)
         base_eval = v3.evaluate(
             base_model,
             0.0,
@@ -1064,10 +1223,15 @@ def run_experiment(cfg: ResidualConfig | None = None) -> pd.DataFrame:
                     p.numel() for p in model.trainable_parameters()
                 ),
             }
-            ckpt = (
-                out_dir / f"adapter_{model_id}_{cfg.dataset}_s{seed}_{fingerprint}.pt"
+            ckpt = _checkpoint_path(
+                out_dir,
+                f"adapter_{model_id}",
+                cfg.dataset,
+                seed,
+                checkpoint_fingerprint,
             )
-            torch.save(
+            _save_provenance_checkpoint(
+                ckpt,
                 {
                     "state": model.state_dict(),
                     "h_all": artifact.h_all,
@@ -1075,7 +1239,7 @@ def run_experiment(cfg: ResidualConfig | None = None) -> pd.DataFrame:
                     "encoder_path": str(encoder_path),
                     "train_stats": train_records[f"{model_id}_s{seed}"],
                 },
-                ckpt,
+                checkpoint_provenance,
             )
             checkpoint_paths[(model_id, seed)] = ckpt
             val_per_user[(model_id, seed)] = {}
@@ -1259,19 +1423,60 @@ def run_experiment(cfg: ResidualConfig | None = None) -> pd.DataFrame:
                 )
 
     frame = pd.DataFrame(rows)
+    fingerprint = _result_fingerprint(
+        cfg,
+        base_cfg,
+        input_manifest,
+        revision,
+        baseline_state_hashes,
+    )
     stem = f"clv_residual_{cfg.dataset}_{fingerprint}"
-    frame.to_csv(out_dir / f"{stem}.csv", index=False, float_format="%.8f")
-    pd.DataFrame(delta_records).to_csv(out_dir / f"{stem}_delta.csv", index=False)
-    with open(out_dir / f"{stem}.json", "w", encoding="utf-8") as f:
+    result_csv = out_dir / f"{stem}.csv"
+    delta_csv = out_dir / f"{stem}_delta.csv"
+    result_json = out_dir / f"{stem}.json"
+    frame.to_csv(result_csv, index=False, float_format="%.8f")
+    pd.DataFrame(delta_records).to_csv(delta_csv, index=False)
+    checkpoint_paths_json = {
+        f"{model_id}_s{seed}": str(path)
+        for (model_id, seed), path in checkpoint_paths.items()
+    } | artifact_checkpoint_paths
+    checkpoint_sha256 = {
+        key: moe.file_sha256(path)
+        for key, path in checkpoint_paths_json.items()
+        if Path(path).is_file()
+    }
+    frame.attrs["result_fingerprint"] = fingerprint
+    frame.attrs["result_paths"] = {
+        "csv": str(result_csv),
+        "delta_csv": str(delta_csv),
+        "json": str(result_json),
+    }
+    with result_json.open("w", encoding="utf-8") as f:
         json.dump(
             {
                 "code_version": CODE_VERSION,
+                "source_revision": revision,
+                "result_fingerprint": fingerprint,
+                "input_manifest": input_manifest,
+                "provenance": _provenance_payload(
+                    cfg,
+                    base_cfg,
+                    input_manifest,
+                    revision,
+                    baseline_state_hashes,
+                ),
                 "config": asdict(cfg),
                 "base_config": {k: v for k, v in base_cfg.items() if k != "OUT_DIR"},
+                "baseline_state_hashes": baseline_state_hashes,
+                "checkpoint_fingerprints": checkpoint_fingerprints,
+                "checkpoint_paths": checkpoint_paths_json,
+                "checkpoint_sha256": checkpoint_sha256,
+                "data_stats": data.get("data_stats", {}),
                 "selected_lambda": selected,
                 "selection_tables": selection_tables,
                 "encoder_diagnostics": encoder_records,
                 "training": train_records,
+                "absolute_rows": frame.to_dict("records"),
                 "delta": delta_records,
                 "interpretation": {
                     "ev": "90-day expected purchase value, not lifetime CLV",
@@ -1283,7 +1488,7 @@ def run_experiment(cfg: ResidualConfig | None = None) -> pd.DataFrame:
             indent=2,
             default=str,
         )
-    print(f"저장: {out_dir / (stem + '.csv')}")
+    print(f"저장: {result_csv}")
     print(f"validation 선택 λ: {selected}")
     return frame
 

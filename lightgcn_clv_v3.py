@@ -416,15 +416,34 @@ def binary_baseline(d, cfg):
     return d_base, cfg_base
 
 
+def _json_safe_time(value):
+    """Convert time boundaries to JSON-native scalars without losing precision."""
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def prepare_data(cfg, dcfg):
     """시간순 분할: train | val | test | holdout(가장 최근).
     holdout은 EVAL_HOLDOUT=True일 때만 평가에 쓰인다(그 전엔 정답조차 만들지 않음)."""
     tx = load_transactions(dcfg)
+    source_stats = {
+        "rows": int(len(tx)),
+        "time_min": _json_safe_time(tx["t"].min()),
+        "time_max": _json_safe_time(tx["t"].max()),
+    }
     if cfg["WINDOW_DAYS"]:
         t_max0 = tx["t"].max()
         delta = pd.Timedelta(days=cfg["WINDOW_DAYS"]) if dcfg["is_date"] else cfg["WINDOW_DAYS"]
         tx = tx[tx["t"] >= t_max0 - delta].copy()
         print(f"최근 {cfg['WINDOW_DAYS']}일 사용: {len(tx):,}건")
+    analysis_window = {
+        "rows_before_kcore": int(len(tx)),
+        "time_min": _json_safe_time(tx["t"].min()),
+        "time_max": _json_safe_time(tx["t"].max()),
+    }
 
     meta = pd.read_csv(dcfg["item_meta_path"], dtype={dcfg["item_key_col"]: str} if dcfg["is_date"] else None)
     meta = meta.rename(columns={dcfg["item_key_col"]: "i_raw", dcfg["category_col"]: "cat_raw"})
@@ -448,6 +467,26 @@ def prepare_data(cfg, dcfg):
           f"유저 {n_u0:,}→{len(keep_u):,} 아이템 {n_i0:,}→{len(keep_i):,} "
           f"엣지 {n_edge0:,}→{n_edge1:,}")
     data_stats = {
+        "source": source_stats,
+        "analysis_window": analysis_window,
+        "split_boundaries": {
+            "train": {
+                "start_inclusive": analysis_window["time_min"],
+                "end_inclusive": _json_safe_time(val_start),
+            },
+            "val": {
+                "start_exclusive": _json_safe_time(val_start),
+                "end_inclusive": _json_safe_time(test_start),
+            },
+            "test": {
+                "start_exclusive": _json_safe_time(test_start),
+                "end_inclusive": _json_safe_time(hold_start),
+            },
+            "holdout": {
+                "start_exclusive": _json_safe_time(hold_start),
+                "end_inclusive": _json_safe_time(t_max),
+            },
+        },
         "min_user_inter": cfg["MIN_USER_INTER"], "min_item_inter": cfg["MIN_ITEM_INTER"],
         "kcore_iters": n_iter,
         "train_rows_before": n_row0, "train_edges_before": n_edge0,
@@ -468,6 +507,23 @@ def prepare_data(cfg, dcfg):
     print(f"유저 {n_users:,} | 아이템 {n_items:,} | 카테고리({dcfg['category_col']}) {n_cat:,}")
 
     train = tx[tx["t"] <= val_start].copy()
+    val_rows = tx[(tx.t > val_start) & (tx.t <= test_start)]
+    test_rows = tx[(tx.t > test_start) & (tx.t <= hold_start)]
+    holdout_rows = tx[tx.t > hold_start]
+    data_stats["analysis_window"]["rows_after_kcore"] = int(len(tx))
+    data_stats["split_rows"] = {
+        "train": int(len(train)),
+        "val": int(len(val_rows)),
+        "test": int(len(test_rows)),
+        "holdout": int(len(holdout_rows)),
+    }
+    data_stats["split_evaluation_status"] = {
+        "val": "constructed",
+        "test": "constructed" if cfg["EVAL_TEST"] else "not_constructed",
+        "holdout": (
+            "constructed" if cfg["EVAL_HOLDOUT"] else "not_constructed"
+        ),
+    }
     train_users = set(train.u_idx.unique()); train_items = set(train.i_idx.unique())
     train_pair_key = np.unique(train.u_idx.values.astype(np.int64) * n_items + train.i_idx.values)
 
@@ -498,15 +554,13 @@ def prepare_data(cfg, dcfg):
         return gt, rev
 
     split_stats = {}
-    splits = {"val": build_eval(tx[(tx.t > val_start) & (tx.t <= test_start)],
-                                "val", "Val    ")}
+    splits = {"val": build_eval(val_rows, "val", "Val    ")}
     if cfg["EVAL_TEST"]:
-        splits["test"] = build_eval(tx[(tx.t > test_start) & (tx.t <= hold_start)],
-                                    "test", "Test   ")
+        splits["test"] = build_eval(test_rows, "test", "Test   ")
     else:
         print("  Test: 계산 안 함 (EVAL_TEST=False — 개발 중에는 validation만 본다)")
     if cfg["EVAL_HOLDOUT"]:
-        splits["holdout"] = build_eval(tx[tx.t > hold_start], "holdout", "Holdout")
+        splits["holdout"] = build_eval(holdout_rows, "holdout", "Holdout")
     else:
         print("  Holdout: 계산 안 함 (EVAL_HOLDOUT=False — 최종 확증 때만 켤 것)")
     data_stats["splits"] = split_stats
@@ -1109,7 +1163,20 @@ def sample_negatives(u_arr, pos_arr, n_items, pos_key, rng, mode="uniform",
     return neg
 
 
-def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, meta):
+def train_phase(
+    model,
+    params,
+    d,
+    gate_t,
+    lam_train,
+    cfg,
+    seed,
+    tag,
+    val_cache,
+    meta,
+    *,
+    progress_store=None,
+):
     """BPR로 params만 학습. 조기종료가 수렴점을 결정한다(상한 EPOCHS).
     학습량(업데이트 수·샘플 수·시간)을 함께 기록해 아키텍처 간 비교에 쓴다."""
     # REG_MODE="batch_l2"면 optimizer에 감쇠를 주지 않는다(정규화는 loss 안에서).
@@ -1121,8 +1188,29 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, 
     n_train = len(tr_u); n_batch = math.ceil(n_train / cfg["BATCH_SIZE"])
     best, best_ep, best_state, bad = -1.0, -1, None, 0
     updates, samples, t_start = 0, 0, time.time()
+    history, start_ep, resumed_from = [], 1, 0
+    previous_wall = 0.0
+    if progress_store is not None:
+        restored = progress_store.restore_epoch(model, opt, rng)
+        if restored is not None:
+            start_ep = int(restored["next_epoch"])
+            resumed_from = start_ep - 1
+            best = float(restored["best_metric"])
+            best_ep = int(restored["best_epoch"])
+            best_state = restored["best_state"]
+            bad = int(restored["bad"])
+            updates = int(restored["updates"])
+            samples = int(restored["samples"])
+            history = list(restored.get("history", []))
+            previous_wall = float(restored.get("wall_clock_sec", 0.0))
+            print(f"  [{tag}] epoch {resumed_from}에서 자동 재개")
+        progress_store.mark_stage(
+            "running", epoch=resumed_from, max_epoch=int(cfg["EPOCHS"])
+        )
 
-    for ep in range(1, cfg["EPOCHS"] + 1):
+    last_ep = resumed_from
+    for ep in range(start_ep, cfg["EPOCHS"] + 1):
+        last_ep = ep
         model.train(); t0 = time.time()
         perm = rng.permutation(n_train); tot = tot_bpr = tot_pc = 0.0
         for b in range(n_batch):
@@ -1140,6 +1228,14 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, 
             opt.zero_grad(); loss.backward(); opt.step()
             tot += loss.item(); tot_bpr += dg["bpr"]; tot_pc += dg["p_correct"]
             updates += 1; samples += len(idx)
+            if progress_store is not None:
+                progress_store.heartbeat(
+                    epoch=ep,
+                    max_epoch=int(cfg["EPOCHS"]),
+                    batch=b + 1,
+                    batches=n_batch,
+                    loss=tot / (b + 1),
+                )
         model.eval()
         r = evaluate(model, lam_train, gate_t, val_cache, meta, [cfg["SELECT_K"]],
                      d["csr_ptr"], d["csr_items"], cfg)
@@ -1156,9 +1252,33 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, 
         with torch.no_grad():
             nu = float(model.E_u.weight.norm(dim=1).mean())
             ni = float(model.E_i.weight.norm(dim=1).mean())
+        epoch_sec = time.time() - t0
+        history.append({
+            "epoch": int(ep),
+            "loss": float(tot / n_batch),
+            "bpr": float(tot_bpr / n_batch),
+            "p_correct": float(tot_pc / n_batch),
+            "val_metric": float(score),
+            "epoch_sec": float(epoch_sec),
+        })
         print(f"  [{tag}] ep {ep:3d} | loss {tot/n_batch:.4f} bpr {tot_bpr/n_batch:.4f} "
               f"P(pos>neg) {tot_pc/n_batch:.3f} | ‖E_u‖ {nu:.4f} ‖E_i‖ {ni:.4f} | "
-              f"val {cfg['SELECT_METRIC']}@{cfg['SELECT_K']} {score:.5f} | {time.time()-t0:.0f}s{star}")
+              f"val {cfg['SELECT_METRIC']}@{cfg['SELECT_K']} {score:.5f} | {epoch_sec:.0f}s{star}")
+        if progress_store is not None:
+            progress_store.save_epoch(
+                model,
+                opt,
+                rng,
+                epoch=int(ep),
+                best_epoch=int(best_ep),
+                best_metric=float(best),
+                best_state=best_state,
+                bad=int(bad),
+                updates=int(updates),
+                samples=int(samples),
+                history=history,
+                wall_clock_sec=previous_wall + time.time() - t_start,
+            )
         if bad >= cfg["EARLY_STOP"]:
             print(f"  [{tag}] early stop"); break
 
@@ -1166,11 +1286,14 @@ def train_phase(model, params, d, gate_t, lam_train, cfg, seed, tag, val_cache, 
         model.load_state_dict(best_state)
     # 값은 전부 순수 파이썬 타입으로 — numpy 스칼라가 섞이면 체크포인트를
     # torch.load(weights_only=True)로 되읽을 수 없다.
-    stats = {"phase": tag, "best_epoch": int(best_ep), "epochs_run": int(ep),
+    stats = {"phase": tag, "best_epoch": int(best_ep), "epochs_run": int(last_ep),
              f"best_val_{cfg['SELECT_METRIC']}@{cfg['SELECT_K']}": float(best),
              "updates": int(updates), "samples": int(samples),
-             "wall_clock_sec": round(time.time() - t_start, 1)}
-    print(f"  [{tag}] 완료 — best ep {best_ep}/{ep}, val {best:.5f}, "
+             "wall_clock_sec": round(previous_wall + time.time() - t_start, 1),
+             "resumed_from_epoch": int(resumed_from),
+             "new_epochs_run": int(max(0, last_ep - resumed_from)),
+             "history": history}
+    print(f"  [{tag}] 완료 — best ep {best_ep}/{last_ep}, val {best:.5f}, "
           f"업데이트 {updates:,}회, 샘플 {samples:,}건, {stats['wall_clock_sec']:.0f}s")
     return stats
 
@@ -1180,7 +1303,20 @@ def build_model(d, x_val_u, x_item, item_cat, cfg):
                              x_val_u, x_item, item_cat, cfg, d["adj"]).to(DEVICE)
 
 
-def get_or_train(arch, seed, d, gate_t, x_val_u, x_item, item_cat, meta, val_cache, cfg):
+def get_or_train(
+    arch,
+    seed,
+    d,
+    gate_t,
+    x_val_u,
+    x_item,
+    item_cat,
+    meta,
+    val_cache,
+    cfg,
+    *,
+    progress_store=None,
+):
     """arch별 학습. pref_only 체크포인트는 two_stage가 stage2 초기값으로 재사용한다."""
     out = Path(cfg["OUT_DIR"]); out.mkdir(parents=True, exist_ok=True)
     ck = out / f"ckpt_{arch}_{cfg['DATASET']}_s{seed}_{cfg_hash(cfg, DCFG, arch, seed)}.pt"
@@ -1195,7 +1331,8 @@ def get_or_train(arch, seed, d, gate_t, x_val_u, x_item, item_cat, meta, val_cac
     if arch == "pref_only":
         model = build_model(d, x_val_u, x_item, item_cat, cfg)
         stats = [train_phase(model, model.pref_params(), d, gate_t, 0.0, cfg, seed,
-                             "pref_only", val_cache, meta)]
+                             "pref_only", val_cache, meta,
+                             progress_store=progress_store)]
     elif arch == "two_stage":
         # stage1 = pref_only 체크포인트를 그대로 재사용 (없으면 여기서 학습됨)
         base, base_stats = get_or_train("pref_only", seed, d, gate_t, x_val_u, x_item,
