@@ -45,6 +45,17 @@ def test_candidate_variables_keep_old_and_literature_based_definitions_separate(
     assert np.isfinite(frame.to_numpy()).all()
 
 
+def test_gate_sources_are_repeat_rate_and_mean_transaction_value():
+    frame = candidate_variables(_anchor())
+
+    np.testing.assert_allclose(
+        frame.new_n_behavior.to_numpy(), np.arange(6, dtype=np.float32) / 29.0
+    )
+    np.testing.assert_allclose(
+        frame.new_v_behavior.to_numpy(), [10, 20, 30, 40, 50, 60]
+    )
+
+
 def test_validity_reports_future_n_v_and_total_without_recommender_splits():
     report = validate_anchor(_anchor(), dataset="toy", anchor_label="train_internal_7")
     metrics = report["metrics"]

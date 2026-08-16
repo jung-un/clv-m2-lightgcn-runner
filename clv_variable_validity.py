@@ -55,7 +55,9 @@ def candidate_variables(anchor: residual.AnchorExamples) -> pd.DataFrame:
     repeat transactions ``x``, time of the last transaction ``t_x``, customer
     age ``T`` and mean inter-transaction gap describe the transaction process;
     mean value per transaction describes the monetary process.  The two
-    behavior scores are descriptive rank summaries, not forecasts N-hat/V-hat.
+    behavior scores are descriptive observed rates and values, not forecasts
+    N-hat/V-hat.  The runner converts them to fixed train-history percentiles
+    for the gates.
     """
 
     basket_count, basket_valid = _column(anchor, "basket_count")
@@ -68,22 +70,16 @@ def candidate_variables(anchor: residual.AnchorExamples) -> pd.DataFrame:
     repeat_count = np.maximum(basket_count - 1.0, 0.0)
     customer_age = np.maximum(observed_days - 1.0, 0.0)
     transaction_recency = np.clip(customer_age - recency_days, 0.0, customer_age)
-    activity_valid = basket_valid & recency_valid & observed_valid
-    recency_fraction = np.divide(
-        transaction_recency,
+    activity_valid = basket_valid & observed_valid
+    repeat_transaction_rate = np.divide(
+        repeat_count,
         np.maximum(customer_age, 1.0),
-        out=np.zeros_like(transaction_recency),
+        out=np.zeros_like(repeat_count),
         where=activity_valid,
     )
 
-    new_n_behavior = _masked_mean(
-        [
-            (_percentile(repeat_count, activity_valid), activity_valid),
-            (_percentile(recency_fraction, activity_valid), activity_valid),
-            (_percentile(gap_mean, gap_valid, ascending=False), gap_valid),
-        ]
-    )
-    new_v_behavior = _percentile(avg_basket_value, value_valid)
+    new_n_behavior = repeat_transaction_rate
+    new_v_behavior = np.where(value_valid, avg_basket_value, 0.0)
 
     old_n_proxy = _masked_mean(
         [
@@ -106,6 +102,7 @@ def candidate_variables(anchor: residual.AnchorExamples) -> pd.DataFrame:
             "old_v_proxy": old_v_proxy,
             "old_clv_proxy": old_n_proxy * old_v_proxy,
             "repeat_transaction_count": repeat_count,
+            "repeat_transaction_rate": repeat_transaction_rate,
             "transaction_recency": transaction_recency,
             "customer_age": customer_age,
             "mean_transaction_gap": np.where(gap_valid, gap_mean, 0.0),

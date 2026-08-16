@@ -35,9 +35,9 @@ class _AxisEncoder(nn.Module):
 class JointNVLightGCN(nn.Module):
     """ID/N/V layer-0 blocks propagated together by one LightGCN.
 
-    ``gamma_n`` and ``gamma_v`` are positive learned global strengths.  They
-    start close to zero, allowing the full-size ID block to establish the
-    collaborative signal while still receiving gradients in the same run.
+    ``gamma_n`` and ``gamma_v`` are positive learned score-level strengths.
+    Their square roots scale both user and item axis blocks, so a small gamma
+    suppresses N/V information on both sides while retaining gradients.
     """
 
     def __init__(
@@ -59,7 +59,7 @@ class JointNVLightGCN(nn.Module):
         gate_shape: str = "equal",
         shuffle_seed: int = 42,
         pref_reg: float = 1e-4,
-        gamma_init_logit: float = -6.0,
+        gamma_init: float = 0.01,
     ):
         super().__init__()
         if variant not in VARIANTS:
@@ -68,6 +68,8 @@ class JointNVLightGCN(nn.Module):
             raise ValueError("사용자·아이템·embedding 크기는 양수여야 합니다")
         if n_layers < 0:
             raise ValueError("n_layers는 0 이상이어야 합니다")
+        if not 0.0 < gamma_init < 1.0:
+            raise ValueError("gamma_init은 0과 1 사이여야 합니다")
 
         user_activity = np.asarray(user_activity, dtype=np.float32)
         user_value = np.asarray(user_value, dtype=np.float32)
@@ -117,8 +119,9 @@ class JointNVLightGCN(nn.Module):
         self.activity_item = _AxisEncoder(item_profile.activity.shape[1], hidden_dim, axis_dim)
         self.value_user = _AxisEncoder(user_value.shape[1], hidden_dim, axis_dim)
         self.value_item = _AxisEncoder(item_profile.value.shape[1], hidden_dim, axis_dim)
-        self.raw_gamma_n = nn.Parameter(torch.tensor(float(gamma_init_logit)))
-        self.raw_gamma_v = nn.Parameter(torch.tensor(float(gamma_init_logit)))
+        gamma_logit = float(np.log(gamma_init / (1.0 - gamma_init)))
+        self.raw_gamma_n = nn.Parameter(torch.tensor(gamma_logit))
+        self.raw_gamma_v = nn.Parameter(torch.tensor(gamma_logit))
 
         self.register_buffer("user_activity", torch.from_numpy(user_activity.copy()))
         self.register_buffer("user_value", torch.from_numpy(user_value.copy()))
@@ -142,15 +145,19 @@ class JointNVLightGCN(nn.Module):
         item_n = self.activity_item(self.item_activity) * self.valid_item[:, None]
         user_v = self.value_user(self.user_value)
         item_v = self.value_item(self.item_value) * self.valid_item[:, None]
+        scale_n = torch.sqrt(self.gamma_n)
+        scale_v = torch.sqrt(self.gamma_v)
         user = torch.cat(
             [
                 self.E_u.weight,
-                self.gamma_n * self.gate_n[:, None] * user_n,
-                self.gamma_v * self.gate_v[:, None] * user_v,
+                scale_n * self.gate_n[:, None] * user_n,
+                scale_v * self.gate_v[:, None] * user_v,
             ],
             dim=1,
         )
-        item = torch.cat([self.E_i.weight, item_n, item_v], dim=1)
+        item = torch.cat(
+            [self.E_i.weight, scale_n * item_n, scale_v * item_v], dim=1
+        )
         return user, item
 
     def propagate(self) -> tuple[torch.Tensor, torch.Tensor]:

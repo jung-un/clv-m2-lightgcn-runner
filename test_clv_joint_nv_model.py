@@ -41,7 +41,7 @@ def _inputs():
     return user_n, user_v, item, q_n, q_v
 
 
-def _model(variant="joint_nv", gate_shape="high", layers=1):
+def _model(variant="joint_nv", gate_shape="high", layers=1, gamma_init=0.01):
     user_n, user_v, item, q_n, q_v = _inputs()
     return JointNVLightGCN(
         n_users=3,
@@ -60,6 +60,7 @@ def _model(variant="joint_nv", gate_shape="high", layers=1):
         gate_shape=gate_shape,
         shuffle_seed=42,
         pref_reg=1e-4,
+        gamma_init=gamma_init,
     )
 
 
@@ -75,6 +76,30 @@ def test_joint_embedding_is_propagated_as_one_concatenated_space():
     assert not torch.allclose(final_u, layer0_u)
     assert zero_u.shape == (3, 1)
     assert zero_i.shape == (4, 1)
+
+
+def test_score_level_gamma_scales_both_user_and_item_axis_blocks_symmetrically():
+    model = _model(layers=0, gamma_init=0.01)
+    user, item = model.layer0_embeddings()
+    user_n = user[:, 6:9]
+    user_v = user[:, 9:12]
+    item_n = item[:, 6:9]
+    item_v = item[:, 9:12]
+
+    np.testing.assert_allclose(float(model.gamma_n.detach()), 0.01, rtol=1e-5)
+    np.testing.assert_allclose(float(model.gamma_v.detach()), 0.01, rtol=1e-5)
+    np.testing.assert_allclose(
+        user_n.norm(dim=1).detach().numpy(), [0.02, 0.18, 0.10], rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        user_v.norm(dim=1).detach().numpy(), [0.18, 0.02, 0.10], rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        item_n.norm(dim=1).detach().numpy(), np.full(4, 0.10), rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        item_v.norm(dim=1).detach().numpy(), np.full(4, 0.10), rtol=1e-5
+    )
 
 
 def test_plain_bpr_sends_one_loss_gradient_to_id_n_and_v_paths():

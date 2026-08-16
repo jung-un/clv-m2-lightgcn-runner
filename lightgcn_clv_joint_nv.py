@@ -20,7 +20,7 @@ import lightgcn_clv_residual as residual
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m2-joint-nv-lightgcn-v1.1"
+CODE_VERSION = "m2-joint-nv-lightgcn-v1.2"
 PRIMARY_MODEL = "joint_nv"
 CONTROLS = ()
 MODELS = ("m1", PRIMARY_MODEL, *CONTROLS)
@@ -40,6 +40,7 @@ class JointNVConfig:
     batch_size: int = 8192
     lr: float = 5e-4
     pref_reg: float = 1e-3
+    gamma_init: float = 0.01
     max_epochs: int = 100
     early_stop: int = 20
     eval_test: bool = False
@@ -88,6 +89,8 @@ def validate_joint_nv_config(cfg: JointNVConfig) -> JointNVConfig:
         raise ValueError("모델·학습 크기는 양수여야 합니다")
     if cfg.n_layers < 0 or cfg.early_stop <= 0:
         raise ValueError("n_layers/early_stop 설정이 잘못됐습니다")
+    if not 0.0 < cfg.gamma_init < 1.0:
+        raise ValueError("gamma_init은 0과 1 사이여야 합니다")
     return cfg
 
 
@@ -117,7 +120,15 @@ def preflight_summary(cfg: JointNVConfig) -> dict:
         "input_days": cfg.input_days,
         "models": list(MODELS),
         "architecture": "ID|N|V layer-0 concat -> one binary LightGCN -> one dot score",
+        "gamma": {
+            "initial_score_strength": cfg.gamma_init,
+            "application": "sqrt(gamma) applied symmetrically to user and item N/V blocks",
+        },
         "gate_shape": cfg.gate_shape,
+        "gate_source": {
+            "q_n": "train-history percentile of repeat transactions / customer age",
+            "q_v": "train-history percentile of mean transaction value",
+        },
         "graph_mode": "binary",
         "negative_sampling": "uniform",
         "loss": "plain_bpr",
@@ -187,6 +198,7 @@ def build_user_axis_inputs(snapshot, n_users: int) -> dict:
     n_behavior_score = np.zeros(n_users, np.float32)
     v_behavior_score = np.zeros(n_users, np.float32)
     repeat_transaction_count = np.zeros(n_users, np.float32)
+    repeat_transaction_rate = np.zeros(n_users, np.float32)
     transaction_recency = np.zeros(n_users, np.float32)
     customer_age = np.zeros(n_users, np.float32)
     mean_transaction_value = np.zeros(n_users, np.float32)
@@ -197,6 +209,7 @@ def build_user_axis_inputs(snapshot, n_users: int) -> dict:
     n_behavior_score[ids] = local_n
     v_behavior_score[ids] = local_v
     repeat_transaction_count[ids] = candidates.repeat_transaction_count
+    repeat_transaction_rate[ids] = candidates.repeat_transaction_rate
     transaction_recency[ids] = candidates.transaction_recency
     customer_age[ids] = candidates.customer_age
     mean_transaction_value[ids] = candidates.mean_transaction_value
@@ -214,6 +227,7 @@ def build_user_axis_inputs(snapshot, n_users: int) -> dict:
         "q_v": q_v,
         "valid_user": valid_user,
         "repeat_transaction_count": repeat_transaction_count,
+        "repeat_transaction_rate": repeat_transaction_rate,
         "transaction_recency": transaction_recency,
         "customer_age": customer_age,
         "mean_transaction_value": mean_transaction_value,
@@ -409,6 +423,7 @@ def _build_model(prepared, cfg, variant):
         gate_shape=cfg.gate_shape,
         shuffle_seed=cfg.seed,
         pref_reg=cfg.pref_reg,
+        gamma_init=cfg.gamma_init,
     ).to(v3.DEVICE)
 
 

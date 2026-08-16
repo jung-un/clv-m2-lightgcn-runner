@@ -35,6 +35,14 @@ def test_hm60_preset_is_seed42_validation_only_and_plain_bpr():
     assert summary["loss"] == "plain_bpr"
     assert summary["separate_encoder"] is False
     assert summary["frozen_or_external_base"] is False
+    assert summary["gamma"] == {
+        "initial_score_strength": 0.01,
+        "application": "sqrt(gamma) applied symmetrically to user and item N/V blocks",
+    }
+    assert summary["gate_source"] == {
+        "q_n": "train-history percentile of repeat transactions / customer age",
+        "q_v": "train-history percentile of mean transaction value",
+    }
     assert summary["eval_test"] is False
     assert summary["eval_holdout"] is False
     assert summary["models"] == ["m1", "joint_nv"]
@@ -146,6 +154,12 @@ def test_user_axes_use_literature_grounded_current_features_and_masks():
     )
     assert axes["q_n"].shape == (5,)
     assert axes["q_v"].shape == (5,)
+    np.testing.assert_allclose(
+        axes["q_n"][[0, 2, 3]], [5 / 6, 1 / 6, 3 / 6]
+    )
+    np.testing.assert_allclose(
+        axes["q_v"][[0, 2, 3]], [1 / 6, 5 / 6, 3 / 6]
+    )
 
 
 def test_result_row_keeps_model_identity_and_full_metric_payload():
