@@ -49,10 +49,11 @@ def test_anchored_diagnostic_colab_is_pinned_and_never_starts_training():
         "".join(cell.get("source", [])) for cell in notebook["cells"]
     )
 
-    assert "2791aabe13a65290ee2ce4b25524e7e50018f48d" in source
+    assert "22ec033f4943c4ace2018d79392853eff08bb5c7" in source
     assert "run_checkpoint_diagnostics(cfg)" in source
     assert "run_experiment" not in source
     assert "training_performed" in source
+    assert "strength_curve" in source
 
 
 def test_hm60_preset_is_seed42_validation_only_and_plain_bpr():
