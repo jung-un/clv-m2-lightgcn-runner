@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import torch
+import copy
 
 from clv_dual_axis_model import DualItemProfile
 from clv_joint_nv_model import JointNVLightGCN
@@ -50,6 +51,7 @@ def _model(
     user_activity_valid=None,
     user_value_valid=None,
     anchor_weight=0.0,
+    preference_preserving=False,
     pref_reg=1e-4,
 ):
     user_n, user_v, item, q_n, q_v = _inputs()
@@ -74,6 +76,7 @@ def _model(
         pref_reg=pref_reg,
         gamma_init=gamma_init,
         anchor_weight=anchor_weight,
+        preference_preserving=preference_preserving,
     )
 
 
@@ -216,3 +219,40 @@ def test_anchored_bpr_balances_full_and_id_losses_without_stopgrad():
     torch.testing.assert_close(loss, 0.5 * expected_full + 0.5 * expected_id)
     assert diagnostics["bpr_full"] == pytest.approx(float(expected_full))
     assert diagnostics["bpr_id"] == pytest.approx(float(expected_id))
+
+
+def test_preference_preserving_joint_keeps_id_gradient_equal_to_id_only_bpr():
+    protected = _model(
+        gate_shape="equal",
+        layers=1,
+        gamma_init=0.1,
+        preference_preserving=True,
+        pref_reg=0.0,
+    )
+    reference = copy.deepcopy(protected)
+    users = torch.tensor([0, 1])
+    positives = torch.tensor([0, 2])
+    negatives = torch.tensor([3, 0])
+
+    ref_user, ref_item = reference.propagate()
+    ref_margin = (
+        (ref_user[users, :6] * ref_item[positives, :6]).sum(1)
+        - (ref_user[users, :6] * ref_item[negatives, :6]).sum(1)
+    )
+    (-torch.nn.functional.logsigmoid(ref_margin).mean()).backward()
+
+    loss, diagnostics = protected.bpr_loss(
+        users, positives, negatives, None, 0.0, None
+    )
+    loss.backward()
+
+    torch.testing.assert_close(protected.E_u.weight.grad, reference.E_u.weight.grad)
+    torch.testing.assert_close(protected.E_i.weight.grad, reference.E_i.weight.grad)
+    assert protected.activity_user.net[0].weight.grad.abs().sum() > 0
+    assert protected.activity_item.net[0].weight.grad.abs().sum() > 0
+    assert protected.value_user.net[0].weight.grad.abs().sum() > 0
+    assert protected.value_item.net[0].weight.grad.abs().sum() > 0
+    assert protected.sqrt_gamma_n.grad.abs() > 0
+    assert protected.sqrt_gamma_v.grad.abs() > 0
+    assert diagnostics["objective"] == "preference_preserving_joint"
+    assert diagnostics["bpr_residual"] > 0

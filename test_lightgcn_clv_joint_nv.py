@@ -178,6 +178,30 @@ def test_fast_anchored_dunnhumby_preset_runs_only_m1_and_m2_on_validation():
     assert summary["variable_validity_source"] is None
 
 
+def test_preference_preserving_dunnhumby_preset_is_validation_only():
+    cfg = joint.configure_preference_preserving_dunnhumby_run()
+    summary = joint.preflight_summary(cfg)
+
+    assert cfg.dataset == "dunnhumby"
+    assert cfg.seed == 42
+    assert cfg.window_days is None
+    assert cfg.gate_shape == "equal"
+    assert cfg.anchor_weight == 0.0
+    assert cfg.preference_preserving is True
+    assert cfg.gamma_init == 0.1
+    assert cfg.compute_variable_validity is False
+    assert cfg.out_dir.endswith("_m2_joint_nv_preference_preserving_v15")
+    assert summary["models"] == ["m1", "joint_nv_preference_preserving"]
+    assert summary["loss"] == {
+        "type": "preference_preserving_joint_bpr",
+        "id_path": "BPR(S_ID)",
+        "nv_path": "BPR(stopgrad(S_ID)+S_N+S_V)",
+        "sample_weighting": False,
+    }
+    assert summary["eval_test"] is False
+    assert summary["eval_holdout"] is False
+
+
 def test_matching_result_payload_uses_anchored_model_identity(tmp_path):
     checkpoint = tmp_path / "joint_nv_anchored_dunnhumby_s42_x.pt"
     checkpoint.touch()

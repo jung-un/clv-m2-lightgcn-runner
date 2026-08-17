@@ -1,7 +1,8 @@
 """Jointly trained CLV N/V subspaces inside a single LightGCN.
 
-The model changes only M2 (the layer-0 representation).  The binary graph,
-uniform negative sampling and ordinary BPR objective remain unchanged.
+The model changes only M2 (the layer-0 representation and gradient routing
+between its ID and N/V blocks).  The binary graph, uniform negative sampling
+and pairwise BPR ranking objective remain unchanged.
 """
 
 from __future__ import annotations
@@ -63,6 +64,7 @@ class JointNVLightGCN(nn.Module):
         pref_reg: float = 1e-4,
         gamma_init: float = 0.01,
         anchor_weight: float = 0.0,
+        preference_preserving: bool = False,
     ):
         super().__init__()
         if variant not in VARIANTS:
@@ -128,7 +130,10 @@ class JointNVLightGCN(nn.Module):
         self.pref_reg = float(pref_reg)
         if not 0.0 <= anchor_weight <= 1.0:
             raise ValueError("anchor_weight는 0과 1 사이여야 합니다")
+        if preference_preserving and anchor_weight > 0.0:
+            raise ValueError("preference-preserving과 anchored 목적함수를 동시에 쓸 수 없습니다")
         self.anchor_weight = float(anchor_weight)
+        self.preference_preserving = bool(preference_preserving)
         self.id_dim = int(id_dim)
         self.axis_dim = int(axis_dim)
         self.variant = variant
@@ -236,14 +241,38 @@ class JointNVLightGCN(nn.Module):
         negative_id = (
             user[users, : self.id_dim] * item[negatives, : self.id_dim]
         ).sum(1)
-        bpr_id = -F.logsigmoid(positive_id - negative_id).mean()
-        bpr = (1.0 - self.anchor_weight) * bpr_full + self.anchor_weight * bpr_id
+        id_margin = positive_id - negative_id
+        bpr_id = -F.logsigmoid(id_margin).mean()
+        bpr_residual = None
+        if self.preference_preserving:
+            positive_nv = (
+                user[users, self.id_dim :] * item[positives, self.id_dim :]
+            ).sum(1)
+            negative_nv = (
+                user[users, self.id_dim :] * item[negatives, self.id_dim :]
+            ).sum(1)
+            nv_margin = positive_nv - negative_nv
+            bpr_residual = -F.logsigmoid(id_margin.detach() + nv_margin).mean()
+            # ID receives exactly the ordinary ID-BPR gradient.  The second
+            # term trains only N/V while conditioning on the current ID score.
+            bpr = bpr_id + bpr_residual
+            objective = "preference_preserving_joint"
+        else:
+            bpr = (
+                (1.0 - self.anchor_weight) * bpr_full
+                + self.anchor_weight * bpr_id
+            )
+            objective = "anchored" if self.anchor_weight > 0 else "plain"
         loss = bpr + self.batch_l2(users, positives, negatives)
         with torch.no_grad():
             diagnostics = {
                 "bpr": float(bpr),
                 "bpr_full": float(bpr_full),
                 "bpr_id": float(bpr_id),
+                "bpr_residual": (
+                    float(bpr_residual) if bpr_residual is not None else None
+                ),
+                "objective": objective,
                 "p_correct": float((positive_score > negative_score).float().mean()),
                 "gamma_n": float(self.gamma_n),
                 "gamma_v": float(self.gamma_v),

@@ -28,7 +28,7 @@ import lightgcn_clv_residual as residual
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m2-joint-nv-lightgcn-v1.4"
+CODE_VERSION = "m2-joint-nv-lightgcn-v1.5"
 DIAGNOSTIC_VERSION = "joint-nv-checkpoint-diagnostics-v1"
 PRIMARY_MODEL = "joint_nv"
 CONTROLS = ()
@@ -51,6 +51,7 @@ class JointNVConfig:
     pref_reg: float = 1e-3
     gamma_init: float = 0.01
     anchor_weight: float = 0.0
+    preference_preserving: bool = False
     compute_variable_validity: bool = True
     max_epochs: int = 100
     early_stop: int = 20
@@ -93,6 +94,23 @@ def configure_anchored_dunnhumby_run(**overrides) -> JointNVConfig:
     )
 
 
+def configure_preference_preserving_dunnhumby_run(**overrides) -> JointNVConfig:
+    """Fast seed-42 screen of M1 versus gradient-separated joint N/V M2."""
+    defaults = {
+        "anchor_weight": 0.0,
+        "preference_preserving": True,
+        "gamma_init": 0.1,
+        "compute_variable_validity": False,
+        "out_dir": (
+            f"{v3.default_out_dir('dunnhumby')}"
+            "_m2_joint_nv_preference_preserving_v15"
+        ),
+    }
+    return configure_joint_nv_run(
+        "dunnhumby", short_hm=False, **(defaults | overrides)
+    )
+
+
 def validate_joint_nv_config(cfg: JointNVConfig) -> JointNVConfig:
     if cfg.eval_test or cfg.eval_holdout:
         raise ValueError("M2 joint N/V screening은 seed 42 validation-only입니다")
@@ -117,10 +135,14 @@ def validate_joint_nv_config(cfg: JointNVConfig) -> JointNVConfig:
         raise ValueError("gamma_init은 0과 1 사이여야 합니다")
     if not 0.0 <= cfg.anchor_weight <= 1.0:
         raise ValueError("anchor_weight는 0과 1 사이여야 합니다")
+    if cfg.preference_preserving and cfg.anchor_weight > 0.0:
+        raise ValueError("preference-preserving과 anchored 목적함수를 동시에 쓸 수 없습니다")
     return cfg
 
 
 def _primary_model_id(cfg: JointNVConfig) -> str:
+    if cfg.preference_preserving:
+        return "joint_nv_preference_preserving"
     return "joint_nv_anchored" if cfg.anchor_weight > 0 else PRIMARY_MODEL
 
 
@@ -142,7 +164,14 @@ def variable_validity_plan(cfg: JointNVConfig) -> dict:
 
 def preflight_summary(cfg: JointNVConfig) -> dict:
     cfg = validate_joint_nv_config(cfg)
-    if cfg.anchor_weight > 0:
+    if cfg.preference_preserving:
+        loss = {
+            "type": "preference_preserving_joint_bpr",
+            "id_path": "BPR(S_ID)",
+            "nv_path": "BPR(stopgrad(S_ID)+S_N+S_V)",
+            "sample_weighting": False,
+        }
+    elif cfg.anchor_weight > 0:
         loss = {
             "type": "preference_anchored_bpr",
             "full_weight": 1.0 - cfg.anchor_weight,
@@ -485,6 +514,7 @@ def _build_model(prepared, cfg, variant):
         pref_reg=cfg.pref_reg,
         gamma_init=cfg.gamma_init,
         anchor_weight=cfg.anchor_weight,
+        preference_preserving=cfg.preference_preserving,
     ).to(v3.DEVICE)
 
 
