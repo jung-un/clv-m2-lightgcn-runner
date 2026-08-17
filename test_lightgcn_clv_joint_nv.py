@@ -114,6 +114,42 @@ def test_fast_anchored_dunnhumby_preset_runs_only_m1_and_m2_on_validation():
     assert summary["variable_validity_source"] is None
 
 
+def test_matching_result_payload_uses_anchored_model_identity(tmp_path):
+    checkpoint = tmp_path / "joint_nv_anchored_dunnhumby_s42_x.pt"
+    checkpoint.touch()
+    result_path = tmp_path / "m2_joint_nv_dunnhumby_x.json"
+    result_path.write_text(
+        json.dumps({"checkpoints": {"joint_nv_anchored": str(checkpoint)}}),
+        encoding="utf-8",
+    )
+
+    payload = joint._matching_result_payload(
+        tmp_path, checkpoint, model_id="joint_nv_anchored"
+    )
+
+    assert payload is not None
+    assert payload["_result_json"] == str(result_path)
+
+
+def test_block_comparison_separates_id_recovery_and_axis_increment():
+    rows = joint._block_comparison_rows(
+        {
+            "id_only": {"revenue@10": 8.0},
+            "id_n": {"revenue@10": 9.0},
+            "id_v": {"revenue@10": 11.0},
+            "full": {"revenue@10": 12.0},
+        },
+        {"revenue@10": 10.0},
+    )
+
+    by_view = {row["view"]: row for row in rows}
+    assert by_view["id_only"]["delta_vs_m1"] == -2.0
+    assert by_view["id_n"]["delta_vs_id_only"] == 1.0
+    assert by_view["id_v"]["delta_vs_id_only"] == 3.0
+    assert by_view["full"]["delta_vs_m1"] == 2.0
+    assert by_view["full"]["relative_change_vs_m1_pct"] == 20.0
+
+
 def test_progress_paths_are_isolated_by_config_hash(tmp_path):
     cfg = joint.configure_joint_nv_run("hm", short_hm=True)
     old = joint._progress_store(

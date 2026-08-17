@@ -118,6 +118,22 @@ def test_checkpoint_loader_selects_latest_compatible_checkpoint(tmp_path):
     assert loaded["config"]["dataset"] == "hm"
 
 
+def test_checkpoint_finder_can_select_anchored_model_id(tmp_path):
+    plain = tmp_path / "joint_nv_dunnhumby_s42_plain.pt"
+    anchored = tmp_path / "joint_nv_anchored_dunnhumby_s42_current.pt"
+    plain.touch()
+    anchored.touch()
+
+    selected = find_joint_checkpoint(
+        tmp_path,
+        dataset="dunnhumby",
+        seed=42,
+        model_id="joint_nv_anchored",
+    )
+
+    assert selected == anchored
+
+
 def test_checkpoint_loader_rejects_different_input_data(tmp_path):
     model = _model()
     path = tmp_path / "joint_nv_hm_s42_x.pt"

@@ -14,11 +14,13 @@ from scipy.stats import rankdata, spearmanr
 BLOCKS = ("id", "n", "v")
 
 
-def find_joint_checkpoint(out_dir, *, dataset: str, seed: int) -> Path:
-    candidates = list(Path(out_dir).glob(f"joint_nv_{dataset}_s{seed}_*.pt"))
+def find_joint_checkpoint(
+    out_dir, *, dataset: str, seed: int, model_id: str = "joint_nv"
+) -> Path:
+    candidates = list(Path(out_dir).glob(f"{model_id}_{dataset}_s{seed}_*.pt"))
     if not candidates:
         raise FileNotFoundError(
-            f"joint_nv checkpoint not found: {out_dir} / {dataset} / seed {seed}"
+            f"{model_id} checkpoint not found: {out_dir} / {dataset} / seed {seed}"
         )
     return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
 

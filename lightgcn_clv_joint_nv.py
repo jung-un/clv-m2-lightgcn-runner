@@ -696,17 +696,52 @@ def run_two_dataset_screening() -> dict[str, pd.DataFrame]:
     return results
 
 
-def _matching_result_payload(out_dir: Path, checkpoint: Path) -> dict | None:
+def _matching_result_payload(
+    out_dir: Path, checkpoint: Path, *, model_id: str = PRIMARY_MODEL
+) -> dict | None:
     for path in sorted(out_dir.glob("m2_joint_nv_*.json"), reverse=True):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        recorded = payload.get("checkpoints", {}).get(PRIMARY_MODEL)
+        recorded = payload.get("checkpoints", {}).get(model_id)
         if recorded and Path(recorded).name == checkpoint.name:
             payload["_result_json"] = str(path)
             return payload
     return None
+
+
+def _block_comparison_rows(block_metrics: dict, baseline_row: dict | None) -> list[dict]:
+    """Separate ID recovery from the incremental contribution of each N/V block."""
+    if not baseline_row or "id_only" not in block_metrics:
+        return []
+    id_only = block_metrics["id_only"]
+    rows = []
+    for view in ("id_only", "id_n", "id_v", "full"):
+        metrics = block_metrics.get(view, {})
+        for metric, m1_value in baseline_row.items():
+            if metric not in metrics:
+                continue
+            if not isinstance(m1_value, (int, float, np.integer, np.floating)):
+                continue
+            value = float(metrics[metric])
+            m1_value = float(m1_value)
+            id_value = float(id_only[metric])
+            rows.append(
+                {
+                    "view": view,
+                    "metric": metric,
+                    "m1": m1_value,
+                    "value": value,
+                    "delta_vs_m1": value - m1_value,
+                    "relative_change_vs_m1_pct": (
+                        100.0 * (value - m1_value) / m1_value
+                        if m1_value != 0.0 else np.nan
+                    ),
+                    "delta_vs_id_only": value - id_value,
+                }
+            )
+    return rows
 
 
 def run_checkpoint_diagnostics(
@@ -720,11 +755,15 @@ def run_checkpoint_diagnostics(
         "training": False,
     }, ensure_ascii=False, indent=2))
     prepared = _prepare(cfg)
+    model_id = _primary_model_id(cfg)
     checkpoint = (
         Path(checkpoint_path)
         if checkpoint_path
         else find_joint_checkpoint(
-            prepared["out_dir"], dataset=cfg.dataset, seed=cfg.seed
+            prepared["out_dir"],
+            dataset=cfg.dataset,
+            seed=cfg.seed,
+            model_id=model_id,
         )
     )
     model = _build_model(prepared, cfg, PRIMARY_MODEL)
@@ -757,7 +796,9 @@ def run_checkpoint_diagnostics(
         prepared["axes"]["v_behavior_score"],
         prepared["axes"]["valid_user"],
     )
-    source_result = _matching_result_payload(prepared["out_dir"], checkpoint)
+    source_result = _matching_result_payload(
+        prepared["out_dir"], checkpoint, model_id=model_id
+    )
     baseline_row = None
     if source_result:
         baseline_row = next(
@@ -767,15 +808,20 @@ def run_checkpoint_diagnostics(
             ),
             None,
         )
+    comparison = pd.DataFrame(_block_comparison_rows(block_metrics, baseline_row))
 
     diagnostic_dir = prepared["out_dir"] / "checkpoint_diagnostics"
     diagnostic_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"joint_nv_blocks_{cfg.dataset}_s{cfg.seed}_{checkpoint.stem[-12:]}"
+    stem = f"{model_id}_blocks_{cfg.dataset}_s{cfg.seed}_{checkpoint.stem[-12:]}"
     metrics_path = diagnostic_dir / f"{stem}.csv"
+    comparison_path = diagnostic_dir / f"{stem}_comparison.csv"
     validity_path = diagnostic_dir / f"{stem}_variable_validity.csv"
     json_path = diagnostic_dir / f"{stem}.json"
     frame.to_csv(metrics_path, index=False, float_format="%.8f")
-    prepared["variable_validity"]["metrics"].to_csv(validity_path, index=False)
+    comparison.to_csv(comparison_path, index=False, float_format="%.8f")
+    validity_metrics = prepared["variable_validity"]["metrics"]
+    if not validity_metrics.empty:
+        validity_metrics.to_csv(validity_path, index=False)
     output = {
         "diagnostic_version": DIAGNOSTIC_VERSION,
         "training_performed": False,
@@ -788,9 +834,10 @@ def run_checkpoint_diagnostics(
         "block_score_summary": score_summary,
         "axis_distribution": axis_summary,
         "block_metrics": rows,
+        "block_comparison": comparison.to_dict("records"),
         "external_m1_from_original_result": baseline_row,
         "source_result_json": source_result.get("_result_json") if source_result else None,
-        "variable_validity": prepared["variable_validity"]["metrics"].to_dict("records"),
+        "variable_validity": validity_metrics.to_dict("records"),
         "interpretation_guard": {
             "gamma": "gamma alone is not effective strength; use block score std ratios",
             "v_validity": "future mean transaction value correlation is conditional on future buyers",
@@ -804,11 +851,15 @@ def run_checkpoint_diagnostics(
     frame.attrs["block_score_summary"] = score_summary
     frame.attrs["axis_distribution"] = axis_summary
     frame.attrs["external_m1"] = baseline_row
+    frame.attrs["block_comparison"] = comparison
+    frame.attrs["training_performed"] = False
     frame.attrs["result_paths"] = {
         "metrics_csv": str(metrics_path),
-        "variable_validity_csv": str(validity_path),
+        "comparison_csv": str(comparison_path),
         "json": str(json_path),
     }
+    if not validity_metrics.empty:
+        frame.attrs["result_paths"]["variable_validity_csv"] = str(validity_path)
     print("체크포인트 진단 완료 (재학습 없음)")
     print("블록 실효강도:", score_summary)
     print("축 분포:", axis_summary)
