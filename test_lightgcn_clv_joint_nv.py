@@ -76,6 +76,28 @@ def test_dunnhumby_variable_validity_uses_only_internal_training_windows():
     }
 
 
+def test_fast_anchored_dunnhumby_preset_runs_only_m1_and_m2_on_validation():
+    cfg = joint.configure_anchored_dunnhumby_run()
+    summary = joint.preflight_summary(cfg)
+
+    assert cfg.dataset == "dunnhumby"
+    assert cfg.seed == 42
+    assert cfg.window_days is None
+    assert cfg.gate_shape == "equal"
+    assert cfg.anchor_weight == 0.5
+    assert cfg.compute_variable_validity is False
+    assert summary["models"] == ["m1", "joint_nv_anchored"]
+    assert summary["loss"] == {
+        "type": "preference_anchored_bpr",
+        "full_weight": 0.5,
+        "id_anchor_weight": 0.5,
+    }
+    assert summary["eval_test"] is False
+    assert summary["eval_holdout"] is False
+    assert summary["variable_validity"] is None
+    assert summary["variable_validity_source"] is None
+
+
 def test_progress_paths_are_isolated_by_config_hash(tmp_path):
     cfg = joint.configure_joint_nv_run("hm", short_hm=True)
     old = joint._progress_store(
@@ -148,6 +170,10 @@ def test_user_axes_use_literature_grounded_current_features_and_masks():
     assert axes["activity"][2, 7] == 0.0
     assert not axes["valid_user"][1]
     assert axes["valid_user"][[0, 2, 3]].all()
+    assert not axes["activity_valid"][1]
+    assert axes["activity_valid"][[0, 2, 3]].all()
+    assert not axes["value_valid"][1]
+    assert axes["value_valid"][[0, 2, 3]].all()
     np.testing.assert_allclose(
         axes["clv_proxy"],
         axes["n_behavior_score"] * axes["v_behavior_score"],

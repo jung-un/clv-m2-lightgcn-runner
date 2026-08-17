@@ -27,7 +27,7 @@ import lightgcn_clv_residual as residual
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m2-joint-nv-lightgcn-v1.2"
+CODE_VERSION = "m2-joint-nv-lightgcn-v1.3"
 DIAGNOSTIC_VERSION = "joint-nv-checkpoint-diagnostics-v1"
 PRIMARY_MODEL = "joint_nv"
 CONTROLS = ()
@@ -49,6 +49,8 @@ class JointNVConfig:
     lr: float = 5e-4
     pref_reg: float = 1e-3
     gamma_init: float = 0.01
+    anchor_weight: float = 0.0
+    compute_variable_validity: bool = True
     max_epochs: int = 100
     early_stop: int = 20
     eval_test: bool = False
@@ -77,6 +79,18 @@ def configure_joint_nv_run(
     return validate_joint_nv_config(JointNVConfig(**(defaults | overrides)))
 
 
+def configure_anchored_dunnhumby_run(**overrides) -> JointNVConfig:
+    """Fast seed-42 screen: external M1@64 versus anchored M2 only."""
+    defaults = {
+        "anchor_weight": 0.5,
+        "compute_variable_validity": False,
+        "out_dir": f"{v3.default_out_dir('dunnhumby')}_m2_joint_nv_anchored",
+    }
+    return configure_joint_nv_run(
+        "dunnhumby", short_hm=False, **(defaults | overrides)
+    )
+
+
 def validate_joint_nv_config(cfg: JointNVConfig) -> JointNVConfig:
     if cfg.eval_test or cfg.eval_holdout:
         raise ValueError("M2 joint N/V screening은 seed 42 validation-only입니다")
@@ -99,7 +113,13 @@ def validate_joint_nv_config(cfg: JointNVConfig) -> JointNVConfig:
         raise ValueError("n_layers/early_stop 설정이 잘못됐습니다")
     if not 0.0 < cfg.gamma_init < 1.0:
         raise ValueError("gamma_init은 0과 1 사이여야 합니다")
+    if not 0.0 <= cfg.anchor_weight <= 1.0:
+        raise ValueError("anchor_weight는 0과 1 사이여야 합니다")
     return cfg
+
+
+def _primary_model_id(cfg: JointNVConfig) -> str:
+    return "joint_nv_anchored" if cfg.anchor_weight > 0 else PRIMARY_MODEL
 
 
 def variable_validity_plan(cfg: JointNVConfig) -> dict:
@@ -120,13 +140,21 @@ def variable_validity_plan(cfg: JointNVConfig) -> dict:
 
 def preflight_summary(cfg: JointNVConfig) -> dict:
     cfg = validate_joint_nv_config(cfg)
+    if cfg.anchor_weight > 0:
+        loss = {
+            "type": "preference_anchored_bpr",
+            "full_weight": 1.0 - cfg.anchor_weight,
+            "id_anchor_weight": cfg.anchor_weight,
+        }
+    else:
+        loss = "plain_bpr"
     return {
         "code_version": CODE_VERSION,
         "dataset": cfg.dataset,
         "seed": cfg.seed,
         "window_days": cfg.window_days,
         "input_days": cfg.input_days,
-        "models": list(MODELS),
+        "models": ["m1", _primary_model_id(cfg)],
         "architecture": "ID|N|V layer-0 concat -> one binary LightGCN -> one dot score",
         "gamma": {
             "initial_score_strength": cfg.gamma_init,
@@ -139,12 +167,18 @@ def preflight_summary(cfg: JointNVConfig) -> dict:
         },
         "graph_mode": "binary",
         "negative_sampling": "uniform",
-        "loss": "plain_bpr",
+        "loss": loss,
         "separate_encoder": False,
         "frozen_or_external_base": False,
         "post_score_residual": False,
-        "variable_validity": variable_validity_plan(cfg),
-        "variable_validity_source": "train_internal_only",
+        "user_axis_output_masks": True,
+        "compute_variable_validity": cfg.compute_variable_validity,
+        "variable_validity": (
+            variable_validity_plan(cfg) if cfg.compute_variable_validity else None
+        ),
+        "variable_validity_source": (
+            "train_internal_only" if cfg.compute_variable_validity else None
+        ),
         "eval_test": cfg.eval_test,
         "eval_holdout": cfg.eval_holdout,
         "out_dir": cfg.out_dir,
@@ -203,6 +237,8 @@ def build_user_axis_inputs(snapshot, n_users: int) -> dict:
 
     activity = np.zeros((n_users, local_activity.shape[1]), np.float32)
     value = np.zeros((n_users, local_value.shape[1]), np.float32)
+    activity_valid = np.zeros(n_users, bool)
+    value_valid = np.zeros(n_users, bool)
     n_behavior_score = np.zeros(n_users, np.float32)
     v_behavior_score = np.zeros(n_users, np.float32)
     repeat_transaction_count = np.zeros(n_users, np.float32)
@@ -214,6 +250,8 @@ def build_user_axis_inputs(snapshot, n_users: int) -> dict:
     ids = np.asarray(snapshot.user_ids, np.int64)
     activity[ids] = local_activity
     value[ids] = local_value
+    activity_valid[ids] = base_valid
+    value_valid[ids] = candidates.value_valid.to_numpy(bool)
     n_behavior_score[ids] = local_n
     v_behavior_score[ids] = local_v
     repeat_transaction_count[ids] = candidates.repeat_transaction_count
@@ -228,6 +266,8 @@ def build_user_axis_inputs(snapshot, n_users: int) -> dict:
     return {
         "activity": activity,
         "value": value,
+        "activity_valid": activity_valid,
+        "value_valid": value_valid,
         "n_behavior_score": n_behavior_score,
         "v_behavior_score": v_behavior_score,
         "clv_proxy": n_behavior_score * v_behavior_score,
@@ -332,29 +372,36 @@ def _prepare(cfg: JointNVConfig) -> dict:
     base_cfg = _base_config(cfg)
     data = v3.prepare_data(base_cfg, v3.DCFG)
     data["loss_w"] = None
-    validity_plan = variable_validity_plan(cfg)
-    validity_anchors = residual.build_anchor_examples(
-        data["train"],
-        data["n_users"],
-        v3.DCFG["is_date"],
-        **validity_plan,
-    )
-    validity_reports = [
-        validate_anchor(
-            anchor,
-            dataset=cfg.dataset,
-            anchor_label=f"train_internal_T-{anchor.offset_days}",
-        )
-        for anchor in validity_anchors.anchors
-    ]
     variable_validity = {
-        "metrics": pd.concat(
-            [report["metrics"] for report in validity_reports], ignore_index=True
-        ),
-        "quadrants": pd.concat(
-            [report["quadrants"] for report in validity_reports], ignore_index=True
-        ),
+        "metrics": pd.DataFrame(),
+        "quadrants": pd.DataFrame(),
     }
+    if cfg.compute_variable_validity:
+        validity_plan = variable_validity_plan(cfg)
+        validity_anchors = residual.build_anchor_examples(
+            data["train"],
+            data["n_users"],
+            v3.DCFG["is_date"],
+            **validity_plan,
+        )
+        validity_reports = [
+            validate_anchor(
+                anchor,
+                dataset=cfg.dataset,
+                anchor_label=f"train_internal_T-{anchor.offset_days}",
+            )
+            for anchor in validity_anchors.anchors
+        ]
+        variable_validity = {
+            "metrics": pd.concat(
+                [report["metrics"] for report in validity_reports],
+                ignore_index=True,
+            ),
+            "quadrants": pd.concat(
+                [report["quadrants"] for report in validity_reports],
+                ignore_index=True,
+            ),
+        }
     snapshot = residual.build_final_snapshot(
         data["train"], data["n_users"], v3.DCFG["is_date"], cfg.input_days
     )
@@ -419,6 +466,8 @@ def _build_model(prepared, cfg, variant):
         n_items=data["n_items"],
         user_activity=axes["activity"],
         user_value=axes["value"],
+        user_activity_valid=axes["activity_valid"],
+        user_value_valid=axes["value_valid"],
         item_profile=prepared["item_profile"],
         q_n=axes["q_n"],
         q_v=axes["q_v"],
@@ -432,14 +481,15 @@ def _build_model(prepared, cfg, variant):
         shuffle_seed=cfg.seed,
         pref_reg=cfg.pref_reg,
         gamma_init=cfg.gamma_init,
+        anchor_weight=cfg.anchor_weight,
     ).to(v3.DEVICE)
 
 
-def _train_variant(prepared, cfg, variant):
+def _train_variant(prepared, cfg, model_id, *, variant=PRIMARY_MODEL):
     v3.set_seed(cfg.seed)
     model = _build_model(prepared, cfg, variant)
     store = _progress_store(
-        prepared["out_dir"], variant, cfg, prepared["config_hash"],
+        prepared["out_dir"], model_id, cfg, prepared["config_hash"],
         prepared["input_hash"], prepared["revision"]
     )
     gate = torch.ones(prepared["data"]["n_users"], device=v3.DEVICE)
@@ -451,16 +501,22 @@ def _train_variant(prepared, cfg, variant):
         0.0,
         prepared["base_cfg"],
         cfg.seed,
-        variant,
+        model_id,
         prepared["cache"],
         prepared["meta"],
         progress_store=store,
     )
     model.eval()
     metrics, per_user = _evaluate(model, prepared)
-    diagnostics = model.score_diagnostics(seed=cfg.seed)
+    if cfg.compute_variable_validity:
+        diagnostics = model.score_diagnostics(seed=cfg.seed)
+    else:
+        diagnostics = {
+            "gamma_n": float(model.gamma_n.detach().cpu()),
+            "gamma_v": float(model.gamma_v.detach().cpu()),
+        }
     checkpoint = prepared["out_dir"] / (
-        f"{variant}_{cfg.dataset}_s{cfg.seed}_{prepared['config_hash']}.pt"
+        f"{model_id}_{cfg.dataset}_s{cfg.seed}_{prepared['config_hash']}.pt"
     )
     torch.save(
         {
@@ -486,9 +542,9 @@ def _train_variant(prepared, cfg, variant):
     }
 
 
-def _decision(rows, baseline):
+def _decision(rows, baseline, primary_model_id=PRIMARY_MODEL):
     table = pd.DataFrame(rows).set_index("model_id")
-    main = table.loc[PRIMARY_MODEL]
+    main = table.loc[primary_model_id]
     accuracy = {}
     for metric in ("recall", "ndcg"):
         for k in (10, 20, 50):
@@ -530,8 +586,25 @@ def _persist(prepared, cfg, rows, baseline_per_user, runs, decision):
     quadrant_path = prepared["out_dir"] / f"{stem}_variable_quadrants.csv"
     frame.to_csv(csv_path, index=False, float_format="%.8f")
     pd.DataFrame(delta_rows).to_csv(delta_path, index=False)
-    prepared["variable_validity"]["metrics"].to_csv(validity_path, index=False)
-    prepared["variable_validity"]["quadrants"].to_csv(quadrant_path, index=False)
+    validity_metrics = prepared["variable_validity"]["metrics"]
+    validity_quadrants = prepared["variable_validity"]["quadrants"]
+    if not validity_metrics.empty:
+        validity_metrics.to_csv(validity_path, index=False)
+        validity_quadrants.to_csv(quadrant_path, index=False)
+    axes = prepared["axes"]
+    mask_summary = {
+        "n_users": int(len(axes["activity_valid"])),
+        "activity_valid_count": int(axes["activity_valid"].sum()),
+        "activity_valid_share": float(axes["activity_valid"].mean()),
+        "value_valid_count": int(axes["value_valid"].sum()),
+        "value_valid_share": float(axes["value_valid"].mean()),
+        "both_valid_count": int(
+            np.logical_and(axes["activity_valid"], axes["value_valid"]).sum()
+        ),
+        "both_valid_share": float(
+            np.logical_and(axes["activity_valid"], axes["value_valid"]).mean()
+        ),
+    }
     payload = {
         "code_version": CODE_VERSION,
         "source_revision": prepared["revision"],
@@ -545,6 +618,7 @@ def _persist(prepared, cfg, rows, baseline_per_user, runs, decision):
             "item_activity": list(prepared["item_profile"].activity_names),
             "item_value": list(prepared["item_profile"].value_names),
         },
+        "user_axis_mask_summary": mask_summary,
         "decision": decision,
         "training": {name: run["training"] for name, run in runs.items()},
         "diagnostics": {name: run["diagnostics"] for name, run in runs.items()},
@@ -553,8 +627,8 @@ def _persist(prepared, cfg, rows, baseline_per_user, runs, decision):
         "paired_delta": delta_rows,
         "variable_validity": {
             "source": "train_internal_only",
-            "metrics": prepared["variable_validity"]["metrics"].to_dict("records"),
-            "quadrants": prepared["variable_validity"]["quadrants"].to_dict("records"),
+            "metrics": validity_metrics.to_dict("records"),
+            "quadrants": validity_quadrants.to_dict("records"),
         },
         "interpretation": {
             "clv": "historical N×V CLV proxy used as conditional representation inputs",
@@ -566,13 +640,16 @@ def _persist(prepared, cfg, rows, baseline_per_user, runs, decision):
         json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
     frame.attrs["decision"] = decision
-    frame.attrs["result_paths"] = {
+    result_paths = {
         "csv": str(csv_path),
         "delta_csv": str(delta_path),
-        "variable_validity_csv": str(validity_path),
-        "variable_quadrants_csv": str(quadrant_path),
         "json": str(json_path),
     }
+    if not validity_metrics.empty:
+        result_paths["variable_validity_csv"] = str(validity_path)
+        result_paths["variable_quadrants_csv"] = str(quadrant_path)
+    frame.attrs["user_axis_mask_summary"] = mask_summary
+    frame.attrs["result_paths"] = result_paths
     return frame
 
 
@@ -582,22 +659,24 @@ def run_experiment(cfg: JointNVConfig | None = None) -> pd.DataFrame:
     prepared = _prepare(cfg)
     _, m1_training, baseline, baseline_per_user = _train_m1(prepared, cfg)
     rows = [result_row("m1", "baseline", "none", cfg.seed, baseline)]
-    runs = {}
-    for model_id in (PRIMARY_MODEL, *CONTROLS):
-        runs[model_id] = _train_variant(prepared, cfg, model_id)
-        rows.append(
-            result_row(
-                model_id,
-                "model" if model_id == PRIMARY_MODEL else "control",
-                cfg.gate_shape if model_id != "joint_constant_user" else "equal",
-                cfg.seed,
-                runs[model_id]["metrics"],
-                runs[model_id]["diagnostics"],
-            )
+    model_id = _primary_model_id(cfg)
+    runs = {
+        model_id: _train_variant(prepared, cfg, model_id, variant=PRIMARY_MODEL)
+    }
+    rows.append(
+        result_row(
+            model_id,
+            "model",
+            cfg.gate_shape,
+            cfg.seed,
+            runs[model_id]["metrics"],
+            runs[model_id]["diagnostics"],
         )
-    decision = _decision(rows, baseline)
+    )
+    decision = _decision(rows, baseline, model_id)
     frame = _persist(prepared, cfg, rows, baseline_per_user, runs, decision)
     frame.attrs["m1_training"] = m1_training
+    print("사용자 N/V 마스크:", frame.attrs["user_axis_mask_summary"])
     print("최종 validation 판정:", decision)
     print("결과 파일:", frame.attrs["result_paths"])
     return frame

@@ -41,13 +41,25 @@ def _inputs():
     return user_n, user_v, item, q_n, q_v
 
 
-def _model(variant="joint_nv", gate_shape="high", layers=1, gamma_init=0.01):
+def _model(
+    variant="joint_nv",
+    gate_shape="high",
+    layers=1,
+    gamma_init=0.01,
+    *,
+    user_activity_valid=None,
+    user_value_valid=None,
+    anchor_weight=0.0,
+    pref_reg=1e-4,
+):
     user_n, user_v, item, q_n, q_v = _inputs()
     return JointNVLightGCN(
         n_users=3,
         n_items=4,
         user_activity=user_n,
         user_value=user_v,
+        user_activity_valid=user_activity_valid,
+        user_value_valid=user_value_valid,
         item_profile=item,
         q_n=q_n,
         q_v=q_v,
@@ -59,8 +71,9 @@ def _model(variant="joint_nv", gate_shape="high", layers=1, gamma_init=0.01):
         variant=variant,
         gate_shape=gate_shape,
         shuffle_seed=42,
-        pref_reg=1e-4,
+        pref_reg=pref_reg,
         gamma_init=gamma_init,
+        anchor_weight=anchor_weight,
     )
 
 
@@ -151,3 +164,49 @@ def test_loss_rejects_sample_weights_so_m4_cannot_leak_into_m2():
             0.0,
             torch.tensor([2.0]),
         )
+
+
+def test_axis_output_masks_remove_missing_user_blocks_after_the_mlp():
+    model = _model(
+        gate_shape="equal",
+        layers=0,
+        user_activity_valid=np.array([True, False, True]),
+        user_value_valid=np.array([False, True, True]),
+    )
+    user, _ = model.layer0_embeddings()
+
+    assert torch.count_nonzero(user[1, 6:9]) == 0
+    assert torch.count_nonzero(user[0, 9:12]) == 0
+    assert torch.count_nonzero(user[0, 6:9]) > 0
+    assert torch.count_nonzero(user[1, 9:12]) > 0
+
+
+def test_anchored_bpr_balances_full_and_id_losses_without_stopgrad():
+    model = _model(
+        gate_shape="equal",
+        layers=0,
+        anchor_weight=0.5,
+        pref_reg=0.0,
+    )
+    users = torch.tensor([0, 1])
+    positives = torch.tensor([0, 2])
+    negatives = torch.tensor([3, 0])
+    user, item = model.propagate()
+    full_margin = (
+        (user[users] * item[positives]).sum(1)
+        - (user[users] * item[negatives]).sum(1)
+    )
+    id_margin = (
+        (user[users, :6] * item[positives, :6]).sum(1)
+        - (user[users, :6] * item[negatives, :6]).sum(1)
+    )
+    expected_full = -torch.nn.functional.logsigmoid(full_margin).mean()
+    expected_id = -torch.nn.functional.logsigmoid(id_margin).mean()
+
+    loss, diagnostics = model.bpr_loss(
+        users, positives, negatives, None, 0.0, None
+    )
+
+    torch.testing.assert_close(loss, 0.5 * expected_full + 0.5 * expected_id)
+    assert diagnostics["bpr_full"] == pytest.approx(float(expected_full))
+    assert diagnostics["bpr_id"] == pytest.approx(float(expected_id))

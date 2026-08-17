@@ -47,6 +47,8 @@ class JointNVLightGCN(nn.Module):
         n_items: int,
         user_activity: np.ndarray,
         user_value: np.ndarray,
+        user_activity_valid: np.ndarray | None = None,
+        user_value_valid: np.ndarray | None = None,
         item_profile: DualItemProfile,
         q_n: np.ndarray,
         q_v: np.ndarray,
@@ -60,6 +62,7 @@ class JointNVLightGCN(nn.Module):
         shuffle_seed: int = 42,
         pref_reg: float = 1e-4,
         gamma_init: float = 0.01,
+        anchor_weight: float = 0.0,
     ):
         super().__init__()
         if variant not in VARIANTS:
@@ -73,12 +76,24 @@ class JointNVLightGCN(nn.Module):
 
         user_activity = np.asarray(user_activity, dtype=np.float32)
         user_value = np.asarray(user_value, dtype=np.float32)
+        user_activity_valid = np.asarray(
+            np.ones(n_users, bool)
+            if user_activity_valid is None
+            else user_activity_valid,
+            dtype=bool,
+        )
+        user_value_valid = np.asarray(
+            np.ones(n_users, bool) if user_value_valid is None else user_value_valid,
+            dtype=bool,
+        )
         q_n = np.asarray(q_n, dtype=np.float32)
         q_v = np.asarray(q_v, dtype=np.float32)
         if user_activity.shape[0] != n_users or user_value.shape[0] != n_users:
             raise ValueError("사용자 특징의 행 수가 n_users와 다릅니다")
         if q_n.shape != (n_users,) or q_v.shape != (n_users,):
             raise ValueError("q_n/q_v shape이 n_users와 다릅니다")
+        if user_activity_valid.shape != (n_users,) or user_value_valid.shape != (n_users,):
+            raise ValueError("사용자 N/V 유효성 마스크 shape이 n_users와 다릅니다")
         if item_profile.activity.shape[0] != n_items or item_profile.value.shape[0] != n_items:
             raise ValueError("아이템 특징의 행 수가 n_items와 다릅니다")
         arrays = (user_activity, user_value, item_profile.activity, item_profile.value, q_n, q_v)
@@ -89,6 +104,8 @@ class JointNVLightGCN(nn.Module):
             permutation = np.random.default_rng(shuffle_seed).permutation(n_users)
             user_activity = user_activity[permutation]
             user_value = user_value[permutation]
+            user_activity_valid = user_activity_valid[permutation]
+            user_value_valid = user_value_valid[permutation]
             q_n = q_n[permutation]
             q_v = q_v[permutation]
         elif variant == "joint_constant_user":
@@ -96,6 +113,8 @@ class JointNVLightGCN(nn.Module):
             user_value = np.broadcast_to(user_value.mean(0, keepdims=True), user_value.shape).copy()
             q_n = np.full(n_users, 0.5, np.float32)
             q_v = np.full(n_users, 0.5, np.float32)
+            user_activity_valid = np.ones(n_users, bool)
+            user_value_valid = np.ones(n_users, bool)
 
         gate_n = apply_gate_shape(q_n, gate_shape)
         gate_v = apply_gate_shape(q_v, gate_shape)
@@ -107,6 +126,11 @@ class JointNVLightGCN(nn.Module):
         self.n_items = int(n_items)
         self.n_layers = int(n_layers)
         self.pref_reg = float(pref_reg)
+        if not 0.0 <= anchor_weight <= 1.0:
+            raise ValueError("anchor_weight는 0과 1 사이여야 합니다")
+        self.anchor_weight = float(anchor_weight)
+        self.id_dim = int(id_dim)
+        self.axis_dim = int(axis_dim)
         self.variant = variant
         self.gate_shape = gate_shape
 
@@ -125,6 +149,13 @@ class JointNVLightGCN(nn.Module):
 
         self.register_buffer("user_activity", torch.from_numpy(user_activity.copy()))
         self.register_buffer("user_value", torch.from_numpy(user_value.copy()))
+        self.register_buffer(
+            "user_activity_valid",
+            torch.from_numpy(user_activity_valid.astype(np.float32)),
+        )
+        self.register_buffer(
+            "user_value_valid", torch.from_numpy(user_value_valid.astype(np.float32))
+        )
         self.register_buffer("item_activity", torch.from_numpy(item_profile.activity.copy()))
         self.register_buffer("item_value", torch.from_numpy(item_profile.value.copy()))
         self.register_buffer("valid_item", torch.from_numpy(item_profile.valid_item.astype(np.float32)))
@@ -141,9 +172,11 @@ class JointNVLightGCN(nn.Module):
         return torch.sigmoid(self.raw_gamma_v)
 
     def layer0_embeddings(self) -> tuple[torch.Tensor, torch.Tensor]:
-        user_n = self.activity_user(self.user_activity)
+        user_n = (
+            self.activity_user(self.user_activity) * self.user_activity_valid[:, None]
+        )
         item_n = self.activity_item(self.item_activity) * self.valid_item[:, None]
-        user_v = self.value_user(self.user_value)
+        user_v = self.value_user(self.user_value) * self.user_value_valid[:, None]
         item_v = self.value_item(self.item_value) * self.valid_item[:, None]
         scale_n = torch.sqrt(self.gamma_n)
         scale_v = torch.sqrt(self.gamma_v)
@@ -196,11 +229,21 @@ class JointNVLightGCN(nn.Module):
         user, item = self.propagate()
         positive_score = (user[users] * item[positives]).sum(1)
         negative_score = (user[users] * item[negatives]).sum(1)
-        bpr = -F.logsigmoid(positive_score - negative_score).mean()
+        bpr_full = -F.logsigmoid(positive_score - negative_score).mean()
+        positive_id = (
+            user[users, : self.id_dim] * item[positives, : self.id_dim]
+        ).sum(1)
+        negative_id = (
+            user[users, : self.id_dim] * item[negatives, : self.id_dim]
+        ).sum(1)
+        bpr_id = -F.logsigmoid(positive_id - negative_id).mean()
+        bpr = (1.0 - self.anchor_weight) * bpr_full + self.anchor_weight * bpr_id
         loss = bpr + self.batch_l2(users, positives, negatives)
         with torch.no_grad():
             diagnostics = {
                 "bpr": float(bpr),
+                "bpr_full": float(bpr_full),
+                "bpr_id": float(bpr_id),
                 "p_correct": float((positive_score > negative_score).float().mean()),
                 "gamma_n": float(self.gamma_n),
                 "gamma_v": float(self.gamma_v),
