@@ -39,6 +39,22 @@ def test_anchored_dunnhumby_colab_is_pinned_and_runs_the_fast_preset_once():
     assert "ACKNOWLEDGE_HIGH_COST" not in source
 
 
+def test_anchored_diagnostic_colab_is_pinned_and_never_starts_training():
+    notebook = json.loads(
+        Path("clv_joint_nv_anchored_diagnostic_colab.ipynb").read_text(
+            encoding="utf-8"
+        )
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "2791aabe13a65290ee2ce4b25524e7e50018f48d" in source
+    assert "run_checkpoint_diagnostics(cfg)" in source
+    assert "run_experiment" not in source
+    assert "training_performed" in source
+
+
 def test_hm60_preset_is_seed42_validation_only_and_plain_bpr():
     cfg = joint.configure_joint_nv_run("hm", short_hm=True)
     summary = joint.preflight_summary(cfg)
