@@ -126,6 +126,25 @@ def test_hm60_preset_is_seed42_validation_only_and_plain_bpr():
     }
 
 
+def test_preference_preserving_colab_is_pinned_and_runs_once():
+    notebook = json.loads(
+        Path("clv_joint_nv_preference_preserving_dunnhumby_colab.ipynb").read_text(
+            encoding="utf-8"
+        )
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "0bfc552d1a70612f6a391baf2401aaeb8cde7920" in source
+    assert "configure_preference_preserving_dunnhumby_run" in source
+    assert source.count("result_df = run_experiment(cfg)") == 1
+    assert "m2-joint-nv-lightgcn-v1.5" in source
+    assert "eval_test'] is False" in source
+    assert "eval_holdout'] is False" in source
+    assert "ACKNOWLEDGE_HIGH_COST" not in source
+
+
 def test_fast_two_dataset_suite_runs_hm60_then_full_dunnhumby(monkeypatch):
     seen = []
 
