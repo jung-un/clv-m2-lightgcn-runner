@@ -60,7 +60,7 @@ def test_colab_is_pinned_and_runs_only_the_safe_runner():
     source = "\n".join(
         "".join(cell.get("source", [])) for cell in notebook["cells"]
     )
-    assert "79a5dd7905ae8917c76107b3b9d810ab00e22a10" in source
+    assert "f447feace10abab2f46bbfe49e2f0f5b9539fbfd" in source
     assert "configure_m3_clv_nv_dunnhumby_run" in source
     assert source.count("run_experiment(cfg)") == 1
     assert "EVAL_TEST=False" in source and "EVAL_HOLDOUT=False" in source
