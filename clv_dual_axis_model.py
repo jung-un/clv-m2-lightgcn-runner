@@ -17,7 +17,7 @@ from clv_moe_features import UserProfileArtifact
 CONTROLS = frozenset(
     {"dual_clv_fixed", "dual_shuffled_user", "dual_adapter_only"}
 )
-GATE_SHAPES = ("high", "equal", "low")
+GATE_SHAPES = ("high", "equal", "low", "centered")
 EVAL_AXIS_MODES = ("n_only", "v_only", "n_plus_v")
 
 
@@ -57,7 +57,7 @@ def fixed_percentile_ranks(
 
 
 def apply_gate_shape(percentiles: np.ndarray, shape: str) -> np.ndarray:
-    """Map percentiles to one of three pre-specified mean-one gate directions."""
+    """Map percentiles to a pre-specified gate direction."""
     q = np.asarray(percentiles, dtype=np.float32)
     if shape == "high":
         return 2.0 * q
@@ -65,6 +65,8 @@ def apply_gate_shape(percentiles: np.ndarray, shape: str) -> np.ndarray:
         return np.ones_like(q)
     if shape == "low":
         return 2.0 * (1.0 - q)
+    if shape == "centered":
+        return 2.0 * q - 1.0
     raise ValueError(f"지원하지 않는 gate shape: {shape}")
 
 

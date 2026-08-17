@@ -162,6 +162,17 @@ def test_fixed_gate_and_controls_have_distinct_identifiable_meaning():
     assert torch.allclose(constant.user_value[0], constant.user_value[2])
 
 
+def test_centered_gate_gives_low_and_high_users_opposite_axis_directions():
+    model = _model("joint_nv", gate_shape="centered", layers=0)
+
+    torch.testing.assert_close(model.gate_n, torch.tensor([-0.8, 0.8, 0.0]))
+    torch.testing.assert_close(model.gate_v, torch.tensor([0.8, -0.8, 0.0]))
+    user, _ = model.layer0_embeddings()
+    assert torch.count_nonzero(user[2, 6:12]) == 0
+    assert torch.dot(user[0, 6:9], user[1, 6:9]) < 0
+    assert torch.dot(user[0, 9:12], user[1, 9:12]) < 0
+
+
 def test_loss_rejects_sample_weights_so_m4_cannot_leak_into_m2():
     model = _model()
     with pytest.raises(ValueError, match="M4"):

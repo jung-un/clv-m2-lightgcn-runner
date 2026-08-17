@@ -292,4 +292,12 @@ class JointNVLightGCN(nn.Module):
             "score_std": float(score.std()),
             "mean_user_norm": float(user.norm(dim=1).mean()),
             "mean_item_norm": float(item.norm(dim=1).mean()),
+            "gate_n_mean": float(self.gate_n.mean()),
+            "gate_n_std": float(self.gate_n.std()),
+            "gate_n_negative_share": float((self.gate_n < 0).float().mean()),
+            "gate_n_positive_share": float((self.gate_n > 0).float().mean()),
+            "gate_v_mean": float(self.gate_v.mean()),
+            "gate_v_std": float(self.gate_v.std()),
+            "gate_v_negative_share": float((self.gate_v < 0).float().mean()),
+            "gate_v_positive_share": float((self.gate_v > 0).float().mean()),
         }
