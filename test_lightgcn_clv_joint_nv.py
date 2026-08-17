@@ -75,6 +75,26 @@ def test_anchored_v14_colab_is_pinned_and_runs_only_the_fast_preset():
     assert "ACKNOWLEDGE_HIGH_COST" not in source
 
 
+def test_anchored_v14_diagnostic_colab_uses_fine_curve_without_training():
+    notebook = json.loads(
+        Path("clv_joint_nv_anchored_v14_diagnostic_colab.ipynb").read_text(
+            encoding="utf-8"
+        )
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "b6e49ed628bee2f22b9e515367b7de7309f169ee" in source
+    assert "strength_multipliers=MULTIPLIERS" in source
+    assert "(0.0, 0.125, 0.25, 0.375, 0.5, 0.75, 1.0)" in source
+    assert "run_checkpoint_diagnostics" in source
+    assert "run_experiment" not in source
+    assert "training_performed" in source
+    assert "eval_test'] is False" in source
+    assert "eval_holdout'] is False" in source
+
+
 def test_hm60_preset_is_seed42_validation_only_and_plain_bpr():
     cfg = joint.configure_joint_nv_run("hm", short_hm=True)
     summary = joint.preflight_summary(cfg)
