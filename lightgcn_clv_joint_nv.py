@@ -28,7 +28,7 @@ import lightgcn_clv_residual as residual
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m2-joint-nv-lightgcn-v1.3"
+CODE_VERSION = "m2-joint-nv-lightgcn-v1.4"
 DIAGNOSTIC_VERSION = "joint-nv-checkpoint-diagnostics-v1"
 PRIMARY_MODEL = "joint_nv"
 CONTROLS = ()
@@ -84,8 +84,9 @@ def configure_anchored_dunnhumby_run(**overrides) -> JointNVConfig:
     """Fast seed-42 screen: external M1@64 versus anchored M2 only."""
     defaults = {
         "anchor_weight": 0.5,
+        "gamma_init": 0.1,
         "compute_variable_validity": False,
-        "out_dir": f"{v3.default_out_dir('dunnhumby')}_m2_joint_nv_anchored",
+        "out_dir": f"{v3.default_out_dir('dunnhumby')}_m2_joint_nv_anchored_v14",
     }
     return configure_joint_nv_run(
         "dunnhumby", short_hm=False, **(defaults | overrides)
@@ -159,7 +160,8 @@ def preflight_summary(cfg: JointNVConfig) -> dict:
         "architecture": "ID|N|V layer-0 concat -> one binary LightGCN -> one dot score",
         "gamma": {
             "initial_score_strength": cfg.gamma_init,
-            "application": "sqrt(gamma) applied symmetrically to user and item N/V blocks",
+            "parameterization": "learned sqrt_gamma s; reported gamma=s^2",
+            "application": "s applied symmetrically to user and item N/V blocks",
         },
         "gate_shape": cfg.gate_shape,
         "gate_source": {
@@ -843,7 +845,9 @@ def run_checkpoint_diagnostics(
         "current_source_revision": prepared["revision"],
         "input_hash": prepared["input_hash"],
         "config": asdict(cfg),
-        "gamma_application": "sqrt(gamma) on both user and item; score multiplier is gamma",
+        "gamma_application": (
+            "learned s on both user and item; reported score multiplier gamma=s^2"
+        ),
         "block_score_summary": score_summary,
         "axis_distribution": axis_summary,
         "block_metrics": rows,

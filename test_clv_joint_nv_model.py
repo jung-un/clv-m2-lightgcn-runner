@@ -91,34 +91,40 @@ def test_joint_embedding_is_propagated_as_one_concatenated_space():
     assert zero_i.shape == (4, 1)
 
 
-def test_score_level_gamma_scales_both_user_and_item_axis_blocks_symmetrically():
-    model = _model(layers=0, gamma_init=0.01)
+def test_learned_sqrt_gamma_scales_both_axis_sides_and_reports_squared_strength():
+    model = _model(layers=0, gamma_init=0.10)
     user, item = model.layer0_embeddings()
     user_n = user[:, 6:9]
     user_v = user[:, 9:12]
     item_n = item[:, 6:9]
     item_v = item[:, 9:12]
 
-    np.testing.assert_allclose(float(model.gamma_n.detach()), 0.01, rtol=1e-5)
-    np.testing.assert_allclose(float(model.gamma_v.detach()), 0.01, rtol=1e-5)
+    np.testing.assert_allclose(float(model.sqrt_gamma_n.detach()), np.sqrt(0.1))
+    np.testing.assert_allclose(float(model.sqrt_gamma_v.detach()), np.sqrt(0.1))
+    np.testing.assert_allclose(float(model.gamma_n.detach()), 0.10, rtol=1e-5)
+    np.testing.assert_allclose(float(model.gamma_v.detach()), 0.10, rtol=1e-5)
     np.testing.assert_allclose(
-        user_n.norm(dim=1).detach().numpy(), [0.02, 0.18, 0.10], rtol=1e-5
+        user_n.norm(dim=1).detach().numpy(),
+        np.sqrt(0.1) * np.array([0.2, 1.8, 1.0]),
+        rtol=1e-5,
     )
     np.testing.assert_allclose(
-        user_v.norm(dim=1).detach().numpy(), [0.18, 0.02, 0.10], rtol=1e-5
+        user_v.norm(dim=1).detach().numpy(),
+        np.sqrt(0.1) * np.array([1.8, 0.2, 1.0]),
+        rtol=1e-5,
     )
     np.testing.assert_allclose(
-        item_n.norm(dim=1).detach().numpy(), np.full(4, 0.10), rtol=1e-5
+        item_n.norm(dim=1).detach().numpy(), np.full(4, np.sqrt(0.1)), rtol=1e-5
     )
     np.testing.assert_allclose(
-        item_v.norm(dim=1).detach().numpy(), np.full(4, 0.10), rtol=1e-5
+        item_v.norm(dim=1).detach().numpy(), np.full(4, np.sqrt(0.1)), rtol=1e-5
     )
 
 
 def test_plain_bpr_sends_one_loss_gradient_to_id_n_and_v_paths():
     model = _model()
-    model.raw_gamma_n.data.fill_(0.0)
-    model.raw_gamma_v.data.fill_(0.0)
+    model.sqrt_gamma_n.data.fill_(0.5)
+    model.sqrt_gamma_v.data.fill_(0.5)
     loss, diagnostics = model.bpr_loss(
         torch.tensor([0, 1]),
         torch.tensor([0, 2]),
@@ -135,8 +141,8 @@ def test_plain_bpr_sends_one_loss_gradient_to_id_n_and_v_paths():
     assert model.activity_item.net[0].weight.grad.abs().sum() > 0
     assert model.value_user.net[0].weight.grad.abs().sum() > 0
     assert model.value_item.net[0].weight.grad.abs().sum() > 0
-    assert model.raw_gamma_n.grad.abs() > 0
-    assert model.raw_gamma_v.grad.abs() > 0
+    assert model.sqrt_gamma_n.grad.abs() > 0
+    assert model.sqrt_gamma_v.grad.abs() > 0
 
 
 def test_fixed_gate_and_controls_have_distinct_identifiable_meaning():

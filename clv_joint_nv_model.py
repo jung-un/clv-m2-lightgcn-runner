@@ -35,9 +35,9 @@ class _AxisEncoder(nn.Module):
 class JointNVLightGCN(nn.Module):
     """ID/N/V layer-0 blocks propagated together by one LightGCN.
 
-    ``gamma_n`` and ``gamma_v`` are positive learned score-level strengths.
-    Their square roots scale both user and item axis blocks, so a small gamma
-    suppresses N/V information on both sides while retaining gradients.
+    ``sqrt_gamma_n`` and ``sqrt_gamma_v`` are learned directly.  The same
+    parameter scales the user and item side of each axis, so the reported
+    non-negative score-level strength is ``gamma = sqrt_gamma ** 2``.
     """
 
     def __init__(
@@ -143,9 +143,9 @@ class JointNVLightGCN(nn.Module):
         self.activity_item = _AxisEncoder(item_profile.activity.shape[1], hidden_dim, axis_dim)
         self.value_user = _AxisEncoder(user_value.shape[1], hidden_dim, axis_dim)
         self.value_item = _AxisEncoder(item_profile.value.shape[1], hidden_dim, axis_dim)
-        gamma_logit = float(np.log(gamma_init / (1.0 - gamma_init)))
-        self.raw_gamma_n = nn.Parameter(torch.tensor(gamma_logit))
-        self.raw_gamma_v = nn.Parameter(torch.tensor(gamma_logit))
+        sqrt_gamma_init = float(np.sqrt(gamma_init))
+        self.sqrt_gamma_n = nn.Parameter(torch.tensor(sqrt_gamma_init))
+        self.sqrt_gamma_v = nn.Parameter(torch.tensor(sqrt_gamma_init))
 
         self.register_buffer("user_activity", torch.from_numpy(user_activity.copy()))
         self.register_buffer("user_value", torch.from_numpy(user_value.copy()))
@@ -165,11 +165,11 @@ class JointNVLightGCN(nn.Module):
 
     @property
     def gamma_n(self) -> torch.Tensor:
-        return torch.sigmoid(self.raw_gamma_n)
+        return self.sqrt_gamma_n.square()
 
     @property
     def gamma_v(self) -> torch.Tensor:
-        return torch.sigmoid(self.raw_gamma_v)
+        return self.sqrt_gamma_v.square()
 
     def layer0_embeddings(self) -> tuple[torch.Tensor, torch.Tensor]:
         user_n = (
@@ -178,8 +178,8 @@ class JointNVLightGCN(nn.Module):
         item_n = self.activity_item(self.item_activity) * self.valid_item[:, None]
         user_v = self.value_user(self.user_value) * self.user_value_valid[:, None]
         item_v = self.value_item(self.item_value) * self.valid_item[:, None]
-        scale_n = torch.sqrt(self.gamma_n)
-        scale_v = torch.sqrt(self.gamma_v)
+        scale_n = self.sqrt_gamma_n
+        scale_v = self.sqrt_gamma_v
         user = torch.cat(
             [
                 self.E_u.weight,

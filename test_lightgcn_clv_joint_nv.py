@@ -70,7 +70,8 @@ def test_hm60_preset_is_seed42_validation_only_and_plain_bpr():
     assert summary["frozen_or_external_base"] is False
     assert summary["gamma"] == {
         "initial_score_strength": 0.01,
-        "application": "sqrt(gamma) applied symmetrically to user and item N/V blocks",
+        "parameterization": "learned sqrt_gamma s; reported gamma=s^2",
+        "application": "s applied symmetrically to user and item N/V blocks",
     }
     assert summary["gate_source"] == {
         "q_n": "train-history percentile of repeat transactions / customer age",
@@ -118,12 +119,19 @@ def test_fast_anchored_dunnhumby_preset_runs_only_m1_and_m2_on_validation():
     assert cfg.window_days is None
     assert cfg.gate_shape == "equal"
     assert cfg.anchor_weight == 0.5
+    assert cfg.gamma_init == 0.1
+    assert cfg.out_dir.endswith("_m2_joint_nv_anchored_v14")
     assert cfg.compute_variable_validity is False
     assert summary["models"] == ["m1", "joint_nv_anchored"]
     assert summary["loss"] == {
         "type": "preference_anchored_bpr",
         "full_weight": 0.5,
         "id_anchor_weight": 0.5,
+    }
+    assert summary["gamma"] == {
+        "initial_score_strength": 0.1,
+        "parameterization": "learned sqrt_gamma s; reported gamma=s^2",
+        "application": "s applied symmetrically to user and item N/V blocks",
     }
     assert summary["eval_test"] is False
     assert summary["eval_holdout"] is False
