@@ -15,6 +15,7 @@ from clv_dual_axis_model import build_dual_item_profiles, fixed_percentile_ranks
 from clv_joint_nv_diagnostics import (
     axis_distribution_diagnostics,
     evaluate_block_views,
+    evaluate_strength_curve,
     find_joint_checkpoint,
     load_joint_checkpoint,
     sampled_block_score_summary,
@@ -780,6 +781,7 @@ def run_checkpoint_diagnostics(
         return metrics
 
     block_metrics = evaluate_block_views(model, evaluator)
+    strength_metrics = evaluate_strength_curve(model, evaluator)
     rows = [
         {
             "dataset": cfg.dataset,
@@ -790,6 +792,15 @@ def run_checkpoint_diagnostics(
         for view, metrics in block_metrics.items()
     ]
     frame = pd.DataFrame(rows)
+    strength_frame = pd.DataFrame([
+        {
+            "dataset": cfg.dataset,
+            "seed": cfg.seed,
+            "nv_score_multiplier": multiplier,
+            **metrics,
+        }
+        for multiplier, metrics in strength_metrics.items()
+    ])
     score_summary = sampled_block_score_summary(model, seed=cfg.seed)
     axis_summary = axis_distribution_diagnostics(
         prepared["axes"]["n_behavior_score"],
@@ -815,10 +826,12 @@ def run_checkpoint_diagnostics(
     stem = f"{model_id}_blocks_{cfg.dataset}_s{cfg.seed}_{checkpoint.stem[-12:]}"
     metrics_path = diagnostic_dir / f"{stem}.csv"
     comparison_path = diagnostic_dir / f"{stem}_comparison.csv"
+    strength_path = diagnostic_dir / f"{stem}_strength_curve.csv"
     validity_path = diagnostic_dir / f"{stem}_variable_validity.csv"
     json_path = diagnostic_dir / f"{stem}.json"
     frame.to_csv(metrics_path, index=False, float_format="%.8f")
     comparison.to_csv(comparison_path, index=False, float_format="%.8f")
+    strength_frame.to_csv(strength_path, index=False, float_format="%.8f")
     validity_metrics = prepared["variable_validity"]["metrics"]
     if not validity_metrics.empty:
         validity_metrics.to_csv(validity_path, index=False)
@@ -835,6 +848,7 @@ def run_checkpoint_diagnostics(
         "axis_distribution": axis_summary,
         "block_metrics": rows,
         "block_comparison": comparison.to_dict("records"),
+        "strength_curve": strength_frame.to_dict("records"),
         "external_m1_from_original_result": baseline_row,
         "source_result_json": source_result.get("_result_json") if source_result else None,
         "variable_validity": validity_metrics.to_dict("records"),
@@ -852,10 +866,12 @@ def run_checkpoint_diagnostics(
     frame.attrs["axis_distribution"] = axis_summary
     frame.attrs["external_m1"] = baseline_row
     frame.attrs["block_comparison"] = comparison
+    frame.attrs["strength_curve"] = strength_frame
     frame.attrs["training_performed"] = False
     frame.attrs["result_paths"] = {
         "metrics_csv": str(metrics_path),
         "comparison_csv": str(comparison_path),
+        "strength_curve_csv": str(strength_path),
         "json": str(json_path),
     }
     if not validity_metrics.empty:

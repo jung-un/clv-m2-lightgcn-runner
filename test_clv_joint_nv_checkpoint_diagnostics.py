@@ -4,6 +4,7 @@ import torch
 from clv_dual_axis_model import DualItemProfile
 from clv_joint_nv_diagnostics import (
     JointNVBlockView,
+    JointNVStrengthView,
     axis_distribution_diagnostics,
     block_score_diagnostics,
     evaluate_block_views,
@@ -80,6 +81,19 @@ def test_block_view_masks_unselected_dimensions_after_propagation():
     torch.testing.assert_close(id_u @ id_i.T + nv_u @ nv_i.T, full_u @ full_i.T)
     assert torch.count_nonzero(id_u[:, 2:]) == 0
     assert torch.count_nonzero(nv_u[:, :2]) == 0
+
+
+def test_strength_view_scales_only_combined_n_v_score():
+    model = _model().eval()
+    full_u, full_i = model.propagate()
+    id_u, id_i, _, _ = JointNVBlockView(model, ("id",)).embeddings()
+    scaled_u, scaled_i, _, _ = JointNVStrengthView(model, 4.0).embeddings()
+
+    full_score = full_u @ full_i.T
+    id_score = id_u @ id_i.T
+    scaled_score = scaled_u @ scaled_i.T
+
+    torch.testing.assert_close(scaled_score, id_score + 4.0 * (full_score - id_score))
 
 
 def test_axis_distribution_uses_midranks_and_reports_ties():

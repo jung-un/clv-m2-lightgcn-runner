@@ -75,6 +75,33 @@ class JointNVBlockView(nn.Module):
         return user, item, zero_user, zero_item
 
 
+class JointNVStrengthView(nn.Module):
+    """Read-only evaluator view that rescales the learned N/V score contribution."""
+
+    def __init__(self, model, multiplier: float):
+        super().__init__()
+        if not np.isfinite(multiplier) or multiplier < 0:
+            raise ValueError("multiplier must be finite and non-negative")
+        self.model = model
+        self.multiplier = float(multiplier)
+
+    def embeddings(self, need_value: bool = True):
+        user, item = self.model.propagate()
+        coordinate_scale = user.new_ones(user.shape[1])
+        axis_scale = self.multiplier**0.5
+        slices = _block_slices(self.model)
+        coordinate_scale[slices["n"]] = axis_scale
+        coordinate_scale[slices["v"]] = axis_scale
+        zero_user = user.new_zeros((self.model.n_users, 1))
+        zero_item = item.new_zeros((self.model.n_items, 1))
+        return (
+            user * coordinate_scale,
+            item * coordinate_scale,
+            zero_user,
+            zero_item,
+        )
+
+
 def evaluate_block_views(model, evaluator) -> dict[str, dict]:
     """Evaluate the full model and exact propagated block ablations."""
     views = {
@@ -88,6 +115,14 @@ def evaluate_block_views(model, evaluator) -> dict[str, dict]:
     return {
         name: evaluator(JointNVBlockView(model, blocks).eval())
         for name, blocks in views.items()
+    }
+
+
+def evaluate_strength_curve(model, evaluator, multipliers=(0.0, 1.0, 2.0, 4.0, 8.0)):
+    """Evaluate whether the learned N/V direction helps when only its score scale changes."""
+    return {
+        float(multiplier): evaluator(JointNVStrengthView(model, multiplier).eval())
+        for multiplier in multipliers
     }
 
 
