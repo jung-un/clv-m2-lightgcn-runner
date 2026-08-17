@@ -748,7 +748,10 @@ def _block_comparison_rows(block_metrics: dict, baseline_row: dict | None) -> li
 
 
 def run_checkpoint_diagnostics(
-    cfg: JointNVConfig | None = None, *, checkpoint_path: str | None = None
+    cfg: JointNVConfig | None = None,
+    *,
+    checkpoint_path: str | None = None,
+    strength_multipliers: tuple[float, ...] | None = None,
 ) -> pd.DataFrame:
     """Evaluate an existing joint checkpoint without any model training."""
     cfg = validate_joint_nv_config(cfg or configure_joint_nv_run("hm", short_hm=True))
@@ -783,7 +786,12 @@ def run_checkpoint_diagnostics(
         return metrics
 
     block_metrics = evaluate_block_views(model, evaluator)
-    strength_metrics = evaluate_strength_curve(model, evaluator)
+    strength_multipliers = strength_multipliers or (0.0, 1.0, 2.0, 4.0, 8.0)
+    strength_metrics = evaluate_strength_curve(
+        model,
+        evaluator,
+        multipliers=strength_multipliers,
+    )
     rows = [
         {
             "dataset": cfg.dataset,

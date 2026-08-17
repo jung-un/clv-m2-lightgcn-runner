@@ -8,6 +8,7 @@ from clv_joint_nv_diagnostics import (
     axis_distribution_diagnostics,
     block_score_diagnostics,
     evaluate_block_views,
+    evaluate_strength_curve,
     find_joint_checkpoint,
     load_joint_checkpoint,
 )
@@ -94,6 +95,22 @@ def test_strength_view_scales_only_combined_n_v_score():
     scaled_score = scaled_u @ scaled_i.T
 
     torch.testing.assert_close(scaled_score, id_score + 4.0 * (full_score - id_score))
+
+
+def test_strength_curve_accepts_fine_grained_v14_multipliers():
+    model = _model().eval()
+
+    def evaluator(view):
+        user, item, _, _ = view.embeddings()
+        return {"mean_score": float((user @ item.T).mean())}
+
+    rows = evaluate_strength_curve(
+        model,
+        evaluator,
+        multipliers=(0.0, 0.125, 0.5, 1.0),
+    )
+
+    assert tuple(rows) == (0.0, 0.125, 0.5, 1.0)
 
 
 def test_axis_distribution_uses_midranks_and_reports_ties():
