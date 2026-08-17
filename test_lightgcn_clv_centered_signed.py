@@ -1,4 +1,6 @@
 from dataclasses import replace
+import json
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -60,3 +62,17 @@ def test_success_requires_m1_gain_and_correct_user_assignment():
     decision = centered.screening_decision(shuffled_wins)
     assert decision["success"] is False
     assert decision["correct_assignment_beats_shuffled"] is False
+
+
+def test_colab_is_pinned_and_has_one_explicit_run_cell():
+    notebook = json.loads(
+        Path("clv_m2_centered_signed_dunnhumby_colab.ipynb").read_text(
+            encoding="utf-8"
+        )
+    )
+    sources = ["".join(cell.get("source", [])) for cell in notebook["cells"]]
+    joined = "\n".join(sources)
+
+    assert "6fa727cf3f8ef4368c8cd81911b18095bd412dc1" in joined
+    assert sum(source.strip() == "result_df = run_experiment(cfg)" for source in sources) == 1
+    assert "ACKNOWLEDGE_HIGH_COST" not in joined
