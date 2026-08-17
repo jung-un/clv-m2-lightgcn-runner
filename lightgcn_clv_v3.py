@@ -67,7 +67,7 @@ from scipy.stats import spearmanr
 
 from clv_m3_nv_graph import build_clv_nv_graph
 
-CODE_VERSION = "v3.14"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.15"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
