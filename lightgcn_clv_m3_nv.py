@@ -119,6 +119,23 @@ def screening_decision(frame: pd.DataFrame) -> dict:
     }
 
 
+def normalize_result_schema(frame: pd.DataFrame) -> pd.DataFrame:
+    """Expose the explicit public name used by the M3 result notebook.
+
+    The shared v3 evaluator historically stores Shannon entropy as
+    ``entropy@K``.  M3 reports label it ``exposure_entropy@K`` so it cannot be
+    confused with another entropy measure.  Keep the historical column too so
+    saved v3 results and downstream analysis remain backwards compatible.
+    """
+    normalized = frame.copy()
+    for k in (10, 20, 50):
+        source = f"entropy@{k}"
+        target = f"exposure_entropy@{k}"
+        if source in normalized.columns and target not in normalized.columns:
+            normalized[target] = normalized[source]
+    return normalized
+
+
 def _activate(cfg: dict) -> None:
     validate_screening_config(cfg)
     settings = {key: value for key, value in cfg.items()
@@ -131,7 +148,7 @@ def run_experiment(cfg: dict | None = None) -> pd.DataFrame:
     _activate(cfg)
     print("M3-CLV-NV screening preflight:")
     print(preflight_summary(cfg))
-    frame = v3.main()
+    frame = normalize_result_schema(v3.main())
     decision = screening_decision(frame)
     frame.attrs["screening_decision"] = decision
     frame.attrs["preflight"] = preflight_summary(cfg)

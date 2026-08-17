@@ -45,6 +45,15 @@ def test_decision_requires_economic_gain_and_accuracy_guardrails():
     assert M3.screening_decision(pd.DataFrame(rows))["success"] is False
 
 
+def test_result_schema_exposes_explicit_exposure_entropy_name():
+    frame = pd.DataFrame({"entropy@10": [3.25], "model_id": ["m3_clv_nv"]})
+
+    normalized = M3.normalize_result_schema(frame)
+
+    assert normalized["exposure_entropy@10"].tolist() == [3.25]
+    assert normalized["entropy@10"].tolist() == [3.25]
+
+
 def test_colab_is_pinned_and_runs_only_the_safe_runner():
     path = Path(__file__).with_name("clv_m3_nv_dunnhumby_colab.ipynb")
     notebook = json.loads(path.read_text(encoding="utf-8"))
