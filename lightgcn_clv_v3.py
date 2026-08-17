@@ -65,6 +65,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
+from clv_m3_nv_graph import build_clv_nv_graph
+
 CODE_VERSION = "v3.14"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -205,7 +207,7 @@ CFG = {
     #   빈도가 반영돼 있다. M3-count가 새로 하는 일은 그 빈도를 **그래프 전파**에도
     #   싣는 것이다. 사전 후보는 binary/count/value였고 price·clv는 2026-08-09에 추가한
     #   사후 변형이므로, 논문에서는 탐색적(exploratory) 분석으로 표기할 것.
-    "GRAPH_MODE": "binary",           # [선택] "binary"|"count"|"value"|"price"|"clv"
+    "GRAPH_MODE": "binary",           # [선택] "binary"|"count"|"value"|"price"|"clv"|"clv_nv"
     "GRAPH_ALPHA": 1.0,               # [기본] 참고 구현의 VG_ALPHA와 동일
 
     # ── M4: CLV-aware 손실함수 (목적함수 개입) ──
@@ -584,7 +586,20 @@ def prepare_data(cfg, dcfg):
     # groupby(sort=True)의 (u_idx,i_idx) 사전식 순서는 np.unique(u*n_items+i)의
     # 오름차순과 일치하므로 eu/ei와 행이 정렬된다(아래 assert로 고정).
     w_edge = np.ones(len(eu), np.float32)
-    if cfg["GRAPH_MODE"] != "binary":
+    clv_nv_graph = None
+    if cfg["GRAPH_MODE"] == "clv_nv":
+        clv_nv_graph = build_clv_nv_graph(train, n_users, n_items)
+        if not (np.array_equal(clv_nv_graph.edge_users, eu)
+                and np.array_equal(clv_nv_graph.edge_items, ei)):
+            raise RuntimeError("CLV-NV graph edge order differs from the shared M1 edge set")
+        w_edge = clv_nv_graph.weights
+        data_stats["clv_nv_graph"] = clv_nv_graph.diagnostics
+        dg = clv_nv_graph.diagnostics
+        print(f"  CLV-NV value graph: edges {len(eu):,} | "
+              f"w mean {dg['weight_mean']:.3f} median {dg['weight_median']:.3f} "
+              f"min {dg['weight_min']:.3f} max {dg['weight_max']:.3f} | "
+              f"repeat-edge share {dg['repeat_edge_share']:.3f}")
+    elif cfg["GRAPH_MODE"] != "binary":
         g_e = train.groupby(["u_idx", "i_idx"], sort=True).agg(cnt=("v", "size"),
                                                               spend=("v", "sum"))
         if len(g_e) != len(eu):
@@ -644,6 +659,7 @@ def prepare_data(cfg, dcfg):
         "n_degree_lt_5": int((ideg < 5).sum()), "n_degree_lt_10": int((ideg < 10).sum())}
 
     return dict(train=train, splits=splits, adj=adj, w_edge=w_edge,
+                clv_nv_graph=clv_nv_graph,
                 pos_key=edge_key, tr_u=tu, tr_i=ti,
                 x_val_u=x_val_u, clv=clv, vhat=vhat,
                 csr_ptr=csr_ptr, csr_items=csr_items, item_cat=item_cat_arr, cat_items=cat_items,

@@ -457,7 +457,7 @@ def test_graph_modes_change_adjacency(tmp_path):
     """binary는 기존 동작과 동일해야 하고, count/value는 실제로 가중치를 바꿔야 한다."""
     cfg, dcfg = _tiny_dataset(tmp_path)
     a = V3.prepare_data(dict(cfg, GRAPH_MODE="binary"), dcfg)["adj"].coalesce()
-    for mode in ("count", "value", "price", "clv"):
+    for mode in ("count", "value", "price", "clv", "clv_nv"):
         b = V3.prepare_data(dict(cfg, GRAPH_MODE=mode), dcfg)["adj"].coalesce()
         # shape만 보면 엣지 집합이 바뀌어도 통과한다 — 좌표 자체를 비교한다.
         torch.testing.assert_close(a.indices(), b.indices())
@@ -467,6 +467,20 @@ def test_graph_modes_change_adjacency(tmp_path):
         raise AssertionError("알 수 없는 GRAPH_MODE는 거부해야 한다")
     except ValueError:
         pass
+
+
+def test_graph_clv_nv_exposes_train_only_components(tmp_path):
+    """CLV-NV 모드는 공통 고유엣지를 보존하고 N/V 진단을 결과에 남겨야 한다."""
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    d = V3.prepare_data(dict(cfg, GRAPH_MODE="clv_nv"), dcfg)
+    eu = d["pos_key"] // d["n_items"]
+    ei = d["pos_key"] % d["n_items"]
+    graph = d["clv_nv_graph"]
+    np.testing.assert_array_equal(graph.edge_users, eu)
+    np.testing.assert_array_equal(graph.edge_items, ei)
+    np.testing.assert_allclose(d["w_edge"], graph.weights)
+    assert not np.allclose(d["w_edge"], 1.0)
+    assert d["data_stats"]["clv_nv_graph"]["n_edges"] == len(eu)
 
 
 def test_graph_alpha_scales_weights(tmp_path):
