@@ -12,6 +12,13 @@ import pandas as pd
 import torch
 
 from clv_dual_axis_model import build_dual_item_profiles, fixed_percentile_ranks
+from clv_joint_nv_diagnostics import (
+    axis_distribution_diagnostics,
+    evaluate_block_views,
+    find_joint_checkpoint,
+    load_joint_checkpoint,
+    sampled_block_score_summary,
+)
 from clv_joint_nv_model import JointNVLightGCN
 from clv_run_state import ProgressStore, RunIdentity
 from clv_variable_validity import candidate_variables, validate_anchor
@@ -21,6 +28,7 @@ import lightgcn_clv_v3 as v3
 
 
 CODE_VERSION = "m2-joint-nv-lightgcn-v1.2"
+DIAGNOSTIC_VERSION = "joint-nv-checkpoint-diagnostics-v1"
 PRIMARY_MODEL = "joint_nv"
 CONTROLS = ()
 MODELS = ("m1", PRIMARY_MODEL, *CONTROLS)
@@ -607,6 +615,126 @@ def run_two_dataset_screening() -> dict[str, pd.DataFrame]:
         results[label] = run_experiment(cfg)
         print(f"{label}: 완료")
     return results
+
+
+def _matching_result_payload(out_dir: Path, checkpoint: Path) -> dict | None:
+    for path in sorted(out_dir.glob("m2_joint_nv_*.json"), reverse=True):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        recorded = payload.get("checkpoints", {}).get(PRIMARY_MODEL)
+        if recorded and Path(recorded).name == checkpoint.name:
+            payload["_result_json"] = str(path)
+            return payload
+    return None
+
+
+def run_checkpoint_diagnostics(
+    cfg: JointNVConfig | None = None, *, checkpoint_path: str | None = None
+) -> pd.DataFrame:
+    """Evaluate an existing joint checkpoint without any model training."""
+    cfg = validate_joint_nv_config(cfg or configure_joint_nv_run("hm", short_hm=True))
+    print(json.dumps({
+        **preflight_summary(cfg),
+        "diagnostic_version": DIAGNOSTIC_VERSION,
+        "training": False,
+    }, ensure_ascii=False, indent=2))
+    prepared = _prepare(cfg)
+    checkpoint = (
+        Path(checkpoint_path)
+        if checkpoint_path
+        else find_joint_checkpoint(
+            prepared["out_dir"], dataset=cfg.dataset, seed=cfg.seed
+        )
+    )
+    model = _build_model(prepared, cfg, PRIMARY_MODEL)
+    checkpoint_payload = load_joint_checkpoint(
+        model,
+        checkpoint,
+        dataset=cfg.dataset,
+        seed=cfg.seed,
+        input_hash=prepared["input_hash"],
+    )
+
+    def evaluator(view):
+        metrics, _ = _evaluate(view, prepared, per_user=False)
+        return metrics
+
+    block_metrics = evaluate_block_views(model, evaluator)
+    rows = [
+        {
+            "dataset": cfg.dataset,
+            "seed": cfg.seed,
+            "view": view,
+            **metrics,
+        }
+        for view, metrics in block_metrics.items()
+    ]
+    frame = pd.DataFrame(rows)
+    score_summary = sampled_block_score_summary(model, seed=cfg.seed)
+    axis_summary = axis_distribution_diagnostics(
+        prepared["axes"]["n_behavior_score"],
+        prepared["axes"]["v_behavior_score"],
+        prepared["axes"]["valid_user"],
+    )
+    source_result = _matching_result_payload(prepared["out_dir"], checkpoint)
+    baseline_row = None
+    if source_result:
+        baseline_row = next(
+            (
+                row for row in source_result.get("absolute_rows", [])
+                if row.get("model_id") == "m1"
+            ),
+            None,
+        )
+
+    diagnostic_dir = prepared["out_dir"] / "checkpoint_diagnostics"
+    diagnostic_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"joint_nv_blocks_{cfg.dataset}_s{cfg.seed}_{checkpoint.stem[-12:]}"
+    metrics_path = diagnostic_dir / f"{stem}.csv"
+    validity_path = diagnostic_dir / f"{stem}_variable_validity.csv"
+    json_path = diagnostic_dir / f"{stem}.json"
+    frame.to_csv(metrics_path, index=False, float_format="%.8f")
+    prepared["variable_validity"]["metrics"].to_csv(validity_path, index=False)
+    output = {
+        "diagnostic_version": DIAGNOSTIC_VERSION,
+        "training_performed": False,
+        "checkpoint": str(checkpoint),
+        "checkpoint_source_revision": checkpoint_payload.get("source_revision"),
+        "current_source_revision": prepared["revision"],
+        "input_hash": prepared["input_hash"],
+        "config": asdict(cfg),
+        "gamma_application": "sqrt(gamma) on both user and item; score multiplier is gamma",
+        "block_score_summary": score_summary,
+        "axis_distribution": axis_summary,
+        "block_metrics": rows,
+        "external_m1_from_original_result": baseline_row,
+        "source_result_json": source_result.get("_result_json") if source_result else None,
+        "variable_validity": prepared["variable_validity"]["metrics"].to_dict("records"),
+        "interpretation_guard": {
+            "gamma": "gamma alone is not effective strength; use block score std ratios",
+            "v_validity": "future mean transaction value correlation is conditional on future buyers",
+            "revenue": "price/purchase-amount weighted hit, not incremental revenue",
+        },
+    }
+    json_path.write_text(
+        json.dumps(output, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
+    frame.attrs["checkpoint"] = str(checkpoint)
+    frame.attrs["block_score_summary"] = score_summary
+    frame.attrs["axis_distribution"] = axis_summary
+    frame.attrs["external_m1"] = baseline_row
+    frame.attrs["result_paths"] = {
+        "metrics_csv": str(metrics_path),
+        "variable_validity_csv": str(validity_path),
+        "json": str(json_path),
+    }
+    print("체크포인트 진단 완료 (재학습 없음)")
+    print("블록 실효강도:", score_summary)
+    print("축 분포:", axis_summary)
+    print("결과 파일:", frame.attrs["result_paths"])
+    return frame
 
 
 def main_cli():

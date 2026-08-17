@@ -75,4 +75,22 @@ def test_validity_reports_future_n_v_and_total_without_recommender_splits():
     ].iloc[0]
     assert n_row.spearman > 0
     assert v_row.spearman > 0
+    assert v_row.target_population == "future_buyers"
+    assert v_row.n_users == 5
     assert len(report["quadrants"]) == 4
+
+
+def test_quadrants_use_midranks_so_zero_ties_do_not_all_become_high_activity():
+    anchor = _anchor()
+    basket_index = residual.NUMERIC_FEATURES.index("basket_count")
+    anchor.numeric[:, basket_index] = [1, 1, 1, 1, 1, 2]
+
+    quadrants = validate_anchor(
+        anchor, dataset="toy", anchor_label="train_internal_7"
+    )["quadrants"].set_index("quadrant")
+
+    low_activity_users = int(
+        quadrants.loc["low_low", "user_count"]
+        + quadrants.loc["value", "user_count"]
+    )
+    assert low_activity_users == 5

@@ -138,9 +138,9 @@ def validate_anchor(
         mean_value = np.asarray(anchor.mean_transaction_value_target, dtype=np.float32)
     total = np.asarray(anchor.amount_target, dtype=np.float32)
     targets = {
-        "future_transaction_count": count,
-        "future_mean_transaction_value": mean_value,
-        "future_total_value": total,
+        "future_transaction_count": (count, np.ones(len(count), dtype=bool), "all_users"),
+        "future_mean_transaction_value": (mean_value, count > 0, "future_buyers"),
+        "future_total_value": (total, np.ones(len(total), dtype=bool), "all_users"),
     }
     rows = []
     for variable in (
@@ -151,7 +151,8 @@ def validate_anchor(
         "new_v_behavior",
         "new_clv_behavior",
     ):
-        for target_name, target in targets.items():
+        for target_name, (target, target_mask, target_population) in targets.items():
+            variable_values = variables[variable].to_numpy(float)
             rows.append(
                 {
                     "dataset": dataset,
@@ -159,15 +160,19 @@ def validate_anchor(
                     "source_split": "train_internal",
                     "variable": variable,
                     "target": target_name,
-                    "n_users": int(len(variables)),
+                    "target_population": target_population,
+                    "n_users": int(target_mask.sum()),
                     "spearman": _safe_spearman(
-                        variables[variable].to_numpy(float), target
+                        variable_values[target_mask], target[target_mask]
                     ),
                 }
             )
 
-    n_high = variables.new_n_behavior >= variables.new_n_behavior.median()
-    v_high = variables.new_v_behavior >= variables.new_v_behavior.median()
+    valid = np.ones(len(variables), dtype=bool)
+    q_n = _percentile(variables.new_n_behavior.to_numpy(float), valid)
+    q_v = _percentile(variables.new_v_behavior.to_numpy(float), valid)
+    n_high = q_n >= 0.5
+    v_high = q_v >= 0.5
     labels = np.select(
         [~n_high & ~v_high, n_high & ~v_high, ~n_high & v_high, n_high & v_high],
         ["low_low", "activity", "value", "core"],
