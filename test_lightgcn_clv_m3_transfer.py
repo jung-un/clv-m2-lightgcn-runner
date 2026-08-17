@@ -1,5 +1,7 @@
 import pandas as pd
 import pytest
+import json
+from pathlib import Path
 
 import lightgcn_clv_m3_transfer as M3
 
@@ -60,3 +62,16 @@ def test_result_schema_exposes_exposure_entropy():
     frame = pd.DataFrame({"entropy@10": [3.0]})
     normalized = M3.normalize_result_schema(frame)
     assert normalized["exposure_entropy@10"].tolist() == [3.0]
+
+
+def test_colab_is_pinned_and_runs_only_transfer_screening():
+    notebook = json.loads(
+        Path("clv_m3_transfer_dunnhumby_colab.ipynb").read_text(encoding="utf-8")
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+    assert "2cb09269cfdda9db237090b0b03c2439f318d79e" in source
+    assert source.count("run_experiment(cfg)") == 1
+    assert "EVAL_TEST" not in source
+    assert "ACKNOWLEDGE_HIGH_COST" not in source
