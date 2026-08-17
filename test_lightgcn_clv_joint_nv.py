@@ -23,6 +23,22 @@ def test_colab_drops_stale_repo_modules_before_importing_runner():
     )
 
 
+def test_anchored_dunnhumby_colab_is_pinned_and_runs_the_fast_preset_once():
+    notebook = json.loads(
+        Path("clv_joint_nv_anchored_dunnhumby_colab.ipynb").read_text(
+            encoding="utf-8"
+        )
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "e3865fafdffd02c04409c3eaed20d1743c159d33" in source
+    assert "configure_anchored_dunnhumby_run" in source
+    assert source.count("result_df = run_experiment(cfg)") == 1
+    assert "ACKNOWLEDGE_HIGH_COST" not in source
+
+
 def test_hm60_preset_is_seed42_validation_only_and_plain_bpr():
     cfg = joint.configure_joint_nv_run("hm", short_hm=True)
     summary = joint.preflight_summary(cfg)
