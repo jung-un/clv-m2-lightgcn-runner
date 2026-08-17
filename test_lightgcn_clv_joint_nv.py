@@ -56,6 +56,25 @@ def test_anchored_diagnostic_colab_is_pinned_and_never_starts_training():
     assert "strength_curve" in source
 
 
+def test_anchored_v14_colab_is_pinned_and_runs_only_the_fast_preset():
+    notebook = json.loads(
+        Path("clv_joint_nv_anchored_v14_dunnhumby_colab.ipynb").read_text(
+            encoding="utf-8"
+        )
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "4233c3cdb911b1024936d95f2236b131df8e881c" in source
+    assert "configure_anchored_dunnhumby_run" in source
+    assert source.count("result_df = run_experiment(cfg)") == 1
+    assert "initial_score_strength'] == 0.1" in source
+    assert "eval_test'] is False" in source
+    assert "eval_holdout'] is False" in source
+    assert "ACKNOWLEDGE_HIGH_COST" not in source
+
+
 def test_hm60_preset_is_seed42_validation_only_and_plain_bpr():
     cfg = joint.configure_joint_nv_run("hm", short_hm=True)
     summary = joint.preflight_summary(cfg)
