@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -89,3 +92,20 @@ def test_m4_main_fails_when_exposure_concentrates_beyond_fixed_guard(
 
     assert decision["arms"]["m4_clv_pair"]["passes_m1_screen"] is False
     assert decision["clv_specific_candidate"] is False
+
+
+def test_m4_interaction_colab_is_pinned_and_runs_fixed_screen_once():
+    notebook = json.loads(
+        Path("clv_m4_interaction_dunnhumby_colab.ipynb").read_text(
+            encoding="utf-8"
+        )
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "6ea53a0f934401f9c5e472ea9ed9708bd9102ec5" in source
+    assert source.count("run_experiment(cfg)") == 1
+    assert "preflight_summary(cfg)" in source
+    assert "EVAL_TEST" not in source
+    assert "EVAL_HOLDOUT" not in source
