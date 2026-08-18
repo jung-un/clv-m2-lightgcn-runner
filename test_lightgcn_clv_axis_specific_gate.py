@@ -1,4 +1,6 @@
 from dataclasses import replace
+import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -43,3 +45,21 @@ def test_axis_specific_preset_rejects_protected_splits(field):
         axis_gate.validate_axis_specific_gate_config(
             replace(cfg, **{field: True})
         )
+
+
+def test_axis_specific_colab_is_pinned_and_runs_once_without_approval_gate():
+    notebook = json.loads(
+        Path("clv_m2_axis_specific_gate_dunnhumby_colab.ipynb").read_text(
+            encoding="utf-8"
+        )
+    )
+    sources = ["".join(cell.get("source", [])) for cell in notebook["cells"]]
+    joined = "\n".join(sources)
+
+    assert sum(
+        source.strip() == "result_df = run_experiment(cfg)"
+        for source in sources
+    ) == 1
+    assert "ACKNOWLEDGE_HIGH_COST" not in joined
+    assert "4accfe76ace0c8bbd71adf936b66e8003160ec31" in joined
+    assert "eval_test" not in joined.lower()
