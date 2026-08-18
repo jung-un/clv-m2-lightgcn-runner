@@ -65,6 +65,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
+from clv_m4_interaction_weights import build_m4_interaction_weights
+
 from clv_m3_axis_adaptive_graph import build_m3_axis_adaptive_graph
 from clv_m3_direct_value_graph import build_direct_clv_value_graph
 from clv_m3_nv_graph import build_clv_nv_graph
@@ -217,7 +219,7 @@ CFG = {
     #   user : w(u)   = 1 + λ·sigmoid(zscore(CLV_u))
     #   pair : w(u,i) = 1 + λ·log1p(쌍 평균단가 / 전체 평균단가)
     # ⚠ 이 λ는 M2의 LAMBDA_TRAIN/LAMBDA_EVAL_SWEEP과 **다른 것**이다. 혼동 금지.
-    "LOSS_MODE": "plain",             # [선택] "plain" | "user" | "pair"
+    "LOSS_MODE": "plain",             # [선택] "plain" | "user" | "pair" | "pair_contribution" | "clv_pair"
     "LOSS_LAMBDA": 1.0,               # [기본] 참고 구현의 CLV_LAMBDA (스윕 0.5/1.0/2.0)
 
     # ── 평가 ──
@@ -879,6 +881,8 @@ def build_loss_weights(train, tr_u, clv, cfg):
 
       user : w(u) = 1 + λ·sigmoid(zscore(CLV_u))   — **유저** 평균 1로 정규화 후 행에 전개
       pair : w(u,i) = 1 + λ·log1p(그 쌍의 평균단가 / 전체 평균단가) — **행** 평균 1로 정규화
+      pair_contribution : 사용자 내 상품의 장바구니금액 기여 백분위
+      clv_pair : historical CLV 백분위 × 상품 기여 백분위
 
     정규화 기준이 다른 것은 의도적이며 참고 구현과 동일하다. user는 고객 단위 개입이라
     고객 평균이 1이어야 하고(구매가 많은 고객은 결과적으로 더 많이 반영된다),
@@ -906,11 +910,45 @@ def build_loss_weights(train, tr_u, clv, cfg):
         pm = train.groupby(["u_idx", "i_idx"])["up"].transform("mean").values
         w = 1.0 + lam * np.log1p(pm / float(train["up"].mean()))
         w = (w / w.mean()).astype(np.float32)       # 행 평균 1
+    elif mode in {"pair_contribution", "clv_pair"}:
+        result = build_m4_interaction_weights(
+            train, clv, mode=mode, beta=lam
+        )
+        w = result.row_weights
     else:
-        raise ValueError(f"LOSS_MODE={mode!r} — plain|user|pair 중 하나여야 한다")
+        raise ValueError(
+            f"LOSS_MODE={mode!r} — plain|user|pair|pair_contribution|clv_pair "
+            "중 하나여야 한다"
+        )
     print(f"  손실가중({mode}, λ={lam}): 행 {len(w):,} | 평균 {w.mean():.3f} "
           f"min {w.min():.3f} 중앙값 {np.median(w):.3f} max {w.max():.3f}")
     return w
+
+
+def loss_weight_diagnostics(weights, tr_u, clv, mode):
+    """Persist the realized BPR-row distribution and its CLV assignment."""
+    if weights is None:
+        return {"mode": mode, "weighted": False}
+    weights = np.asarray(weights, dtype=np.float64)
+    users = np.asarray(tr_u, dtype=np.int64)
+    customer_value = np.asarray(clv, dtype=np.float64).copy()
+    if np.all(np.isnan(customer_value)):
+        correlation = 0.0
+    else:
+        customer_value[np.isnan(customer_value)] = np.nanmedian(customer_value)
+        correlation = spearmanr(customer_value[users], weights).correlation
+    return {
+        "mode": mode,
+        "weighted": True,
+        "min": float(weights.min()),
+        "median": float(np.median(weights)),
+        "mean": float(weights.mean()),
+        "max": float(weights.max()),
+        "std": float(weights.std()),
+        "clv_weight_spearman": (
+            0.0 if np.isnan(correlation) else float(correlation)
+        ),
+    }
 
 
 def segment_thresholds(clv, edges):
@@ -1649,6 +1687,9 @@ def main():
     meta = item_meta(d["train"], d["n_items"])
     gate = build_gate(clv, vhat, cfg["GATE_MODE"]); gate_t = torch.from_numpy(gate).to(DEVICE)
     d["loss_w"] = build_loss_weights(d["train"], d["tr_u"], clv, cfg)   # M4 (없으면 None)
+    loss_diagnostics = loss_weight_diagnostics(
+        d["loss_w"], d["tr_u"], clv, cfg["LOSS_MODE"]
+    )
     # 세그먼트는 게이트와 무관하게 **항상 CLV 기준**이다 — CLV는 분석변수(어느 고객군에서
     # 이득/손실이 났는지)이고, 게이트는 개입변수라 역할이 다르다. GATE_MODE를 바꿔도
     # 세그먼트 정의가 따라 바뀌면 모드 간 세그먼트 결과를 비교할 수 없다.
@@ -1770,6 +1811,7 @@ def main():
                    "delta_table": delta_df.to_dict("records"),
                    "lambda_selection_table": sel_table.to_dict("records"),
                    "train_stats": train_stats, "score_diagnostics": diagnostics,
+                   "loss_weight_diagnostics": loss_diagnostics,
                    "segment_thresholds": {"low": seg_th[0], "high": seg_th[1],
                                           "note": "train 전체 고객 기준 고정"},
                    # MIN_ITEM_INTER를 바꿔 비교할 때 분모가 함께 변한다(희귀 아이템이
