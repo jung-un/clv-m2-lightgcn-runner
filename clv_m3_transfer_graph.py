@@ -250,16 +250,27 @@ def build_m3_transfer_graphs(
     q_n[user_ids] = _percentile(activity)
     mean_basket_value = user_stats["mean_basket_value"].to_numpy(np.float64)
     q_v[user_ids] = _percentile(mean_basket_value)
-    # Historical CLV proxy magnitude.  N and V remain separately available
-    # below, so customers with the same N*V can still receive different graph
-    # relations according to how that value was formed.
-    q_clv[user_ids] = _percentile(activity * np.maximum(mean_basket_value, 0.0))
+    # A coherent decomposition must use the same N/V quantities for both the
+    # total CLV level and the composition shares.  Ratios of independent
+    # percentiles are not a decomposition of N*V.  In log space the stabilized
+    # product is additive, so pi_N/pi_V are literal shares of that same total.
+    transaction_count = np.maximum(
+        user_stats["basket_count"].to_numpy(np.float64) - 1.0, 0.0
+    )
+    log_n = np.log1p(transaction_count)
+    log_v = np.log1p(np.maximum(mean_basket_value, 0.0))
+    log_clv = log_n + log_v
+    q_clv[user_ids] = _percentile(log_clv)
     eps = 1e-6
     pi_n = np.zeros(n_users, dtype=np.float64)
     pi_v = np.zeros(n_users, dtype=np.float64)
-    denominator = q_n[user_ids] + q_v[user_ids] + 2.0 * eps
-    pi_n[user_ids] = (q_n[user_ids] + eps) / denominator
-    pi_v[user_ids] = (q_v[user_ids] + eps) / denominator
+    positive_total = log_clv > eps
+    local_pi_n = np.full(len(user_ids), 0.5, dtype=np.float64)
+    local_pi_n[positive_total] = (
+        log_n[positive_total] / log_clv[positive_total]
+    )
+    pi_n[user_ids] = local_pi_n
+    pi_v[user_ids] = 1.0 - local_pi_n
 
     # Shared unique user-item edge order.  This must match M1 exactly.
     edge = (
@@ -361,7 +372,7 @@ def build_m3_transfer_graphs(
     )
 
     # Full-CLV compositional relation:
-    #   magnitude = percentile(N_u * V_u)
+    #   magnitude = percentile(log(1+N_u) + log(1+V_u))
     #   composition = user-specific N/V shares
     #   direction = corrected N-transfer and V-contribution edge relations.
     # Unlike an equal N+V sum, the N relation is concentrated on N-driven
@@ -369,6 +380,10 @@ def build_m3_transfer_graphs(
     clv_composition_signal = q_clv[edge_users] * (
         pi_n[edge_users] * z_n + pi_v[edge_users] * z_v
     )
+    # The following mean-one normalization preserves each user's total outgoing
+    # edge mass.  Therefore q_C changes within-neighborhood sharpness
+    # (temperature), not the user's loss weight or all of their edges at once.
+    # That is the graph-propagation intervention that distinguishes M3 from M4.
     beta_clv, clv_composition_weights, clv_strength = _match_user_normalized_beta(
         clv_composition_signal,
         target_strength,
@@ -389,6 +404,8 @@ def build_m3_transfer_graphs(
         "q_n_unique": int(np.unique(q_n[user_ids]).size),
         "q_v_unique": int(np.unique(q_v[user_ids]).size),
         "q_clv_unique": int(np.unique(q_clv[user_ids]).size),
+        "log_clv_min": float(log_clv.min()),
+        "log_clv_max": float(log_clv.max()),
         "pi_n_mean": float(pi_n[user_ids].mean()),
         "pi_n_std": float(pi_n[user_ids].std()),
         "pi_v_mean": float(pi_v[user_ids].mean()),

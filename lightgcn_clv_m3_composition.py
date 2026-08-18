@@ -87,14 +87,20 @@ def preflight_summary(cfg: dict) -> dict:
         "seed": cfg["SEED_LIST"][0],
         "split": "validation only",
         "models": ["m1_baseline", MODEL_ID],
-        "clv_definition": "historical CLV proxy magnitude = N_u * V_u",
+        "clv_definition": (
+            "L_u=log(1+N_u)+log(1+V_u); q_CLV=percentile(L_u)"
+        ),
         "composition": (
-            "pi_N=q_N/(q_N+q_V), pi_V=1-pi_N; "
+            "pi_N=log(1+N_u)/L_u, pi_V=log(1+V_u)/L_u; "
             "q_CLV*(pi_N*z_N_transfer + pi_V*z_V_contribution)"
         ),
         "edge_weight": (
             "positive exponential weight; mean one inside each user's train "
             "neighborhood; train-only effective propagation strength matched"
+        ),
+        "q_clv_role": (
+            "controls within-user edge sharpness; mean-one normalization preserves "
+            "each user's total edge mass, so this is not M4 loss weighting"
         ),
         "common_conditions": {
             "edge_set": "same unique train user-item edges as binary M1",
