@@ -65,10 +65,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.stats import spearmanr
 
+from clv_m3_axis_adaptive_graph import build_m3_axis_adaptive_graph
 from clv_m3_nv_graph import build_clv_nv_graph
 from clv_m3_transfer_graph import build_m3_transfer_graphs
 
-CODE_VERSION = "v3.15"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.16"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -208,7 +209,7 @@ CFG = {
     #   빈도가 반영돼 있다. M3-count가 새로 하는 일은 그 빈도를 **그래프 전파**에도
     #   싣는 것이다. 사전 후보는 binary/count/value였고 price·clv는 2026-08-09에 추가한
     #   사후 변형이므로, 논문에서는 탐색적(exploratory) 분석으로 표기할 것.
-    "GRAPH_MODE": "binary",           # [선택] "binary"|"count"|"value"|"price"|"clv"|"clv_nv"|"n_transfer"|"v_contribution"|"clv_composition"
+    "GRAPH_MODE": "binary",           # [선택] "binary"|"count"|"value"|"price"|"clv"|"clv_nv"|"n_transfer"|"v_contribution"|"clv_composition"|"clv_axis_adaptive"|"clv_axis_adaptive_v_only"
     "GRAPH_ALPHA": 1.0,               # [기본] 참고 구현의 VG_ALPHA와 동일
 
     # ── M4: CLV-aware 손실함수 (목적함수 개입) ──
@@ -589,7 +590,54 @@ def prepare_data(cfg, dcfg):
     w_edge = np.ones(len(eu), np.float32)
     clv_nv_graph = None
     m3_transfer_graph = None
-    if cfg["GRAPH_MODE"] in {"n_transfer", "v_contribution", "clv_composition"}:
+    m3_axis_adaptive_graph = None
+    if cfg["GRAPH_MODE"] in {
+        "clv_axis_adaptive",
+        "clv_axis_adaptive_v_only",
+    }:
+        m3_axis_adaptive_graph = build_m3_axis_adaptive_graph(
+            train, n_users, n_items
+        )
+        if not (
+            np.array_equal(m3_axis_adaptive_graph.edge_users, eu)
+            and np.array_equal(m3_axis_adaptive_graph.edge_items, ei)
+        ):
+            raise RuntimeError(
+                "M3 axis-adaptive graph edge order differs from the shared M1 edge set"
+            )
+        w_edge = (
+            m3_axis_adaptive_graph.v_only_weights
+            if cfg["GRAPH_MODE"] == "clv_axis_adaptive_v_only"
+            else m3_axis_adaptive_graph.weights
+        )
+        data_stats["m3_axis_adaptive_graph"] = m3_axis_adaptive_graph.diagnostics
+        dg = m3_axis_adaptive_graph.diagnostics
+        weight_key = (
+            "v_only_weights"
+            if cfg["GRAPH_MODE"] == "clv_axis_adaptive_v_only"
+            else "weights"
+        )
+        strength_key = (
+            "v_only_propagation_strength"
+            if cfg["GRAPH_MODE"] == "clv_axis_adaptive_v_only"
+            else "propagation_strength"
+        )
+        ws = dg[weight_key]
+        print(
+            f"  M3 CLV axis-adaptive graph: edges {len(eu):,} | "
+            f"w mean {ws['mean']:.3f} median {ws['median']:.3f} "
+            f"min {ws['min']:.3f} max {ws['max']:.3f} | "
+            f"propagation strength {dg[strength_key]:.4f}"
+        )
+        print(
+            "    train-only N audit: pair obs median "
+            f"{dg['pair_basket_observations']['median']:.1f} | "
+            f"item obs median {dg['item_basket_observations']['median']:.1f} | "
+            "N relation–popularity Spearman "
+            f"{dg['n_relation_popularity_spearman']:.4f} | "
+            f"N relation unique {dg['n_item_relation_unique']:,}"
+        )
+    elif cfg["GRAPH_MODE"] in {"n_transfer", "v_contribution", "clv_composition"}:
         m3_transfer_graph = build_m3_transfer_graphs(train, n_users, n_items)
         if not (np.array_equal(m3_transfer_graph.edge_users, eu)
                 and np.array_equal(m3_transfer_graph.edge_items, ei)):
@@ -664,7 +712,8 @@ def prepare_data(cfg, dcfg):
         else:
             raise ValueError(f"GRAPH_MODE={cfg['GRAPH_MODE']!r} — "
                              "binary|count|value|price|clv|clv_nv|"
-                             "n_transfer|v_contribution|clv_composition")
+                             "n_transfer|v_contribution|clv_composition|"
+                             "clv_axis_adaptive|clv_axis_adaptive_v_only")
         print(f"  가치그래프({cfg['GRAPH_MODE']}, α={a}): 엣지 {len(eu):,} | "
               f"w 평균 {w_edge.mean():.3f} 중앙값 {np.median(w_edge):.3f} 최대 {w_edge.max():.3f}")
 
@@ -692,6 +741,7 @@ def prepare_data(cfg, dcfg):
     return dict(train=train, splits=splits, adj=adj, w_edge=w_edge,
                 clv_nv_graph=clv_nv_graph,
                 m3_transfer_graph=m3_transfer_graph,
+                m3_axis_adaptive_graph=m3_axis_adaptive_graph,
                 pos_key=edge_key, tr_u=tu, tr_i=ti,
                 x_val_u=x_val_u, clv=clv, vhat=vhat,
                 csr_ptr=csr_ptr, csr_items=csr_items, item_cat=item_cat_arr, cat_items=cat_items,
