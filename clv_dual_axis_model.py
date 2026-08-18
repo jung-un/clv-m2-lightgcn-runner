@@ -17,7 +17,7 @@ from clv_moe_features import UserProfileArtifact
 CONTROLS = frozenset(
     {"dual_clv_fixed", "dual_shuffled_user", "dual_adapter_only"}
 )
-GATE_SHAPES = ("high", "equal", "low", "centered")
+GATE_SHAPES = ("high", "equal", "low", "centered", "axis_positive")
 EVAL_AXIS_MODES = ("n_only", "v_only", "n_plus_v")
 
 
@@ -56,7 +56,11 @@ def fixed_percentile_ranks(
     return q_n, q_v
 
 
-def apply_gate_shape(percentiles: np.ndarray, shape: str) -> np.ndarray:
+def apply_gate_shape(
+    percentiles: np.ndarray,
+    shape: str,
+    valid: np.ndarray | None = None,
+) -> np.ndarray:
     """Map percentiles to a pre-specified gate direction."""
     q = np.asarray(percentiles, dtype=np.float32)
     if shape == "high":
@@ -67,6 +71,18 @@ def apply_gate_shape(percentiles: np.ndarray, shape: str) -> np.ndarray:
         return 2.0 * (1.0 - q)
     if shape == "centered":
         return 2.0 * q - 1.0
+    if shape == "axis_positive":
+        # Preserve the mean intervention strength while assigning more of the
+        # N (V) block only to users with high N (V).  The positive floor avoids
+        # the sign cancellation and median-user shutoff of the centered gate.
+        observed = np.ones_like(q, dtype=bool) if valid is None else np.asarray(valid, dtype=bool)
+        if observed.shape != q.shape:
+            raise ValueError("gate validity mask shape과 percentile shape이 다릅니다")
+        raw = 0.5 + q
+        gate = np.ones_like(q)
+        if observed.any():
+            gate[observed] = raw[observed] / raw[observed].mean()
+        return gate
     raise ValueError(f"지원하지 않는 gate shape: {shape}")
 
 

@@ -118,8 +118,8 @@ class JointNVLightGCN(nn.Module):
             user_activity_valid = np.ones(n_users, bool)
             user_value_valid = np.ones(n_users, bool)
 
-        gate_n = apply_gate_shape(q_n, gate_shape)
-        gate_v = apply_gate_shape(q_v, gate_shape)
+        gate_n = apply_gate_shape(q_n, gate_shape, user_activity_valid)
+        gate_v = apply_gate_shape(q_v, gate_shape, user_value_valid)
         if variant == "joint_constant_user":
             gate_n = np.ones(n_users, np.float32)
             gate_v = np.ones(n_users, np.float32)

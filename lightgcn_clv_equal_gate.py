@@ -412,14 +412,20 @@ def _train_with_symmetric_selection(
     }
 
 
-def _result_rows(cfg, runs) -> list[dict]:
+def _result_rows(
+    cfg,
+    runs,
+    *,
+    model_id: str = MODEL_ID,
+    gate_label: str = "equal",
+) -> list[dict]:
     rows = []
-    for model_id, role in (("m1", "baseline"), (MODEL_ID, "model")):
-        for rule, result in runs[model_id]["evaluated"].items():
+    for current_model_id, role in (("m1", "baseline"), (model_id, "model")):
+        for rule, result in runs[current_model_id]["evaluated"].items():
             row = joint.result_row(
-                model_id,
+                current_model_id,
                 role,
-                "none" if model_id == "m1" else "equal",
+                "none" if current_model_id == "m1" else gate_label,
                 cfg.seed,
                 _public(result["metrics"]),
                 result["diagnostics"],
@@ -433,15 +439,17 @@ def _result_rows(cfg, runs) -> list[dict]:
     return rows
 
 
-def screening_decision(rows: list[dict]) -> dict:
+def screening_decision(
+    rows: list[dict], *, model_id: str = MODEL_ID
+) -> dict:
     table = pd.DataFrame(rows).set_index(["selection_rule", "model_id"])
     views = {}
     for rule in (SELECTION_PRIMARY, SELECTION_ECONOMIC):
-        if (rule, "m1") not in table.index or (rule, MODEL_ID) not in table.index:
+        if (rule, "m1") not in table.index or (rule, model_id) not in table.index:
             views[rule] = {"available": False, "success": False}
             continue
         baseline = table.loc[(rule, "m1")]
-        model = table.loc[(rule, MODEL_ID)]
+        model = table.loc[(rule, model_id)]
         ratios = {
             metric: float(model[metric] / max(float(baseline[metric]), 1e-12))
             for metric in GUARD_METRICS
@@ -472,17 +480,17 @@ def screening_decision(rows: list[dict]) -> dict:
     }
 
 
-def _paired_rows(runs) -> list[dict]:
+def _paired_rows(runs, *, model_id: str = MODEL_ID) -> list[dict]:
     rows = []
     for rule in (SELECTION_PRIMARY, SELECTION_ECONOMIC):
-        if rule not in runs["m1"]["evaluated"] or rule not in runs[MODEL_ID]["evaluated"]:
+        if rule not in runs["m1"]["evaluated"] or rule not in runs[model_id]["evaluated"]:
             continue
         baseline = runs["m1"]["evaluated"][rule]["per_user"]
-        model = runs[MODEL_ID]["evaluated"][rule]["per_user"]
+        model = runs[model_id]["evaluated"][rule]["per_user"]
         for metric in ("recall", "ndcg", "revenue", "arp"):
             rows.append(
                 {
-                    "model_id": MODEL_ID,
+                    "model_id": model_id,
                     "reference": "m1",
                     "selection_rule": rule,
                     "split": "val",
@@ -500,10 +508,22 @@ def prepared_bootstrap_count() -> int:
     return int(v3.CFG.get("N_BOOT", 1000))
 
 
-def _persist(prepared, cfg, rows, paired, runs, guard_reference, decision):
+def _persist(
+    prepared,
+    cfg,
+    rows,
+    paired,
+    runs,
+    guard_reference,
+    decision,
+    *,
+    stem_prefix: str = "m2_equal_gate_dunnhumby",
+    code_version: str = CODE_VERSION,
+    preflight: dict | None = None,
+):
     out = Path(cfg.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    stem = f"m2_equal_gate_dunnhumby_{prepared['config_hash']}"
+    stem = f"{stem_prefix}_{prepared['config_hash']}"
     csv_path = out / f"{stem}.csv"
     paired_path = out / f"{stem}_paired.csv"
     history_path = out / f"{stem}_epoch_history.csv"
@@ -518,11 +538,11 @@ def _persist(prepared, cfg, rows, paired, runs, guard_reference, decision):
         )
     pd.DataFrame(history_rows).to_csv(history_path, index=False)
     payload = {
-        "code_version": CODE_VERSION,
+        "code_version": code_version,
         "source_revision": prepared["revision"],
         "input_manifest": prepared["manifest"],
         "config": asdict(cfg),
-        "preflight": preflight_summary(cfg),
+        "preflight": preflight if preflight is not None else preflight_summary(cfg),
         "guard_reference": guard_reference,
         "decision": decision,
         "absolute_rows": frame.to_dict("records"),

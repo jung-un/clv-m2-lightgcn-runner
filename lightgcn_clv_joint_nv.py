@@ -118,7 +118,13 @@ def validate_joint_nv_config(cfg: JointNVConfig) -> JointNVConfig:
         raise ValueError("1차 screening은 seed 42만 허용합니다")
     if cfg.dataset not in v3.SCHEMA:
         raise ValueError(f"알 수 없는 dataset: {cfg.dataset}")
-    if cfg.gate_shape not in {"high", "equal", "low", "centered"}:
+    if cfg.gate_shape not in {
+        "high",
+        "equal",
+        "low",
+        "centered",
+        "axis_positive",
+    }:
         raise ValueError(f"알 수 없는 gate_shape: {cfg.gate_shape}")
     if min(
         cfg.input_days,
