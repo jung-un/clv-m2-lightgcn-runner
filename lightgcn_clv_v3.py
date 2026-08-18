@@ -68,11 +68,12 @@ from scipy.stats import spearmanr
 from clv_m4_interaction_weights import build_m4_interaction_weights
 
 from clv_m3_axis_adaptive_graph import build_m3_axis_adaptive_graph
+from clv_m3_clv_relation_graph import build_clv_relation_graph
 from clv_m3_direct_value_graph import build_direct_clv_value_graph
 from clv_m3_nv_graph import build_clv_nv_graph
 from clv_m3_transfer_graph import build_m3_transfer_graphs
 
-CODE_VERSION = "v3.16"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
+CODE_VERSION = "v3.17"          # 결과 파일에 기록 — 코드가 바뀌면 올릴 것
 IN_COLAB = os.path.exists("/content")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -212,7 +213,7 @@ CFG = {
     #   빈도가 반영돼 있다. M3-count가 새로 하는 일은 그 빈도를 **그래프 전파**에도
     #   싣는 것이다. 사전 후보는 binary/count/value였고 price·clv는 2026-08-09에 추가한
     #   사후 변형이므로, 논문에서는 탐색적(exploratory) 분석으로 표기할 것.
-    "GRAPH_MODE": "binary",           # [선택] "binary"|"count"|"value"|"price"|"clv"|"clv_nv"|"n_transfer"|"v_contribution"|"clv_composition"|"clv_axis_adaptive"|"clv_axis_adaptive_v_only"|"clv_direct_user"|"clv_direct_spend_control"|"clv_direct_user_spend"
+    "GRAPH_MODE": "binary",           # [선택] binary 또는 아래 M3 구현 모드
     "GRAPH_ALPHA": 1.0,               # [기본] 참고 구현의 VG_ALPHA와 동일
 
     # ── M4: CLV-aware 손실함수 (목적함수 개입) ──
@@ -595,7 +596,45 @@ def prepare_data(cfg, dcfg):
     m3_transfer_graph = None
     m3_axis_adaptive_graph = None
     m3_direct_value_graph = None
+    m3_clv_relation_graph = None
     if cfg["GRAPH_MODE"] in {
+        "relation_only",
+        "clv_relation_gate",
+        "allocated_relation_only",
+        "clv_allocated_relation_gate",
+    }:
+        m3_clv_relation_graph = build_clv_relation_graph(
+            train,
+            n_users,
+            n_items,
+            clv,
+            target_strength=cfg["GRAPH_ALPHA"],
+        )
+        if not (
+            np.array_equal(m3_clv_relation_graph.edge_users, eu)
+            and np.array_equal(m3_clv_relation_graph.edge_items, ei)
+        ):
+            raise RuntimeError(
+                "M3 CLV relation graph edge order differs from the shared M1 edge set"
+            )
+        weight_key = {
+            "relation_only": "relation_only_weights",
+            "clv_relation_gate": "clv_gate_weights",
+            "allocated_relation_only": "allocated_relation_only_weights",
+            "clv_allocated_relation_gate": "clv_allocated_gate_weights",
+        }[cfg["GRAPH_MODE"]]
+        w_edge = getattr(m3_clv_relation_graph, weight_key)
+        data_stats["m3_clv_relation_graph"] = m3_clv_relation_graph.diagnostics
+        dg = m3_clv_relation_graph.diagnostics
+        ws = dg[weight_key]
+        print(
+            f"  M3 CLV relation graph ({cfg['GRAPH_MODE']}): edges {len(eu):,} | "
+            f"w mean {ws['mean']:.3f} median {ws['median']:.3f} "
+            f"min {ws['min']:.3f} max {ws['max']:.3f} | "
+            f"price rho {dg[f'{weight_key}_item_price_spearman']:.4f} | "
+            f"propagation strength {dg[f'{weight_key}_propagation_strength']:.4f}"
+        )
+    elif cfg["GRAPH_MODE"] in {
         "clv_direct_user",
         "clv_direct_spend_control",
         "clv_direct_user_spend",
@@ -752,7 +791,9 @@ def prepare_data(cfg, dcfg):
                              "n_transfer|v_contribution|clv_composition|"
                              "clv_axis_adaptive|clv_axis_adaptive_v_only|"
                              "clv_direct_user|clv_direct_spend_control|"
-                             "clv_direct_user_spend")
+                             "clv_direct_user_spend|relation_only|"
+                             "clv_relation_gate|allocated_relation_only|"
+                             "clv_allocated_relation_gate")
         print(f"  가치그래프({cfg['GRAPH_MODE']}, α={a}): 엣지 {len(eu):,} | "
               f"w 평균 {w_edge.mean():.3f} 중앙값 {np.median(w_edge):.3f} 최대 {w_edge.max():.3f}")
 
@@ -781,6 +822,7 @@ def prepare_data(cfg, dcfg):
                 clv_nv_graph=clv_nv_graph,
                 m3_transfer_graph=m3_transfer_graph,
                 m3_axis_adaptive_graph=m3_axis_adaptive_graph,
+                m3_clv_relation_graph=m3_clv_relation_graph,
                 pos_key=edge_key, tr_u=tu, tr_i=ti,
                 x_val_u=x_val_u, clv=clv, vhat=vhat,
                 csr_ptr=csr_ptr, csr_items=csr_items, item_cat=item_cat_arr, cat_items=cat_items,
