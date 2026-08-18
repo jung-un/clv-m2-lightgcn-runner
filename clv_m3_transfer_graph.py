@@ -25,6 +25,7 @@ from scipy.stats import rankdata
 
 
 DEFAULT_BETA_CAP = 0.25
+DEFAULT_COMPOSITION_BETA_CAP = 2.0
 DEFAULT_CATEGORY_PRIOR_STRENGTH = 20.0
 
 
@@ -34,10 +35,15 @@ class M3TransferGraphWeights:
     edge_items: np.ndarray
     n_weights: np.ndarray
     v_weights: np.ndarray
+    clv_composition_weights: np.ndarray
     n_signal: np.ndarray
     v_signal: np.ndarray
+    clv_composition_signal: np.ndarray
     q_n: np.ndarray
     q_v: np.ndarray
+    q_clv: np.ndarray
+    pi_n: np.ndarray
+    pi_v: np.ndarray
     diagnostics: dict
 
 
@@ -67,6 +73,19 @@ def _rank_signal(signal: np.ndarray) -> np.ndarray:
 def _mean_one_exponential(z: np.ndarray, beta: float) -> np.ndarray:
     raw = np.exp(float(beta) * np.asarray(z, dtype=np.float64))
     return raw / raw.mean()
+
+
+def _user_mean_one_exponential(
+    z: np.ndarray, beta: float, edge_users: np.ndarray, n_users: int
+) -> np.ndarray:
+    """Positive weights whose mean is one inside every user's neighborhood."""
+    raw = np.exp(float(beta) * np.asarray(z, dtype=np.float64))
+    total = np.bincount(edge_users, weights=raw, minlength=n_users)
+    count = np.bincount(edge_users, minlength=n_users)
+    user_mean = np.ones(n_users, dtype=np.float64)
+    valid = count > 0
+    user_mean[valid] = total[valid] / count[valid]
+    return raw / user_mean[edge_users]
 
 
 def normalized_propagation_strength(
@@ -126,6 +145,44 @@ def _match_beta(
     return beta, weights, strength
 
 
+def _match_user_normalized_beta(
+    z: np.ndarray,
+    target_strength: float,
+    edge_users: np.ndarray,
+    edge_items: np.ndarray,
+    n_users: int,
+    n_items: int,
+    beta_cap: float,
+) -> tuple[float, np.ndarray, float]:
+    """Match train-only propagation strength with per-user mean-one weights."""
+    if target_strength <= 1e-12:
+        weights = np.ones(len(z), dtype=np.float64)
+        return 0.0, weights, 0.0
+    cap_weights = _user_mean_one_exponential(z, beta_cap, edge_users, n_users)
+    cap_strength = normalized_propagation_strength(
+        edge_users, edge_items, cap_weights, n_users, n_items
+    )
+    if cap_strength <= target_strength:
+        return float(beta_cap), cap_weights, cap_strength
+    lo, hi = 0.0, float(beta_cap)
+    for _ in range(48):
+        mid = (lo + hi) / 2.0
+        weights = _user_mean_one_exponential(z, mid, edge_users, n_users)
+        strength = normalized_propagation_strength(
+            edge_users, edge_items, weights, n_users, n_items
+        )
+        if strength < target_strength:
+            lo = mid
+        else:
+            hi = mid
+    beta = (lo + hi) / 2.0
+    weights = _user_mean_one_exponential(z, beta, edge_users, n_users)
+    strength = normalized_propagation_strength(
+        edge_users, edge_items, weights, n_users, n_items
+    )
+    return beta, weights, strength
+
+
 def _weight_summary(weights: np.ndarray) -> dict:
     return {
         "mean": float(weights.mean()),
@@ -144,6 +201,7 @@ def build_m3_transfer_graphs(
     n_items: int,
     *,
     beta_cap: float = DEFAULT_BETA_CAP,
+    composition_beta_cap: float = DEFAULT_COMPOSITION_BETA_CAP,
     category_prior_strength: float = DEFAULT_CATEGORY_PRIOR_STRENGTH,
 ) -> M3TransferGraphWeights:
     """Build matched N-transfer and V-contribution weights from train only."""
@@ -155,8 +213,10 @@ def build_m3_transfer_graphs(
         raise ValueError("M3 transfer graph에 사용할 train 행이 없습니다")
     if n_users <= 0 or n_items <= 0:
         raise ValueError("n_users와 n_items는 양수여야 합니다")
-    if beta_cap <= 0 or category_prior_strength < 0:
-        raise ValueError("beta_cap은 양수, category_prior_strength는 0 이상이어야 합니다")
+    if beta_cap <= 0 or composition_beta_cap <= 0 or category_prior_strength < 0:
+        raise ValueError(
+            "beta_cap들은 양수, category_prior_strength는 0 이상이어야 합니다"
+        )
     if not np.isfinite(train["v"].to_numpy(np.float64)).all():
         raise ValueError("train 거래가치에 비유한 값이 있습니다")
 
@@ -185,11 +245,21 @@ def build_m3_transfer_graphs(
     ) / age
     q_n = np.zeros(n_users, dtype=np.float64)
     q_v = np.zeros(n_users, dtype=np.float64)
+    q_clv = np.zeros(n_users, dtype=np.float64)
     user_ids = user_stats.index.to_numpy(np.int64)
     q_n[user_ids] = _percentile(activity)
-    q_v[user_ids] = _percentile(
-        user_stats["mean_basket_value"].to_numpy(np.float64)
-    )
+    mean_basket_value = user_stats["mean_basket_value"].to_numpy(np.float64)
+    q_v[user_ids] = _percentile(mean_basket_value)
+    # Historical CLV proxy magnitude.  N and V remain separately available
+    # below, so customers with the same N*V can still receive different graph
+    # relations according to how that value was formed.
+    q_clv[user_ids] = _percentile(activity * np.maximum(mean_basket_value, 0.0))
+    eps = 1e-6
+    pi_n = np.zeros(n_users, dtype=np.float64)
+    pi_v = np.zeros(n_users, dtype=np.float64)
+    denominator = q_n[user_ids] + q_v[user_ids] + 2.0 * eps
+    pi_n[user_ids] = (q_n[user_ids] + eps) / denominator
+    pi_v[user_ids] = (q_v[user_ids] + eps) / denominator
 
     # Shared unique user-item edge order.  This must match M1 exactly.
     edge = (
@@ -290,6 +360,25 @@ def build_m3_transfer_graphs(
         z_v, target_strength, edge_users, edge_items, n_users, n_items, beta_cap
     )
 
+    # Full-CLV compositional relation:
+    #   magnitude = percentile(N_u * V_u)
+    #   composition = user-specific N/V shares
+    #   direction = corrected N-transfer and V-contribution edge relations.
+    # Unlike an equal N+V sum, the N relation is concentrated on N-driven
+    # customers instead of diluting the successful V relation for everyone.
+    clv_composition_signal = q_clv[edge_users] * (
+        pi_n[edge_users] * z_n + pi_v[edge_users] * z_v
+    )
+    beta_clv, clv_composition_weights, clv_strength = _match_user_normalized_beta(
+        clv_composition_signal,
+        target_strength,
+        edge_users,
+        edge_items,
+        n_users,
+        n_items,
+        composition_beta_cap,
+    )
+
     diagnostics = {
         "n_edges": int(len(edge)),
         "category_prior_strength": float(category_prior_strength),
@@ -299,25 +388,39 @@ def build_m3_transfer_graphs(
         "nonpositive_basket_line_share": float((~valid_basket).mean()),
         "q_n_unique": int(np.unique(q_n[user_ids]).size),
         "q_v_unique": int(np.unique(q_v[user_ids]).size),
+        "q_clv_unique": int(np.unique(q_clv[user_ids]).size),
+        "pi_n_mean": float(pi_n[user_ids].mean()),
+        "pi_n_std": float(pi_n[user_ids].std()),
+        "pi_v_mean": float(pi_v[user_ids].mean()),
+        "pi_v_std": float(pi_v[user_ids].std()),
         "n_signal_zero_share": float((n_signal == 0).mean()),
         "v_signal_zero_share": float((v_signal == 0).mean()),
         "beta_cap": float(beta_cap),
+        "composition_beta_cap": float(composition_beta_cap),
         "beta_n": float(beta_n),
         "beta_v": float(beta_v),
+        "beta_clv_composition": float(beta_clv),
         "target_propagation_strength": float(target_strength),
         "n_propagation_strength": float(n_strength),
         "v_propagation_strength": float(v_strength),
+        "clv_composition_propagation_strength": float(clv_strength),
         "n_weights": _weight_summary(n_weights),
         "v_weights": _weight_summary(v_weights),
+        "clv_composition_weights": _weight_summary(clv_composition_weights),
     }
     return M3TransferGraphWeights(
         edge_users=edge_users,
         edge_items=edge_items,
         n_weights=n_weights.astype(np.float32),
         v_weights=v_weights.astype(np.float32),
+        clv_composition_weights=clv_composition_weights.astype(np.float32),
         n_signal=n_signal.astype(np.float32),
         v_signal=v_signal.astype(np.float32),
+        clv_composition_signal=clv_composition_signal.astype(np.float32),
         q_n=q_n.astype(np.float32),
         q_v=q_v.astype(np.float32),
+        q_clv=q_clv.astype(np.float32),
+        pi_n=pi_n.astype(np.float32),
+        pi_v=pi_v.astype(np.float32),
         diagnostics=diagnostics,
     )

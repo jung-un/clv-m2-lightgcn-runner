@@ -25,13 +25,30 @@ def test_transfer_graph_preserves_edges_and_matches_effective_strength():
     np.testing.assert_array_equal(keys, np.array([0, 1, 2, 4, 5]))
     assert graph.n_weights.mean() == pytest.approx(1.0, abs=1e-6)
     assert graph.v_weights.mean() == pytest.approx(1.0, abs=1e-6)
+    assert graph.clv_composition_weights.mean() == pytest.approx(1.0, abs=1e-6)
     assert np.all(graph.n_weights > 0)
     assert np.all(graph.v_weights > 0)
+    assert np.all(graph.clv_composition_weights > 0)
     assert graph.n_weights.max() / graph.n_weights.min() < 1.7
     assert graph.v_weights.max() / graph.v_weights.min() < 1.7
     assert graph.diagnostics["n_propagation_strength"] == pytest.approx(
         graph.diagnostics["v_propagation_strength"], abs=1e-8
     )
+    assert graph.diagnostics[
+        "clv_composition_propagation_strength"
+    ] == pytest.approx(graph.diagnostics["target_propagation_strength"], abs=1e-8)
+
+
+def test_clv_composition_uses_full_magnitude_and_user_specific_axis_mix():
+    graph = build_m3_transfer_graphs(_train_rows(), n_users=2, n_items=3)
+
+    assert np.allclose(graph.pi_n + graph.pi_v, 1.0, atol=1e-6)
+    assert np.unique(graph.q_clv).size > 1
+    assert not np.array_equal(graph.clv_composition_signal, graph.n_signal)
+    assert not np.array_equal(graph.clv_composition_signal, graph.v_signal)
+    for user in np.unique(graph.edge_users):
+        current = graph.clv_composition_weights[graph.edge_users == user]
+        assert current.mean() == pytest.approx(1.0, abs=1e-6)
 
 
 def test_n_transfer_uses_category_repeatability_not_exact_edge_repeat():
