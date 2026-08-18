@@ -500,6 +500,35 @@ def read_progress(out_dir: str | Path) -> dict:
     return payload
 
 
+def load_completed_result(out_dir: str | Path) -> pd.DataFrame:
+    """Reload final artifacts after a Colab runtime reconnect."""
+    root = Path(out_dir)
+    candidates = sorted(
+        root.glob("m2_axis_specific_gate_hm2y_*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise FileNotFoundError(f"완료 결과 JSON을 찾을 수 없습니다: {root}")
+    json_path = candidates[0]
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    csv_path = json_path.with_suffix(".csv")
+    if not csv_path.exists():
+        raise FileNotFoundError(f"완료 결과 CSV를 찾을 수 없습니다: {csv_path}")
+    frame = pd.read_csv(csv_path)
+    frame.attrs["decision"] = payload["decision"]
+    frame.attrs["result_paths"] = {
+        "csv": str(csv_path),
+        "paired_csv": str(csv_path.with_name(f"{csv_path.stem}_paired.csv")),
+        "epoch_history_csv": str(
+            csv_path.with_name(f"{csv_path.stem}_epoch_history.csv")
+        ),
+        "json": str(json_path),
+        "progress": read_progress(root).get("progress_path"),
+    }
+    return frame
+
+
 def run_experiment(cfg: joint.JointNVConfig | None = None) -> pd.DataFrame:
     cfg = validate_hm2y_config(cfg or configure_axis_specific_gate_hm2y_run())
     preflight = preflight_summary(cfg)
