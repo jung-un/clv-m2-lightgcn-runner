@@ -57,5 +57,6 @@ def test_hm2y_colab_runs_once_without_approval_gate():
         for source in sources
     ) == 1
     assert "ACKNOWLEDGE_HIGH_COST" not in joined
-    assert "TO_BE_PINNED_AFTER_REVIEW" in joined
+    assert "77b47e48cd07fd71cc8170b9cb7e37c057508acc" in joined
+    assert "TO_BE_PINNED_AFTER_REVIEW" not in joined
     assert "read_progress(cfg.out_dir)" in joined
