@@ -36,9 +36,10 @@ class _AxisEncoder(nn.Module):
 class JointNVLightGCN(nn.Module):
     """ID/N/V layer-0 blocks propagated together by one LightGCN.
 
-    ``sqrt_gamma_n`` and ``sqrt_gamma_v`` are learned directly.  The same
-    parameter scales the user and item side of each axis, so the reported
-    non-negative score-level strength is ``gamma = sqrt_gamma ** 2``.
+    ``sqrt_gamma_n`` and ``sqrt_gamma_v`` are checkpoint-compatible internal
+    parameter names.  In reports they are called the activity-axis weight and
+    transaction-value-axis weight.  The same parameter scales the user and
+    item side of each axis, so the reported non-negative weight is its square.
     """
 
     def __init__(
@@ -175,6 +176,16 @@ class JointNVLightGCN(nn.Module):
     @property
     def gamma_v(self) -> torch.Tensor:
         return self.sqrt_gamma_v.square()
+
+    @property
+    def activity_axis_weight(self) -> torch.Tensor:
+        """Public/reporting name for the learned N-axis weight."""
+        return self.gamma_n
+
+    @property
+    def transaction_value_axis_weight(self) -> torch.Tensor:
+        """Public/reporting name for the learned V-axis weight."""
+        return self.gamma_v
 
     def layer0_embeddings(self) -> tuple[torch.Tensor, torch.Tensor]:
         user_n = (

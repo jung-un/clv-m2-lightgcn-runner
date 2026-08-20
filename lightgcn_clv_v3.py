@@ -123,6 +123,9 @@ CFG = {
     # 반복 노출된 셈이 되어 confirmatory 지위를 잃는다. 개발 단계는 validation만 본다.
     "EVAL_TEST": False,               # ⚠ 모형을 확정한 뒤에만 True
     "EVAL_HOLDOUT": False,            # ⚠ 논문 최종 확증 때 딱 한 번만 True
+    # 최종 test-only 실행에서만 True. 기존 train과 validation 기간을 하나의 학습
+    # 구간으로 합치고, 합쳐진 구간의 모든 (user,item) 쌍을 test 정답에서 제외한다.
+    "TRAIN_ON_VAL": False,
     # [2026-08-07] MIN_ITEM_INTER=1은 Dunnhumby(유저 2,500 vs 아이템 90,785, 아이템당
     # 상호작용 중앙값 3)에서 학습 불가능한 아이템 임베딩을 6만 개 넘게 만들어 baseline이
     # 인기도로 붕괴하는 원인으로 의심된다. 10-core는 LightGCN 원논문 등 표준 관행이고
@@ -265,6 +268,7 @@ def cfg_hash(cfg, dcfg, arch, seed):
             "BATCH_SIZE", "LR", "REG_MODE", "PREF_REG", "VALUE_REG", "WD", "NEG_MODE",
             "EPOCHS", "EARLY_STOP", "SELECT_METRIC", "SELECT_K",
             "WINDOW_DAYS", "VAL_DAYS", "TEST_DAYS", "HOLDOUT_DAYS",
+            "TRAIN_ON_VAL",
             "MIN_USER_INTER", "MIN_ITEM_INTER", "PREMIUM_THR", "LAMBDA_TRAIN",
             # GATE_MODE는 bpr_loss의 gate를 통해 가중치를 직접 바꾸므로 학습 설정이다.
             # 빠뜨리면 모드가 다른 실행이 같은 체크포인트를 재사용해 결과가 오염된다.
@@ -272,7 +276,17 @@ def cfg_hash(cfg, dcfg, arch, seed):
             # M3(그래프)·M4(손실)는 가중치를 직접 바꾸므로 **모든 아키텍처**에서 학습
             # 설정이다. GATE_MODE와 달리 pref_only도 영향을 받으므로 예외를 두지 않는다.
             "GRAPH_MODE", "GRAPH_ALPHA", "LOSS_MODE", "LOSS_LAMBDA"]
-    payload = {k: cfg[k] for k in keys}
+    # TRAIN_ON_VAL was added after several focused tests and helper configs had
+    # already started constructing minimal dictionaries.  Treat its absence as
+    # the historical default(False), while all older keys remain required.
+    payload = {
+        k: (cfg.get(k, False) if k == "TRAIN_ON_VAL" else cfg[k])
+        for k in keys
+    }
+    # 기존 체크포인트 해시는 그대로 유지하고, validation을 학습에 합치는 최종
+    # 실행만 별도 해시를 갖게 한다.
+    if not payload["TRAIN_ON_VAL"]:
+        payload.pop("TRAIN_ON_VAL")
     # 단, pref_only는 λ_train=0이라 가치항이 손실에 전혀 들어가지 않는다 → 게이트가
     # 가중치에 영향을 못 준다. 그런데도 해시에 넣으면 GATE_MODE만 바꿔도 pref_only를
     # 세 시드 다시 학습하게 되어 v3.4의 낭비가 그대로 재현된다. two_stage/joint_warm이
@@ -304,7 +318,9 @@ def result_hash(cfg, dcfg, arch):
                "delta": cfg["NONINFERIORITY_DELTA"], "k_list": cfg["K_LIST"],
                "n_boot": cfg["N_BOOT"], "seg_edges": list(cfg["SEG_EDGES"]),
                "eval_test": cfg["EVAL_TEST"],
-               "eval_holdout": cfg["EVAL_HOLDOUT"], "code": CODE_VERSION}
+               "eval_holdout": cfg["EVAL_HOLDOUT"],
+               "train_on_val": cfg.get("TRAIN_ON_VAL", False),
+               "code": CODE_VERSION}
     return hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:10]
 
 
@@ -463,9 +479,17 @@ def prepare_data(cfg, dcfg):
     hold_start = t_max - day(cfg["HOLDOUT_DAYS"])
     test_start = hold_start - day(cfg["TEST_DAYS"])
     val_start = test_start - day(cfg["VAL_DAYS"])
-    print(f"분할 경계: train ≤ {val_start} < val ≤ {test_start} < test ≤ {hold_start} < holdout")
+    train_on_val = bool(cfg.get("TRAIN_ON_VAL", False))
+    train_end = test_start if train_on_val else val_start
+    if train_on_val:
+        print(
+            f"분할 경계(최종평가): train+validation ≤ {test_start} "
+            f"< test ≤ {hold_start} < holdout"
+        )
+    else:
+        print(f"분할 경계: train ≤ {val_start} < val ≤ {test_start} < test ≤ {hold_start} < holdout")
 
-    tp = tx[tx["t"] <= val_start]
+    tp = tx[tx["t"] <= train_end]
     n_row0, n_u0, n_i0 = len(tp), tp["u_raw"].nunique(), tp["i_raw"].nunique()
     n_edge0 = len(tp[["u_raw", "i_raw"]].drop_duplicates())
     keep_u, keep_i, n_edge1, n_iter = kcore_filter(
@@ -480,11 +504,12 @@ def prepare_data(cfg, dcfg):
         "split_boundaries": {
             "train": {
                 "start_inclusive": analysis_window["time_min"],
-                "end_inclusive": _json_safe_time(val_start),
+                "end_inclusive": _json_safe_time(train_end),
             },
             "val": {
                 "start_exclusive": _json_safe_time(val_start),
                 "end_inclusive": _json_safe_time(test_start),
+                **({"merged_into_train": True} if train_on_val else {}),
             },
             "test": {
                 "start_exclusive": _json_safe_time(test_start),
@@ -514,8 +539,12 @@ def prepare_data(cfg, dcfg):
     n_users, n_items, n_cat = len(uids), len(iids), len(cats)
     print(f"유저 {n_users:,} | 아이템 {n_items:,} | 카테고리({dcfg['category_col']}) {n_cat:,}")
 
-    train = tx[tx["t"] <= val_start].copy()
-    val_rows = tx[(tx.t > val_start) & (tx.t <= test_start)]
+    train = tx[tx["t"] <= train_end].copy()
+    val_rows = (
+        tx.iloc[0:0].copy()
+        if train_on_val
+        else tx[(tx.t > val_start) & (tx.t <= test_start)]
+    )
     test_rows = tx[(tx.t > test_start) & (tx.t <= hold_start)]
     holdout_rows = tx[tx.t > hold_start]
     data_stats["analysis_window"]["rows_after_kcore"] = int(len(tx))
@@ -526,7 +555,7 @@ def prepare_data(cfg, dcfg):
         "holdout": int(len(holdout_rows)),
     }
     data_stats["split_evaluation_status"] = {
-        "val": "constructed",
+        "val": "merged_into_train" if train_on_val else "constructed",
         "test": "constructed" if cfg["EVAL_TEST"] else "not_constructed",
         "holdout": (
             "constructed" if cfg["EVAL_HOLDOUT"] else "not_constructed"
@@ -562,7 +591,11 @@ def prepare_data(cfg, dcfg):
         return gt, rev
 
     split_stats = {}
-    splits = {"val": build_eval(val_rows, "val", "Val    ")}
+    splits = {}
+    if train_on_val:
+        print("  Val: train에 병합됨 (별도 평가·선택 없음)")
+    else:
+        splits["val"] = build_eval(val_rows, "val", "Val    ")
     if cfg["EVAL_TEST"]:
         splits["test"] = build_eval(test_rows, "test", "Test   ")
     else:

@@ -356,6 +356,41 @@ def test_prepare_data_persists_reserved_boundaries_without_protected_truth(tmp_p
     json.dumps(stats)
 
 
+def test_prepare_data_can_merge_validation_for_final_test_without_pair_leakage(
+    tmp_path,
+):
+    """Final test training merges val, but its seen pairs remain excluded.
+
+    This is the professor-approved new-item task: a user-item pair observed at
+    any point in the merged train+validation interval cannot become test truth.
+    """
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    cfg.update(TRAIN_ON_VAL=True, EVAL_TEST=True, EVAL_HOLDOUT=False)
+
+    data = V3.prepare_data(cfg, dcfg)
+    stats = data["data_stats"]
+
+    assert set(data["splits"]) == {"test"}
+    assert stats["split_evaluation_status"] == {
+        "val": "merged_into_train",
+        "test": "constructed",
+        "holdout": "not_constructed",
+    }
+    assert stats["split_boundaries"]["train"]["end_inclusive"] == 45
+    assert stats["split_boundaries"]["val"]["merged_into_train"] is True
+
+    train_pairs = set(
+        zip(data["train"].u_idx.astype(int), data["train"].i_idx.astype(int))
+    )
+    test_truth, _ = data["splits"]["test"]
+    test_pairs = {
+        (int(user), int(item))
+        for user, items in test_truth.items()
+        for item in items
+    }
+    assert train_pairs.isdisjoint(test_pairs)
+
+
 def test_prepare_data_date_boundaries_are_json_safe(tmp_path):
     cfg, dcfg = _tiny_dataset(tmp_path)
     tx_path = Path(dcfg["tx_path"])

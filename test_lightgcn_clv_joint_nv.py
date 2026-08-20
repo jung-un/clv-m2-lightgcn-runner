@@ -7,6 +7,7 @@ import pytest
 
 import lightgcn_clv_residual as residual
 import lightgcn_clv_joint_nv as joint
+from clv_joint_nv_model import JointNVLightGCN
 
 
 def test_colab_drops_stale_repo_modules_before_importing_runner():
@@ -166,6 +167,11 @@ def test_dunnhumby_variable_validity_uses_only_internal_training_windows():
         "target_days": 90,
         "anchor_offsets": (270, 180, 90),
     }
+
+
+def test_axis_weight_public_names_preserve_checkpoint_compatible_parameters():
+    assert JointNVLightGCN.activity_axis_weight.fget is not None
+    assert JointNVLightGCN.transaction_value_axis_weight.fget is not None
 
 
 def test_fast_anchored_dunnhumby_preset_runs_only_m1_and_m2_on_validation():
