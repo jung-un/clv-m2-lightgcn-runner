@@ -460,7 +460,11 @@ def _fixed_epoch_train(
             "p_correct": correct_sum / n_batches,
             "epoch_sec": time.time() - epoch_started,
         }
-        if isinstance(model, JointNVLightGCN):
+        if (
+            isinstance(model, JointNVLightGCN)
+            and model.activity_axis_weight is not None
+            and model.transaction_value_axis_weight is not None
+        ):
             record.update(
                 activity_axis_weight=float(
                     model.activity_axis_weight.detach().cpu()
