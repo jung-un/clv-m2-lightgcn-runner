@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 
 import lightgcn_clv_postprop_gate_test1 as runner
@@ -42,3 +45,18 @@ def test_preflight_declares_actual_current_feature_schema(tmp_path):
         "mean_transaction_value_share"
     )
     assert summary["evidence_status"].startswith("exploratory")
+
+
+def test_colab_is_pinned_and_has_one_unguarded_run_cell():
+    notebook_path = Path(__file__).with_name(
+        "clv_m2_postprop_gate_dunnhumby_test1_colab.ipynb"
+    )
+    notebook = json.loads(notebook_path.read_text())
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "d1f913bb806c657ea4995a2355d64ae2662f3cf7" in source
+    assert source.count("result_df = run_test1(cfg)") == 1
+    assert "ACKNOWLEDGE_HIGH_COST" not in source
+    assert "holdout은 생성·평가하지 않음" in source
