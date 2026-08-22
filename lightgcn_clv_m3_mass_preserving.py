@@ -1,371 +1,617 @@
-"""Dunnhumby seed-42 validation screen for direct CLV message redistribution."""
+"""Test-only runner for direct CLV influence in LightGCN propagation.
+
+Former train and validation intervals are merged. Every arm trains for a fixed
+100 epochs without validation or early stopping, then evaluates the fixed
+DAY 698--704 test interval exactly once. Later rows are ignored and never
+evaluated. The default is the requested seed-42 pilot; ``FULL_SEEDS`` can be
+supplied later unchanged.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.stats import t as student_t
+import torch
 
-import lightgcn_clv_v3 as v3
 from clv_m3_mass_preserving_graph import (
     DEFAULT_SHUFFLE_SEED,
-    MODES,
     build_directional_torch_adj,
     build_mass_preserving_clv_graph,
 )
+from clv_run_state import ProgressStore, RunIdentity, clone_state, file_sha256
+import lightgcn_clv_axis_specific_test10 as fixed_train
+import lightgcn_clv_moe as moe
+import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m3-direct-clv-item-message-redistribution-v1"
+CODE_VERSION = "m3-direct-clv-item-message-test-only-v2"
+PILOT_SEEDS = (42,)
+FULL_SEEDS = tuple(range(42, 52))
 MODEL_IDS = {
+    "m1": "m1_baseline",
     "n_only": "m3_n_only_influence",
     "v_only": "m3_v_only_influence",
     "clv": "m3_clv_influence",
     "clv_shuffle": "m3_clv_influence_shuffle",
 }
-ACCURACY_METRICS = (
-    "recall@10",
-    "ndcg@10",
-    "recall@20",
-    "ndcg@20",
-    "recall@50",
-    "ndcg@50",
-)
+MODEL_ORDER = tuple(MODEL_IDS.values())
+
+
+@dataclass(frozen=True)
+class M3TestConfig:
+    dataset: str = "dunnhumby"
+    seeds: tuple[int, ...] = PILOT_SEEDS
+    epochs: int = 100
+    dim: int = 64
+    n_layers: int = 2
+    batch_size: int = 8192
+    lr: float = 5e-4
+    pref_reg: float = 1e-3
+    test_days: int = 7
+    out_dir: str = ""
 
 
 def _default_out_dir() -> str:
     if v3.IN_COLAB:
-        return "/content/drive/MyDrive/논문/data/results_m3_clv_influence_dunnhumby"
+        return "/content/drive/MyDrive/논문/data/results_m3_clv_influence_test_dunnhumby"
     return str(
         Path(v3.default_out_dir("dunnhumby")).with_name(
-            "results_m3_clv_influence_dunnhumby"
+            "results_m3_clv_influence_test_dunnhumby"
         )
     )
 
 
-def validate_screening_config(cfg: dict) -> None:
-    expected = {
-        "DATASET": "dunnhumby",
-        "SEED_LIST": [42],
-        "ARCH": "pref_only",
-        "GRAPH_MODE": "clv",
-        "LOSS_MODE": "plain",
-        "NEG_MODE": "uniform",
-        "WINDOW_DAYS": None,
-        "MIN_USER_INTER": 1,
-        "MIN_ITEM_INTER": 1,
-        "GATE_MODE": "none",
-        "EVAL_TEST": False,
-        "EVAL_HOLDOUT": False,
-    }
-    for key, wanted in expected.items():
-        if cfg.get(key) != wanted:
-            raise ValueError(f"screening config requires {key}={wanted!r}")
-    if not cfg.get("OUT_DIR") or "dunnhumby" not in str(cfg["OUT_DIR"]):
-        raise ValueError("OUT_DIR must identify the Dunnhumby M3 run")
+def configure_m3_clv_influence_test_run(**overrides) -> M3TestConfig:
+    return validate_test_config(
+        M3TestConfig(**({"out_dir": _default_out_dir()} | overrides))
+    )
 
 
-def configure_m3_clv_influence_dunnhumby_run(
-    *, out_dir: str | None = None, **overrides
-) -> dict:
-    settings = {
-        "ARCH": "pref_only",
-        "SEED_LIST": [42],
-        "WINDOW_DAYS": None,
-        "MIN_USER_INTER": 1,
-        "MIN_ITEM_INTER": 1,
-        "GRAPH_MODE": "clv",
-        "GRAPH_ALPHA": 1.0,  # runner compatibility only; the method has no alpha
-        "LOSS_MODE": "plain",
-        "NEG_MODE": "uniform",
-        "GATE_MODE": "none",
-        "REPORT_LEGACY_VALUE_FEATURES": False,
-        "EVAL_TEST": False,
-        "EVAL_HOLDOUT": False,
+def validate_test_config(cfg: M3TestConfig) -> M3TestConfig:
+    required = {
+        "dataset": "dunnhumby",
+        "epochs": 100,
+        "dim": 64,
+        "n_layers": 2,
+        "test_days": 7,
     }
-    settings.update(overrides)
-    cfg = dict(v3.CFG)
-    cfg.update(settings)
-    cfg["DATASET"] = "dunnhumby"
-    cfg["OUT_DIR"] = out_dir or _default_out_dir()
-    validate_screening_config(cfg)
+    for key, expected in required.items():
+        if getattr(cfg, key) != expected:
+            raise ValueError(f"M3 test-only setting requires {key}={expected!r}")
+    if not cfg.seeds or len(set(cfg.seeds)) != len(cfg.seeds):
+        raise ValueError("seeds must be non-empty and unique")
+    if tuple(sorted(cfg.seeds)) != cfg.seeds:
+        raise ValueError("seeds must be sorted")
+    if not set(cfg.seeds).issubset(FULL_SEEDS):
+        raise ValueError(f"seeds must be a subset of {FULL_SEEDS}")
+    if cfg.batch_size <= 0 or cfg.lr <= 0 or cfg.pref_reg < 0:
+        raise ValueError("invalid training setting")
+    if not cfg.out_dir or "dunnhumby" not in cfg.out_dir:
+        raise ValueError("out_dir must identify the Dunnhumby M3 test run")
     return cfg
 
 
-def preflight_summary(cfg: dict) -> dict:
-    validate_screening_config(cfg)
+def preflight_summary(cfg: M3TestConfig) -> dict:
+    cfg = validate_test_config(cfg)
     return {
         "code_version": CODE_VERSION,
-        "dataset": "dunnhumby",
-        "seed": 42,
-        "split": "validation only",
-        "models": ["m1_baseline", *MODEL_IDS.values()],
+        "dataset": cfg.dataset,
+        "seeds": list(cfg.seeds),
+        "current_scope": (
+            "single-seed protocol check"
+            if cfg.seeds == PILOT_SEEDS
+            else "multi-seed run"
+        ),
+        "planned_full_seeds": list(FULL_SEEDS),
+        "models": list(MODEL_ORDER),
+        "training_data": "former train + validation",
+        "test_data": "fixed DAY 698--704 after merged training through DAY 697",
+        "validation_constructed": False,
+        "validation_selection": False,
+        "early_stopping": False,
+        "epochs": cfg.epochs,
+        "test_evaluation": "one final-checkpoint evaluation per seed/model",
+        "post_test_rows": "ignored; no truth, metric, or result is constructed",
+        "holdout_evaluation": False,
+        "new_item_task": (
+            "all user-item pairs in merged train+validation are excluded from test truth"
+        ),
         "customer_value": {
-            "n_hat": "number of train transactions/baskets",
-            "v_hat": "mean train transaction/basket value",
+            "n_hat": "number of merged-train transactions/baskets",
+            "v_hat": "mean merged-train transaction/basket value",
             "clv_proxy": "n_hat * v_hat",
-            "factor": "mean-one 0.5 + train-user percentile; no alpha/beta",
+            "factor": "mean-one 0.5 + merged-train user percentile; no alpha/beta",
         },
         "propagation": {
             "user_from_item": "unchanged M1 symmetric-normalized coefficients",
-            "item_from_user": (
-                "M1 coefficients redistributed within each item by the user factor"
-            ),
+            "item_from_user": "fixed item mass redistributed by the user factor",
             "identity": "factor == 1 gives the exact M1 operator",
-            "mass_constraint": "each item's incoming coefficient sum equals M1",
         },
-        "controls": {
-            MODEL_IDS["n_only"]: "same operator with percentile(n_hat)",
-            MODEL_IDS["v_only"]: "same operator with percentile(v_hat)",
-            MODEL_IDS["clv_shuffle"]: (
-                f"same CLV factors permuted across train users; seed={DEFAULT_SHUFFLE_SEED}"
-            ),
-        },
-        "shared_invariants": {
-            "edge_set": "same unique train user-item pairs as M1",
-            "loss": "plain BPR without sample weights",
+        "fixed_boundaries": {
+            "edge_set": "same unique merged-train user-item pairs as M1",
+            "loss": "plain pairwise BPR; no sample weights or added loss",
             "negative_sampling": "uniform",
-            "min_user_inter": 1,
-            "min_item_inter": 1,
-            "no_m2_embedding": True,
-            "no_m4_loss_weight": True,
+            "min_user_interactions": 1,
+            "min_item_interactions": 1,
+            "m2_embedding": False,
+            "m4_loss_weight": False,
         },
-        "screen": {
-            "all_accuracy_ratios_vs_m1": ">= 0.99",
-            "purchase_value_weighted_hit_at_10": (
-                "> M1, N-only, V-only, and shuffled-CLV control"
-            ),
-            "recommended_mean_price_percentile_ratio": "0.97 to 1.03 vs M1",
-            "distinct_items_at_10_ratio": ">= 0.95 vs M1",
-            "top10_exposure_share_increase": "<= 0.01 absolute vs M1",
-        },
-        "eval_test": False,
-        "eval_holdout": False,
-        "out_dir": cfg["OUT_DIR"],
+        "reporting": (
+            "descriptive test results only; with 10 seeds, report means and "
+            "same-seed paired differences with 95% t intervals"
+        ),
+        "test_use_prohibition": (
+            "test must not select or modify formula, model, epoch, or hyperparameter"
+        ),
+        "out_dir": cfg.out_dir,
     }
 
 
-def normalize_result_schema(frame: pd.DataFrame) -> pd.DataFrame:
-    normalized = frame.copy()
-    for k in (10, 20, 50):
-        source = f"entropy@{k}"
-        target = f"exposure_entropy@{k}"
-        if source in normalized.columns and target not in normalized.columns:
-            normalized[target] = normalized[source]
-        hits = k * normalized[f"precision@{k}"]
-        normalized[f"mean_hits@{k}"] = hits
-        normalized[f"hit_value@{k}"] = np.where(
-            hits > 0, normalized[f"revenue@{k}"] / hits, np.nan
+def _base_config(cfg: M3TestConfig) -> dict:
+    base = dict(
+        v3.configure_run(
+            cfg.dataset,
+            out_dir=cfg.out_dir,
+            ARCH="pref_only",
+            SEED_LIST=list(cfg.seeds),
+            WINDOW_DAYS=None,
+            VAL_DAYS=7,
+            TEST_DAYS=cfg.test_days,
+            # Preserve the already-fixed DAY 698--704 test boundary. The final
+            # seven days are ignored rather than re-labelled as a new test.
+            HOLDOUT_DAYS=7,
+            TRAIN_ON_VAL=True,
+            EVAL_TEST=True,
+            EVAL_HOLDOUT=False,
+            GRAPH_MODE="binary",
+            GRAPH_ALPHA=1.0,
+            LOSS_MODE="plain",
+            NEG_MODE="uniform",
+            GATE_MODE="none",
+            MIN_USER_INTER=1,
+            MIN_ITEM_INTER=1,
+            DIM=cfg.dim,
+            N_LAYERS=cfg.n_layers,
+            BATCH_SIZE=cfg.batch_size,
+            LR=cfg.lr,
+            PREF_REG=cfg.pref_reg,
+            EPOCHS=cfg.epochs,
+            EARLY_STOP=cfg.epochs,
+            REPORT_LEGACY_VALUE_FEATURES=False,
         )
-    return normalized
-
-
-def screening_decision(frame: pd.DataFrame) -> dict:
-    val = frame[frame["split"].eq("val")]
-
-    def row(model_id: str) -> pd.Series:
-        selected = val[val["model_id"].eq(model_id)]
-        if selected.empty:
-            raise ValueError(f"validation result is missing {model_id}")
-        return selected.select_dtypes(include=[np.number]).mean()
-
-    baseline = row("m1_baseline")
-    proposed = row(MODEL_IDS["clv"])
-    controls = {
-        mode: row(MODEL_IDS[mode]) for mode in ("n_only", "v_only", "clv_shuffle")
-    }
-    ratios = {
-        metric: float(proposed[metric] / baseline[metric])
-        for metric in ACCURACY_METRICS
-    }
-    control_deltas = {
-        mode: float(proposed["revenue@10"] - control["revenue@10"])
-        for mode, control in controls.items()
-    }
-    price_ratio = float(proposed["arp@10"] / baseline["arp@10"])
-    distinct_ratio = float(
-        proposed["n_distinct@10"] / baseline["n_distinct@10"]
     )
-    top10_delta = float(proposed["top10_share@10"] - baseline["top10_share@10"])
-    guards = {
-        "accuracy": bool(all(value >= 0.99 for value in ratios.values())),
-        "weighted_hit_vs_m1": bool(proposed["revenue@10"] > baseline["revenue@10"]),
-        "weighted_hit_vs_n_only": bool(control_deltas["n_only"] > 0),
-        "weighted_hit_vs_v_only": bool(control_deltas["v_only"] > 0),
-        "weighted_hit_vs_shuffled_clv": bool(control_deltas["clv_shuffle"] > 0),
-        "recommended_price_percentile": bool(0.97 <= price_ratio <= 1.03),
-        "distinct_items": bool(distinct_ratio >= 0.95),
-        "top10_exposure_share": bool(top10_delta <= 0.01),
+    required = {
+        "TRAIN_ON_VAL": True,
+        "EVAL_TEST": True,
+        "EVAL_HOLDOUT": False,
+        "HOLDOUT_DAYS": 7,
+        "GRAPH_MODE": "binary",
+        "LOSS_MODE": "plain",
+        "NEG_MODE": "uniform",
+        "MIN_USER_INTER": 1,
+        "MIN_ITEM_INTER": 1,
+        "EPOCHS": 100,
     }
-    return {
-        "success": bool(all(guards.values())),
-        "guards": guards,
-        "accuracy_ratios_vs_m1": ratios,
-        "weighted_hit_at_10_delta_vs_m1": float(
-            proposed["revenue@10"] - baseline["revenue@10"]
-        ),
-        "weighted_hit_at_10_delta_vs_controls": control_deltas,
-        "recommended_mean_price_percentile_ratio_vs_m1": price_ratio,
-        "distinct_items_at_10_ratio_vs_m1": distinct_ratio,
-        "top10_exposure_share_delta_vs_m1": top10_delta,
-        "mean_hits_at_10_delta_vs_m1": float(
-            proposed["mean_hits@10"] - baseline["mean_hits@10"]
-        ),
-        "hit_value_at_10_delta_vs_m1": float(
-            proposed["hit_value@10"] - baseline["hit_value@10"]
-        ),
-        "note": (
-            "Validation screening only. The code field revenue is a purchase-value-"
-            "weighted hit metric, not actual revenue. No population significance is "
-            "claimed from this one-seed screen."
-        ),
-    }
+    for key, expected in required.items():
+        if base.get(key) != expected:
+            raise RuntimeError(
+                f"test-only configuration contamination: {key}={base.get(key)!r}"
+            )
+    return base
 
 
-def _prepare_with_redistribution(original_prepare, mode: str):
-    def wrapped(cfg: dict, dcfg: dict) -> dict:
-        binary_cfg = dict(cfg)
-        binary_cfg["GRAPH_MODE"] = "binary"
-        data = original_prepare(binary_cfg, dcfg)
-        graph = build_mass_preserving_clv_graph(
-            data["train"], data["n_users"], data["n_items"]
-        )
-        expected_users = (data["pos_key"] // data["n_items"]).astype(np.int64)
-        expected_items = (data["pos_key"] % data["n_items"]).astype(np.int64)
-        if not (
-            np.array_equal(graph.edge_users, expected_users)
-            and np.array_equal(graph.edge_items, expected_items)
-        ):
-            raise RuntimeError("CLV redistribution edge order differs from M1")
-        data["adj"] = build_directional_torch_adj(
-            graph, mode, data["n_users"], data["n_items"], v3.DEVICE
-        )
-        data["w_edge"] = graph.user_factors[mode][graph.edge_users]
-        data["clv"] = graph.clv_proxy
-        data["vhat"] = graph.v_hat
-        data["m3_mass_preserving_graph"] = graph
-        data["data_stats"]["m3_mass_preserving_graph"] = {
-            **graph.diagnostics,
-            "selected_mode": mode,
-        }
-        mode_diag = graph.diagnostics["modes"][mode]
-        print(
-            f"  M3 direct CLV influence ({mode}): edges {len(graph.edge_users):,} | "
-            f"factor std {mode_diag['user_factor']['std']:.4f} | "
-            "item factor Kish median "
-            f"{mode_diag['item_kish_ratio_from_user_factor_median']:.4f} | "
-            f"max item-mass error {mode_diag['max_item_mass_abs_error']:.3e}"
-        )
-        return data
-
-    return wrapped
-
-
-def _run_mode(cfg: dict, mode: str) -> pd.DataFrame:
-    current = dict(cfg)
-    current["GRAPH_MODE"] = mode
-    settings = {
-        key: value for key, value in current.items() if key not in {"DATASET", "OUT_DIR"}
-    }
-    v3.configure_run(current["DATASET"], out_dir=current["OUT_DIR"], **settings)
-    original_prepare = v3.prepare_data
-    v3.prepare_data = _prepare_with_redistribution(original_prepare, mode)
-    try:
-        return normalize_result_schema(v3.main())
-    finally:
-        v3.prepare_data = original_prepare
-
-
-def _native_result_paths() -> dict:
-    stem = (
-        f"result_pref_only_{v3.CFG['DATASET']}_"
-        f"{v3.result_hash(v3.CFG, v3.DCFG, 'pref_only')}"
-    )
-    out = Path(v3.CFG["OUT_DIR"])
-    return {
-        "json": str(out / f"{stem}.json"),
-        "val_csv": str(out / f"{stem}_val.csv"),
-        "delta_csv": str(out / f"{stem}_delta.csv"),
-    }
-
-
-def _fingerprint(cfg: dict) -> str:
+def _method_hash(cfg: M3TestConfig, input_hash: str, revision: str) -> str:
     payload = {
-        "code_version": CODE_VERSION,
-        "v3_code_version": v3.CODE_VERSION,
-        "dataset": cfg["DATASET"],
-        "seed_list": cfg["SEED_LIST"],
-        "shuffle_seed": DEFAULT_SHUFFLE_SEED,
-        "modes": MODES,
+        key: value
+        for key, value in asdict(cfg).items()
+        if key not in {"seeds", "out_dir"}
     }
+    payload.update(
+        code_version=CODE_VERSION,
+        models=MODEL_ORDER,
+        shuffle_seed=DEFAULT_SHUFFLE_SEED,
+        input_hash=input_hash,
+        source_revision=revision,
+    )
     return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
+        json.dumps(payload, sort_keys=True, default=str).encode()
     ).hexdigest()[:12]
 
 
-def run_experiment(cfg: dict | None = None) -> pd.DataFrame:
-    cfg = configure_m3_clv_influence_dunnhumby_run() if cfg is None else dict(cfg)
-    summary = preflight_summary(cfg)
-    print("M3 direct CLV influence preflight:")
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+def _prepare(cfg: M3TestConfig) -> dict:
+    out_dir = Path(cfg.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = moe.build_input_manifest(v3.SCHEMA[cfg.dataset])
+    input_hash = moe.manifest_hash(manifest)
+    revision = moe.source_revision()
+    base_cfg = _base_config(cfg)
+    data = v3.prepare_data(base_cfg, v3.DCFG)
+    if set(data["splits"]) != {"test"}:
+        raise RuntimeError(f"test-only split contamination: {sorted(data['splits'])}")
+    split_rows = data["data_stats"].get("split_rows", {})
+    if split_rows.get("val") != 0:
+        raise RuntimeError(f"validation rows must be zero: {split_rows}")
+    split_status = data["data_stats"].get("split_evaluation_status", {})
+    if split_status.get("holdout") != "not_constructed":
+        raise RuntimeError(f"post-test rows must not be evaluated: {split_status}")
+    data["loss_w"] = None
 
-    frames, paths = {}, {}
-    for mode in MODES:
-        frames[mode] = _run_mode(cfg, mode)
-        paths[mode] = _native_result_paths()
-
-    frame = pd.concat(
-        [
-            frames[MODES[0]][frames[MODES[0]]["model_id"].eq("m1_baseline")],
-            *[
-                frames[mode][frames[mode]["model_id"].eq(f"m3_{mode}")].assign(
-                    model_id=MODEL_IDS[mode]
-                )
-                for mode in MODES
-            ],
-        ],
-        ignore_index=True,
+    graph = build_mass_preserving_clv_graph(
+        data["train"], data["n_users"], data["n_items"]
     )
-    decision = screening_decision(frame)
-    out = Path(cfg["OUT_DIR"])
-    out.mkdir(parents=True, exist_ok=True)
-    fingerprint = _fingerprint(cfg)
-    csv_path = out / f"m3_clv_influence_comparison_{fingerprint}.csv"
-    json_path = out / f"m3_clv_influence_comparison_{fingerprint}.json"
-    frame.to_csv(csv_path, index=False, float_format="%.8f")
-    with json_path.open("w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "preflight": summary,
-                "screening_decision": decision,
-                "absolute_rows": frame.to_dict("records"),
-                "native_result_paths": paths,
-            },
-            handle,
-            ensure_ascii=False,
-            indent=2,
-            default=float,
-        )
-    frame.attrs["screening_decision"] = decision
-    frame.attrs["preflight"] = summary
-    frame.attrs["out_dir"] = cfg["OUT_DIR"]
-    frame.attrs["result_paths"] = {
-        "csv": str(csv_path),
-        "json": str(json_path),
-        "native": paths,
+    expected_users = (data["pos_key"] // data["n_items"]).astype(np.int64)
+    expected_items = (data["pos_key"] % data["n_items"]).astype(np.int64)
+    if not (
+        np.array_equal(graph.edge_users, expected_users)
+        and np.array_equal(graph.edge_items, expected_items)
+    ):
+        raise RuntimeError("M3 graph edge order differs from merged-train M1")
+    data["clv"] = graph.clv_proxy
+    data["vhat"] = graph.v_hat
+    data["data_stats"]["m3_mass_preserving_graph"] = graph.diagnostics
+    thresholds = v3.segment_thresholds(graph.clv_proxy, base_cfg["SEG_EDGES"])
+    cache = v3.EvalCache(
+        *data["splits"]["test"], graph.clv_proxy, thresholds, data["n_items"]
+    )
+    meta = v3.item_meta(data["train"], data["n_items"])
+    x_item, item_cat = v3.item_value_features(data["train"], data["n_items"])
+    return {
+        "out_dir": out_dir,
+        "manifest": manifest,
+        "input_hash": input_hash,
+        "revision": revision,
+        "method_hash": _method_hash(cfg, input_hash, revision),
+        "base_cfg": base_cfg,
+        "data": data,
+        "graph": graph,
+        "cache": cache,
+        "meta": meta,
+        "x_item": x_item,
+        "item_cat": item_cat,
     }
-    print("M3 direct CLV influence screening decision:")
-    print(json.dumps(decision, ensure_ascii=False, indent=2))
-    print("result files:", frame.attrs["result_paths"])
+
+
+def _mode_for_model(model_id: str) -> str | None:
+    for mode, candidate in MODEL_IDS.items():
+        if candidate == model_id:
+            return None if mode == "m1" else mode
+    raise KeyError(model_id)
+
+
+def _build_model(prepared: dict, cfg: M3TestConfig, model_id: str, seed: int):
+    data = prepared["data"]
+    mode = _mode_for_model(model_id)
+    model_data = data
+    if mode is not None:
+        model_data = {
+            **data,
+            "adj": build_directional_torch_adj(
+                prepared["graph"],
+                mode,
+                data["n_users"],
+                data["n_items"],
+                v3.DEVICE,
+            ),
+        }
+    v3.set_seed(seed)
+    model = v3.build_model(
+        model_data,
+        data["x_val_u"],
+        prepared["x_item"],
+        prepared["item_cat"],
+        prepared["base_cfg"],
+    )
+    return model, list(model.pref_params())
+
+
+def _arm_hash(prepared: dict, cfg: M3TestConfig, model_id: str, seed: int) -> str:
+    payload = {
+        "method": prepared["method_hash"],
+        "model_id": model_id,
+        "seed": seed,
+        "epochs": cfg.epochs,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode()
+    ).hexdigest()[:12]
+
+
+def _arm_paths(prepared: dict, model_id: str, seed: int) -> dict[str, Path]:
+    root = prepared["out_dir"] / "arms" / prepared["method_hash"]
+    stem = f"{model_id}_s{seed}"
+    return {
+        "result": root / f"{stem}.json",
+        "per_user": root / f"{stem}_per_user.npz",
+        "checkpoint": root / f"{stem}.pt",
+    }
+
+
+def _progress_store(
+    prepared: dict, cfg: M3TestConfig, model_id: str, seed: int
+) -> ProgressStore:
+    return ProgressStore(
+        prepared["out_dir"] / "progress" / prepared["method_hash"],
+        RunIdentity(
+            stage="final_train_test",
+            model_id=model_id,
+            seed=seed,
+            config_hash=_arm_hash(prepared, cfg, model_id, seed),
+            source_revision=prepared["revision"],
+            input_hash=prepared["input_hash"],
+        ),
+    )
+
+
+def _load_cached_arm(paths: dict[str, Path]) -> dict | None:
+    if not (paths["result"].exists() and paths["per_user"].exists()):
+        return None
+    payload = json.loads(paths["result"].read_text(encoding="utf-8"))
+    arrays = np.load(paths["per_user"])
+    payload["per_user"] = {key: arrays[key] for key in arrays.files}
+    print(
+        f"  [cached] {payload['model_id']} seed {payload['seed']} reused; "
+        "no repeated test evaluation"
+    )
+    return payload
+
+
+def _run_arm(
+    prepared: dict, cfg: M3TestConfig, model_id: str, seed: int
+) -> dict:
+    paths = _arm_paths(prepared, model_id, seed)
+    cached = _load_cached_arm(paths)
+    if cached is not None:
+        return cached
+    model, params = _build_model(prepared, cfg, model_id, seed)
+    store = _progress_store(prepared, cfg, model_id, seed)
+    training = fixed_train._fixed_epoch_train(
+        model, params, prepared, cfg, model_id, seed, store
+    )
+    model.eval()
+    checkpoint_payload = {
+        "state": clone_state(model),
+        "model_id": model_id,
+        "seed": seed,
+        "training": training,
+        "config": asdict(cfg),
+        "source_revision": prepared["revision"],
+        "input_hash": prepared["input_hash"],
+    }
+    paths["checkpoint"].parent.mkdir(parents=True, exist_ok=True)
+    temporary = paths["checkpoint"].with_suffix(".pt.tmp")
+    torch.save(checkpoint_payload, temporary)
+    os.replace(temporary, paths["checkpoint"])
+
+    metrics, per_user = moe._flat_evaluation(
+        model,
+        0.0,
+        prepared["cache"],
+        prepared["meta"],
+        prepared["data"],
+        prepared["base_cfg"],
+        per_user=True,
+    )
+    public_metrics = fixed_train._public_metrics(metrics)
+    public_per_user = fixed_train._public_per_user(per_user)
+    fixed_train._atomic_npz(paths["per_user"], public_per_user)
+    mode = _mode_for_model(model_id)
+    payload = {
+        "model_id": model_id,
+        "role": "baseline" if mode is None else (
+            "model" if mode == "clv" else "control"
+        ),
+        "seed": seed,
+        "split": "test",
+        "final_epoch": cfg.epochs,
+        "validation_selection": False,
+        "test_evaluation_count": 1,
+        "test_evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "metrics": public_metrics,
+        "graph_diagnostics": (
+            None if mode is None else prepared["graph"].diagnostics["modes"][mode]
+        ),
+        "training": training,
+        "checkpoint": str(paths["checkpoint"]),
+        "checkpoint_sha256": file_sha256(paths["checkpoint"]),
+        "per_user_path": str(paths["per_user"]),
+    }
+    fixed_train._atomic_json(paths["result"], payload)
+    payload["per_user"] = public_per_user
+    store.mark_complete(
+        epoch=cfg.epochs,
+        max_epoch=cfg.epochs,
+        selection="none",
+        split="test",
+        test_evaluation_count=1,
+        checkpoint_path=str(paths["checkpoint"]),
+        result_path=str(paths["result"]),
+    )
+    return payload
+
+
+def _absolute_rows(arms: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "seed": arm["seed"],
+                "model_id": arm["model_id"],
+                "role": arm["role"],
+                "split": "test",
+                "epoch": arm["final_epoch"],
+                **arm["metrics"],
+            }
+            for arm in arms
+        ]
+    ).sort_values(["seed", "model_id"]).reset_index(drop=True)
+
+
+def _mean_ci(values: np.ndarray) -> dict:
+    values = np.asarray(values, dtype=np.float64)
+    n = len(values)
+    mean = float(values.mean())
+    if n < 2:
+        return {
+            "n_seeds": n,
+            "mean": mean,
+            "sd": np.nan,
+            "lo": np.nan,
+            "hi": np.nan,
+        }
+    sd = float(values.std(ddof=1))
+    half = float(student_t.ppf(0.975, n - 1)) * sd / math.sqrt(n)
+    return {
+        "n_seeds": n,
+        "mean": mean,
+        "sd": sd,
+        "lo": mean - half,
+        "hi": mean + half,
+    }
+
+
+def _summary_tables(
+    absolute: pd.DataFrame, arms: list[dict], seeds: tuple[int, ...]
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    metric_columns = [
+        column
+        for column in absolute.columns
+        if "@" in column
+        or column == "user_value_tendency_recommended_price_alignment"
+    ]
+    absolute_summary = []
+    for model_id, group in absolute.groupby("model_id", sort=False):
+        for metric in metric_columns:
+            absolute_summary.append(
+                {"model_id": model_id, "metric": metric, **_mean_ci(group[metric])}
+            )
+    arm_map = {(arm["seed"], arm["model_id"]): arm for arm in arms}
+    paired_rows = []
+    for seed in seeds:
+        baseline = arm_map[(seed, MODEL_IDS["m1"])]
+        for model_id in MODEL_ORDER[1:]:
+            compared = arm_map[(seed, model_id)]
+            for metric in metric_columns:
+                paired_rows.append(
+                    {
+                        "seed": seed,
+                        "model_id": model_id,
+                        "reference": MODEL_IDS["m1"],
+                        "metric": metric,
+                        "delta": float(
+                            compared["metrics"][metric]
+                            - baseline["metrics"][metric]
+                        ),
+                    }
+                )
+    paired_seed = pd.DataFrame(paired_rows)
+    paired_summary = []
+    for (model_id, metric), group in paired_seed.groupby(
+        ["model_id", "metric"], sort=False
+    ):
+        paired_summary.append(
+            {
+                "model_id": model_id,
+                "reference": MODEL_IDS["m1"],
+                "metric": metric,
+                **_mean_ci(group["delta"].to_numpy()),
+                "positive_seed_count": int((group["delta"] > 0).sum()),
+            }
+        )
+    return pd.DataFrame(absolute_summary), paired_seed, pd.DataFrame(paired_summary)
+
+
+def _persist(
+    prepared: dict, cfg: M3TestConfig, arms: list[dict]
+) -> pd.DataFrame:
+    absolute = _absolute_rows(arms)
+    absolute_summary, paired_seed, paired_summary = _summary_tables(
+        absolute, arms, cfg.seeds
+    )
+    run_hash = hashlib.sha256(
+        json.dumps(
+            {"method": prepared["method_hash"], "seeds": cfg.seeds},
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()[:12]
+    stem = f"m3_clv_influence_test_{run_hash}"
+    paths = {
+        "absolute_csv": prepared["out_dir"] / f"{stem}.csv",
+        "absolute_summary_csv": prepared["out_dir"] / f"{stem}_mean.csv",
+        "paired_seed_csv": prepared["out_dir"] / f"{stem}_paired_seed.csv",
+        "paired_summary_csv": prepared["out_dir"] / f"{stem}_paired_mean.csv",
+        "json": prepared["out_dir"] / f"{stem}.json",
+    }
+    fixed_train._atomic_csv(paths["absolute_csv"], absolute)
+    fixed_train._atomic_csv(paths["absolute_summary_csv"], absolute_summary)
+    fixed_train._atomic_csv(paths["paired_seed_csv"], paired_seed)
+    fixed_train._atomic_csv(paths["paired_summary_csv"], paired_summary)
+    payload = {
+        "code_version": CODE_VERSION,
+        "source_revision": prepared["revision"],
+        "input_manifest": prepared["manifest"],
+        "config": asdict(cfg),
+        "preflight": preflight_summary(cfg),
+        "data_stats": prepared["data"].get("data_stats", {}),
+        "graph_diagnostics": prepared["graph"].diagnostics,
+        "absolute_rows": absolute.to_dict("records"),
+        "absolute_seed_summary": absolute_summary.to_dict("records"),
+        "same_seed_differences": paired_seed.to_dict("records"),
+        "same_seed_summary": paired_summary.to_dict("records"),
+        "result_paths": {name: str(path) for name, path in paths.items()},
+        "interpretation": {
+            "selection": "none; validation is absent and test is not used for selection",
+            "single_seed": (
+                "one seed is a protocol check only; dispersion and significance are not estimable"
+                if len(cfg.seeds) == 1
+                else None
+            ),
+            "weighted_hit": (
+                "price/purchase-amount weighted recommendation hit; not actual incremental revenue"
+            ),
+        },
+    }
+    fixed_train._atomic_json(paths["json"], payload)
+    absolute.attrs["absolute_summary"] = absolute_summary
+    absolute.attrs["paired_seed"] = paired_seed
+    absolute.attrs["paired_summary"] = paired_summary
+    absolute.attrs["result_paths"] = {
+        name: str(path) for name, path in paths.items()
+    }
+    return absolute
+
+
+def run_test(cfg: M3TestConfig | None = None) -> pd.DataFrame:
+    cfg = validate_test_config(cfg or configure_m3_clv_influence_test_run())
+    print(json.dumps(preflight_summary(cfg), ensure_ascii=False, indent=2))
+    prepared = _prepare(cfg)
+    arms = []
+    for seed in cfg.seeds:
+        for model_id in MODEL_ORDER:
+            print(f"\n===== seed {seed} | {model_id} | fixed 100-epoch train =====")
+            arms.append(_run_arm(prepared, cfg, model_id, seed))
+    frame = _persist(prepared, cfg, arms)
+    print("\nTest absolute metrics:")
+    print(frame.to_string(index=False))
+    print("\nSame-seed differences from M1:")
+    print(frame.attrs["paired_summary"].to_string(index=False))
+    if len(cfg.seeds) == 1:
+        print("\nOne seed only: no variance, confidence interval, or significance claim.")
+    print("Result files:", frame.attrs["result_paths"])
     return frame
 
 
 if __name__ == "__main__":
     print(
         json.dumps(
-            preflight_summary(configure_m3_clv_influence_dunnhumby_run()),
+            preflight_summary(configure_m3_clv_influence_test_run()),
             ensure_ascii=False,
             indent=2,
         )
