@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 import lightgcn_clv_postprop_gate_test1 as runner
@@ -60,3 +61,23 @@ def test_colab_is_pinned_and_has_one_unguarded_run_cell():
     assert source.count("result_df = run_test1(cfg)") == 1
     assert "ACKNOWLEDGE_HIGH_COST" not in source
     assert "holdout은 생성·평가하지 않음" in source
+
+
+def test_result_metadata_keeps_wide_dataframe_display_safe():
+    absolute = pd.DataFrame(
+        [{f"metric_{index}": float(index) for index in range(150)}]
+    )
+    comparison = pd.DataFrame(
+        [{"metric": "recall@10", "absolute_delta": 0.0}]
+    )
+
+    runner._attach_result_metadata(
+        absolute,
+        comparison,
+        {"absolute_csv": "/tmp/absolute.csv"},
+    )
+
+    assert isinstance(absolute.attrs["comparison"], list)
+    assert absolute.attrs["comparison"][0]["metric"] == "recall@10"
+    repr(absolute)
+    absolute._repr_html_()

@@ -435,6 +435,18 @@ def _comparison(absolute: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _attach_result_metadata(
+    absolute: pd.DataFrame,
+    comparison: pd.DataFrame,
+    paths: dict[str, str | Path],
+) -> None:
+    """Attach only scalar containers so wide DataFrames remain display-safe."""
+    absolute.attrs["comparison"] = comparison.to_dict("records")
+    absolute.attrs["result_paths"] = {
+        name: str(path) for name, path in paths.items()
+    }
+
+
 def run_test1(cfg: Test1Config | None = None) -> pd.DataFrame:
     cfg = validate_test1_config(cfg or configure_test1_run())
     print(json.dumps(preflight_summary(cfg), ensure_ascii=False, indent=2))
@@ -476,10 +488,7 @@ def run_test1(cfg: Test1Config | None = None) -> pd.DataFrame:
             },
         },
     )
-    absolute.attrs["comparison"] = comparison
-    absolute.attrs["result_paths"] = {
-        name: str(path) for name, path in paths.items()
-    }
+    _attach_result_metadata(absolute, comparison, paths)
     print("\n절대지표:")
     print(absolute.to_string(index=False))
     print("\nM1 대비 변화:")
