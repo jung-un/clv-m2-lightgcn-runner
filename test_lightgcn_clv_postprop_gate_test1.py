@@ -57,7 +57,7 @@ def test_colab_is_pinned_and_has_one_unguarded_run_cell():
         "".join(cell.get("source", [])) for cell in notebook["cells"]
     )
 
-    assert "d1f913bb806c657ea4995a2355d64ae2662f3cf7" in source
+    assert "16d03a8861447d6a1afdf107ad7d154cc371ff9d" in source
     assert source.count("result_df = run_test1(cfg)") == 1
     assert "ACKNOWLEDGE_HIGH_COST" not in source
     assert "holdout은 생성·평가하지 않음" in source
