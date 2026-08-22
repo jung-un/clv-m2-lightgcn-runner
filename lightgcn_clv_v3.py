@@ -902,7 +902,11 @@ def clv_features(train, n_users, cfg, is_date):
     clv[g.index.values] = g["CLV"].values
     vhat = np.full(n_users, np.nan)
     vhat[g.index.values] = g["V_hat"].values
-    print(f"  유저 가치 입력 [F_p,T_p,R_p,AOV_p,Prem_p] {x.shape} (축소추정 없음)")
+    if cfg.get("REPORT_LEGACY_VALUE_FEATURES", True):
+        print(
+            f"  구형 가치모형 호환 입력 [F_p,T_p,R_p,AOV_p,Prem_p] "
+            f"{x.shape} (축소추정 없음)"
+        )
     return x, clv, vhat
 
 
@@ -1035,7 +1039,7 @@ def segment_thresholds(clv, edges):
     return float(lo), float(hi)
 
 
-def item_value_features(train, n_items):
+def item_value_features(train, n_items, *, report=True):
     """[가격백분위, 카테고리내 가격순위] + 카테고리 ID. 가격은 단가(up) 중앙값 기준."""
     g = train.groupby("i_idx").agg(med=("up", "median"))
     price_pct = np.full(n_items, 0.5, np.float32)
@@ -1048,7 +1052,11 @@ def item_value_features(train, n_items):
     cat_arr = np.zeros(n_items, dtype=np.int64)
     cat_arr[cat_of.index.values] = cat_of.values
     x = np.stack([price_pct, within], axis=1).astype(np.float32)
-    print(f"  아이템 가치 입력 [가격백분위, 카테고리내 가격순위] {x.shape} + 카테고리 임베딩")
+    if report:
+        print(
+            "  구형 가치모형 호환 아이템 입력 "
+            f"[가격백분위, 카테고리내 가격순위] {x.shape} + 카테고리 임베딩"
+        )
     return x, cat_arr
 
 

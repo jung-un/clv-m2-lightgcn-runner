@@ -51,6 +51,37 @@ def test_base_config_merges_validation_and_opens_only_test(tmp_path):
     assert base["MIN_USER_INTER"] == 1
     assert base["MIN_ITEM_INTER"] == 1
     assert base["EPOCHS"] == 100
+    assert base["REPORT_LEGACY_VALUE_FEATURES"] is False
+
+
+def test_final_runner_declares_the_accepted_m2_feature_schema():
+    assert final10.ACCEPTED_M2_FEATURE_SCHEMA == {
+        "user_activity": [
+            "repeat_transaction_count",
+            "transaction_recency",
+            "customer_age",
+            "mean_transaction_gap",
+            "valid_repeat_transaction_count",
+            "valid_transaction_recency",
+            "valid_customer_age",
+            "valid_mean_transaction_gap",
+        ],
+        "user_value": [
+            "mean_transaction_value",
+            "valid_mean_transaction_value",
+        ],
+        "item_activity": [
+            "repeat_purchase_share",
+            "log_median_repeat_gap",
+            "repeat_gap_valid",
+        ],
+        "item_value": [
+            "price_percentile",
+            "category_price_percentile",
+            "log_mean_unit_price",
+            "mean_transaction_value_share",
+        ],
+    }
 
 
 def test_four_model_specs_include_capacity_and_assignment_controls():

@@ -45,6 +45,33 @@ PUBLIC_METRIC_NAMES = {
     "arp": "mean_recommended_price_percentile",
     "value_alignment": "user_value_tendency_recommended_price_alignment",
 }
+ACCEPTED_M2_FEATURE_SCHEMA = {
+    "user_activity": [
+        "repeat_transaction_count",
+        "transaction_recency",
+        "customer_age",
+        "mean_transaction_gap",
+        "valid_repeat_transaction_count",
+        "valid_transaction_recency",
+        "valid_customer_age",
+        "valid_mean_transaction_gap",
+    ],
+    "user_value": [
+        "mean_transaction_value",
+        "valid_mean_transaction_value",
+    ],
+    "item_activity": [
+        "repeat_purchase_share",
+        "log_median_repeat_gap",
+        "repeat_gap_valid",
+    ],
+    "item_value": [
+        "price_percentile",
+        "category_price_percentile",
+        "log_mean_unit_price",
+        "mean_transaction_value_share",
+    ],
+}
 
 
 @dataclass(frozen=True)
@@ -105,6 +132,7 @@ def preflight_summary(cfg: Test10Config) -> dict:
         "dataset": cfg.dataset,
         "seeds": list(cfg.seeds),
         "models": list(MODELS),
+        "m2_feature_schema": ACCEPTED_M2_FEATURE_SCHEMA,
         "training_data": "former train + validation",
         "new_item_task": (
             "every user-item pair observed in merged train+validation is "
@@ -160,6 +188,7 @@ def _base_config(cfg: Test10Config) -> dict:
         PREF_REG=cfg.pref_reg,
         EPOCHS=cfg.epochs,
         EARLY_STOP=cfg.epochs,
+        REPORT_LEGACY_VALUE_FEATURES=False,
     )
     base = dict(configured)
     required = {
@@ -215,6 +244,20 @@ def _prepare(cfg: Test10Config) -> dict:
     item_profile = build_dual_item_profiles(
         data["train"], data["n_items"], v3.DCFG["is_date"]
     )
+    actual_feature_schema = {
+        "user_activity": list(axes["activity_names"]),
+        "user_value": list(axes["value_names"]),
+        "item_activity": list(item_profile.activity_names),
+        "item_value": list(item_profile.value_names),
+    }
+    if actual_feature_schema != ACCEPTED_M2_FEATURE_SCHEMA:
+        raise RuntimeError(
+            "승인된 M2 사용자·아이템 입력과 실제 입력이 다릅니다: "
+            f"expected={ACCEPTED_M2_FEATURE_SCHEMA}, actual={actual_feature_schema}"
+        )
+    print("  현재 M2 사용자·아이템 입력:")
+    for axis, names in actual_feature_schema.items():
+        print(f"    {axis}: {names}")
     meta = v3.item_meta(data["train"], data["n_items"])
     thresholds = v3.segment_thresholds(axes["clv_proxy"], base_cfg["SEG_EDGES"])
     cache = v3.EvalCache(
@@ -223,7 +266,9 @@ def _prepare(cfg: Test10Config) -> dict:
         thresholds,
         data["n_items"],
     )
-    x_item, item_cat = v3.item_value_features(data["train"], data["n_items"])
+    x_item, item_cat = v3.item_value_features(
+        data["train"], data["n_items"], report=False
+    )
     return {
         "out_dir": out_dir,
         "manifest": manifest,
@@ -234,6 +279,7 @@ def _prepare(cfg: Test10Config) -> dict:
         "data": data,
         "axes": axes,
         "item_profile": item_profile,
+        "feature_schema": actual_feature_schema,
         "meta": meta,
         "cache": cache,
         "x_item": x_item,
@@ -749,12 +795,7 @@ def _persist(
         "config": asdict(cfg),
         "preflight": preflight_summary(cfg),
         "data_stats": prepared["data"].get("data_stats", {}),
-        "feature_schema": {
-            "user_activity": list(prepared["axes"]["activity_names"]),
-            "user_value": list(prepared["axes"]["value_names"]),
-            "item_activity": list(prepared["item_profile"].activity_names),
-            "item_value": list(prepared["item_profile"].value_names),
-        },
+        "feature_schema": prepared["feature_schema"],
         "absolute_rows": absolute.to_dict("records"),
         "absolute_10seed_summary": absolute_summary.to_dict("records"),
         "same_seed_differences": paired_seed.to_dict("records"),
