@@ -23,7 +23,7 @@ def _adj(n_users=3, n_items=4):
     return torch.sparse_coo_tensor(indices, norm, raw.shape).coalesce()
 
 
-def _model(layers=1):
+def _model(layers=1, axis_budget=0.1):
     return GateFreeLowDimNVLightGCN(
         n_users=3,
         n_items=4,
@@ -42,7 +42,7 @@ def _model(layers=1):
         axis_dim=4,
         hidden_dim=5,
         n_layers=layers,
-        axis_budget=0.1,
+        axis_budget=axis_budget,
         pref_reg=1e-4,
     )
 
@@ -69,6 +69,15 @@ def test_model_has_no_item_economic_inputs_gate_or_learned_axis_weight():
     assert not hasattr(model, "sqrt_gamma_n")
     assert not hasattr(model, "sqrt_gamma_v")
     assert model.axis_budget == pytest.approx(0.1)
+
+
+def test_point_zero_five_budget_scales_each_axis_by_square_root():
+    model = _model(layers=0, axis_budget=0.05)
+    user, item = model.layer0_embeddings()
+
+    assert torch.all(user[:, 6:].abs() <= np.sqrt(0.05) + 1e-7)
+    assert torch.all(item[:, 6:].abs() <= np.sqrt(0.05) + 1e-7)
+    assert model.representation_diagnostics()["axis_budget"] == pytest.approx(0.05)
 
 
 def test_one_plain_bpr_loss_trains_id_user_axes_and_item_responses():

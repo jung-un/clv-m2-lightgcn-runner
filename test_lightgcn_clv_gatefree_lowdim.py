@@ -29,6 +29,34 @@ def test_screen_is_one_new_model_on_historical_development_split(tmp_path):
     assert summary["m2"]["explicit_item_features"] is False
     assert summary["m2"]["user_gate"] is False
     assert summary["m2"]["learned_axis_weight"] is False
+    assert summary["m2"]["fixed_per_axis_budget"] == pytest.approx(0.1)
+    assert summary["m2"]["fixed_total_clv_budget"] == pytest.approx(0.2)
+
+
+def test_split_budget_uses_point_zero_five_per_axis(tmp_path):
+    cfg = runner.configure_gatefree_lowdim_run(
+        out_dir=str(tmp_path / "new"),
+        baseline_result_dir=str(tmp_path / "old"),
+        axis_budget=0.05,
+    )
+
+    summary = runner.preflight_summary(cfg)
+
+    assert cfg.axis_budget == pytest.approx(0.05)
+    assert summary["m2"]["fixed_per_axis_budget"] == pytest.approx(0.05)
+    assert summary["m2"]["fixed_total_clv_budget"] == pytest.approx(0.1)
+    assert summary["m2"]["score_formula"] == (
+        "S_ID + axis_budget*S_N + axis_budget*S_V"
+    )
+
+
+def test_unplanned_axis_budget_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="0.05 또는 0.1"):
+        runner.configure_gatefree_lowdim_run(
+            out_dir=str(tmp_path / "new"),
+            baseline_result_dir=str(tmp_path / "old"),
+            axis_budget=0.075,
+        )
 
 
 def test_base_config_preserves_m2_boundaries(tmp_path):

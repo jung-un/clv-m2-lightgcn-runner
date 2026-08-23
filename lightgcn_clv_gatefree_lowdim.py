@@ -28,6 +28,7 @@ import lightgcn_clv_v3 as v3
 
 CODE_VERSION = "m2-gatefree-lowdim-historical-screen-v1"
 MODEL_ID = "m2_gatefree_lowdim"
+ALLOWED_AXIS_BUDGETS = {0.05, 0.1}
 
 
 @dataclass(frozen=True)
@@ -74,13 +75,16 @@ def validate_config(cfg: GateFreeLowDimConfig) -> GateFreeLowDimConfig:
         "id_dim": 64,
         "axis_dim": 4,
         "hidden_dim": 8,
-        "axis_budget": 0.1,
         "n_layers": 2,
         "input_days": 365,
     }
     for key, expected in required.items():
         if getattr(cfg, key) != expected:
             raise ValueError(f"빠른 M2 screen은 {key}={expected!r}이어야 합니다")
+    if cfg.axis_budget not in ALLOWED_AXIS_BUDGETS:
+        raise ValueError(
+            "축별 고정 계수는 사전 선언된 0.05 또는 0.1이어야 합니다"
+        )
     if cfg.batch_size <= 0 or cfg.lr <= 0 or cfg.pref_reg < 0:
         raise ValueError("학습 설정이 잘못됐습니다")
     if not cfg.out_dir or not cfg.baseline_result_dir:
@@ -110,7 +114,11 @@ def preflight_summary(cfg: GateFreeLowDimConfig) -> dict:
             "item_response": "learned from item ID by the same recommendation loss",
             "user_gate": False,
             "learned_axis_weight": False,
-            "fixed_common_axis_budget": cfg.axis_budget,
+            "fixed_per_axis_budget": cfg.axis_budget,
+            "fixed_total_clv_budget": 2.0 * cfg.axis_budget,
+            "score_formula": (
+                "S_ID + axis_budget*S_N + axis_budget*S_V"
+            ),
             "train_user_coordinate_mean": 0.0,
         },
         "fixed": {
