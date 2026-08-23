@@ -58,6 +58,7 @@ class GateFreeLowDimNVLightGCN(nn.Module):
         hidden_dim: int = 8,
         n_layers: int = 2,
         axis_budget: float = 0.1,
+        training_axis_balance_delta: float = 0.0,
         pref_reg: float = 1e-3,
     ):
         super().__init__()
@@ -69,6 +70,10 @@ class GateFreeLowDimNVLightGCN(nn.Module):
             raise ValueError("hidden_dim은 양수, n_layers는 0 이상이어야 합니다")
         if not 0.0 < axis_budget <= 1.0:
             raise ValueError("axis_budget은 0보다 크고 1 이하여야 합니다")
+        if not 0.0 <= training_axis_balance_delta < 1.0:
+            raise ValueError(
+                "training_axis_balance_delta는 0 이상 1 미만이어야 합니다"
+            )
 
         user_activity = np.asarray(user_activity, dtype=np.float32)
         user_value = np.asarray(user_value, dtype=np.float32)
@@ -90,6 +95,7 @@ class GateFreeLowDimNVLightGCN(nn.Module):
         self.axis_dim = int(axis_dim)
         self.n_layers = int(n_layers)
         self.axis_budget = float(axis_budget)
+        self.training_axis_balance_delta = float(training_axis_balance_delta)
         self.pref_reg = float(pref_reg)
 
         self.E_u = nn.Embedding(n_users, id_dim)
@@ -191,14 +197,58 @@ class GateFreeLowDimNVLightGCN(nn.Module):
         if weights is not None:
             raise ValueError("M2 표현 실험에 M4 표본 가중치를 넣을 수 없습니다")
         user, item = self.propagate()
-        positive_score = (user[users] * item[positives]).sum(1)
-        negative_score = (user[users] * item[negatives]).sum(1)
+        id_end = self.id_dim
+        activity_end = id_end + self.axis_dim
+
+        def components(item_ids):
+            selected_user = user[users]
+            selected_item = item[item_ids]
+            return (
+                (selected_user[:, :id_end] * selected_item[:, :id_end]).sum(1),
+                (
+                    selected_user[:, id_end:activity_end]
+                    * selected_item[:, id_end:activity_end]
+                ).sum(1),
+                (
+                    selected_user[:, activity_end:]
+                    * selected_item[:, activity_end:]
+                ).sum(1),
+            )
+
+        positive_id, positive_activity, positive_value = components(positives)
+        negative_id, negative_activity, negative_value = components(negatives)
+        if self.training and self.training_axis_balance_delta > 0:
+            epsilon = (
+                torch.rand_like(positive_id) * 2.0 - 1.0
+            ) * self.training_axis_balance_delta
+        else:
+            epsilon = torch.zeros_like(positive_id)
+        activity_multiplier = 1.0 + epsilon
+        value_multiplier = 1.0 - epsilon
+        # The same epsilon is used for the positive and negative item of each
+        # BPR triplet.  Only the relative N/V balance changes; the total axis
+        # budget remains constant and both axes stay strictly positive.
+        positive_score = (
+            positive_id
+            + activity_multiplier * positive_activity
+            + value_multiplier * positive_value
+        )
+        negative_score = (
+            negative_id
+            + activity_multiplier * negative_activity
+            + value_multiplier * negative_value
+        )
         bpr = -F.logsigmoid(positive_score - negative_score).mean()
         loss = bpr + self.batch_l2(users, positives, negatives)
         with torch.no_grad():
             diagnostics = {
                 "bpr": float(bpr),
                 "objective": "plain_bpr",
+                "training_axis_balance_delta": self.training_axis_balance_delta,
+                "axis_balance_epsilon_mean": float(epsilon.mean()),
+                "axis_balance_epsilon_std": float(
+                    epsilon.std(unbiased=False)
+                ),
                 "p_correct": float(
                     (positive_score > negative_score).float().mean()
                 ),
@@ -210,6 +260,17 @@ class GateFreeLowDimNVLightGCN(nn.Module):
         user0, item0 = self.layer0_embeddings()
         return {
             "axis_budget": self.axis_budget,
+            "training_axis_balance_delta": self.training_axis_balance_delta,
+            "training_activity_multiplier_range": [
+                1.0 - self.training_axis_balance_delta,
+                1.0 + self.training_axis_balance_delta,
+            ],
+            "training_value_multiplier_range": [
+                1.0 - self.training_axis_balance_delta,
+                1.0 + self.training_axis_balance_delta,
+            ],
+            "evaluation_activity_multiplier": 1.0,
+            "evaluation_value_multiplier": 1.0,
             "total_dim": self.total_dim,
             "activity_user_coordinate_mean_abs": float(
                 user0[:, self.id_dim : self.id_dim + self.axis_dim]

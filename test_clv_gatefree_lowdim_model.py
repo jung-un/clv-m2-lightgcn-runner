@@ -23,7 +23,7 @@ def _adj(n_users=3, n_items=4):
     return torch.sparse_coo_tensor(indices, norm, raw.shape).coalesce()
 
 
-def _model(layers=1, axis_budget=0.1):
+def _model(layers=1, axis_budget=0.1, training_axis_balance_delta=0.0):
     return GateFreeLowDimNVLightGCN(
         n_users=3,
         n_items=4,
@@ -43,6 +43,7 @@ def _model(layers=1, axis_budget=0.1):
         hidden_dim=5,
         n_layers=layers,
         axis_budget=axis_budget,
+        training_axis_balance_delta=training_axis_balance_delta,
         pref_reg=1e-4,
     )
 
@@ -112,3 +113,70 @@ def test_m4_sample_weights_are_rejected():
             0.0,
             torch.tensor([2.0]),
         )
+
+
+def test_training_balance_uses_one_complementary_epsilon_per_triplet():
+    model = _model(layers=1, training_axis_balance_delta=0.3)
+    users = torch.tensor([0, 1])
+    positives = torch.tensor([0, 2])
+    negatives = torch.tensor([3, 0])
+    model.train()
+
+    torch.manual_seed(123)
+    rng_state = torch.get_rng_state()
+    loss, diagnostics = model.bpr_loss(
+        users, positives, negatives, None, 0.0, None
+    )
+
+    torch.set_rng_state(rng_state)
+    epsilon = (torch.rand(2) * 2.0 - 1.0) * 0.3
+    user, item = model.propagate()
+    id_end = model.id_dim
+    activity_end = id_end + model.axis_dim
+
+    def score(item_ids):
+        selected_user = user[users]
+        selected_item = item[item_ids]
+        id_score = (
+            selected_user[:, :id_end] * selected_item[:, :id_end]
+        ).sum(1)
+        activity_score = (
+            selected_user[:, id_end:activity_end]
+            * selected_item[:, id_end:activity_end]
+        ).sum(1)
+        value_score = (
+            selected_user[:, activity_end:]
+            * selected_item[:, activity_end:]
+        ).sum(1)
+        return (
+            id_score
+            + (1.0 + epsilon) * activity_score
+            + (1.0 - epsilon) * value_score
+        )
+
+    expected_bpr = -torch.nn.functional.logsigmoid(
+        score(positives) - score(negatives)
+    ).mean()
+    expected = expected_bpr + model.batch_l2(users, positives, negatives)
+
+    torch.testing.assert_close(loss, expected)
+    assert diagnostics["training_axis_balance_delta"] == pytest.approx(0.3)
+    assert torch.all(1.0 + epsilon >= 0.7)
+    assert torch.all(1.0 - epsilon >= 0.7)
+    torch.testing.assert_close(
+        (1.0 + epsilon) + (1.0 - epsilon), torch.full((2,), 2.0)
+    )
+
+
+def test_evaluation_embeddings_do_not_apply_training_perturbation():
+    plain = _model(layers=1, training_axis_balance_delta=0.0)
+    perturbed = _model(layers=1, training_axis_balance_delta=0.3)
+    perturbed.load_state_dict(plain.state_dict())
+    plain.eval()
+    perturbed.eval()
+
+    plain_user, plain_item, *_ = plain.embeddings()
+    perturbed_user, perturbed_item, *_ = perturbed.embeddings()
+
+    torch.testing.assert_close(perturbed_user, plain_user)
+    torch.testing.assert_close(perturbed_item, plain_item)
