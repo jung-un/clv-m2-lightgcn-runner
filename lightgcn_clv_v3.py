@@ -116,6 +116,9 @@ CFG = {
     # ── 데이터 (시간순: train | val | test | holdout) ──
     "OUT_DIR": None,
     "WINDOW_DAYS": 60,                # [선택] hm=60, dunnhumby=None(전체)
+    # 역사적 개발 백테스트 전용. None이면 기존 전체 기간을 그대로 사용한다.
+    # 이미 확인한 test를 재사용하지 않고 더 이른 시점에서 새 가설을 탐색할 때만 설정.
+    "TIME_CUTOFF": None,
     "VAL_DAYS": 7, "TEST_DAYS": 7,    # [기본]
     "HOLDOUT_DAYS": 7,                # [선택] 최종 확증 전용. 아래 플래그 전엔 계산 안 함
     # [2026-08-09] test도 holdout과 같은 방식으로 **명시적으로 켜야** 계산된다.
@@ -287,6 +290,10 @@ def cfg_hash(cfg, dcfg, arch, seed):
     # 실행만 별도 해시를 갖게 한다.
     if not payload["TRAIN_ON_VAL"]:
         payload.pop("TRAIN_ON_VAL")
+    # None인 기존 실행의 체크포인트 해시는 보존한다. 역사적 백테스트만 별도
+    # cutoff를 해시에 넣어 다른 기간의 가중치가 섞이지 않게 한다.
+    if cfg.get("TIME_CUTOFF") is not None:
+        payload["TIME_CUTOFF"] = cfg["TIME_CUTOFF"]
     # 단, pref_only는 λ_train=0이라 가치항이 손실에 전혀 들어가지 않는다 → 게이트가
     # 가중치에 영향을 못 준다. 그런데도 해시에 넣으면 GATE_MODE만 바꿔도 pref_only를
     # 세 시드 다시 학습하게 되어 v3.4의 낭비가 그대로 재현된다. two_stage/joint_warm이
@@ -453,6 +460,16 @@ def prepare_data(cfg, dcfg):
     """시간순 분할: train | val | test | holdout(가장 최근).
     holdout은 EVAL_HOLDOUT=True일 때만 평가에 쓰인다(그 전엔 정답조차 만들지 않음)."""
     tx = load_transactions(dcfg)
+    cutoff = cfg.get("TIME_CUTOFF")
+    if cutoff is not None:
+        cutoff_value = pd.Timestamp(cutoff) if dcfg["is_date"] else float(cutoff)
+        tx = tx[tx["t"] <= cutoff_value].copy()
+        if tx.empty:
+            raise ValueError("TIME_CUTOFF 적용 후 거래가 없습니다")
+        print(
+            f"역사적 개발 백테스트 cutoff ≤ {cutoff_value}: "
+            f"{len(tx):,}건"
+        )
     source_stats = {
         "rows": int(len(tx)),
         "time_min": _json_safe_time(tx["t"].min()),

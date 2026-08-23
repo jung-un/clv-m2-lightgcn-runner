@@ -28,6 +28,8 @@ class DualItemProfile:
     valid_item: np.ndarray
     activity_names: tuple[str, ...]
     value_names: tuple[str, ...]
+    repeat_share_mode: str = "raw"
+    repeat_share_diagnostics: dict[str, float] | None = None
 
 
 def _midrank_percentile(values: np.ndarray) -> np.ndarray:
@@ -99,8 +101,72 @@ def _standardize(raw: np.ndarray) -> np.ndarray:
     return ((raw - mean) / std).astype(np.float32)
 
 
+def _spearman(values: np.ndarray, other: np.ndarray) -> float:
+    values = np.asarray(values, dtype=np.float64)
+    other = np.asarray(other, dtype=np.float64)
+    valid = np.isfinite(values) & np.isfinite(other)
+    if valid.sum() < 2:
+        return float("nan")
+    left = rankdata(values[valid], method="average")
+    right = rankdata(other[valid], method="average")
+    if np.std(left) < 1e-12 or np.std(right) < 1e-12:
+        return float("nan")
+    return float(np.corrcoef(left, right)[0, 1])
+
+
+def popularity_controlled_repeat_share(
+    repeat_share: np.ndarray,
+    unique_buyers: np.ndarray,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Remove the train-catalog popularity component from RepeatShare.
+
+    The fitted relation is
+        RepeatShare_i = beta_0 + beta_1 log(1 + buyers_i) + residual_i.
+    Only the residual is returned as the popularity-controlled feature.  All
+    quantities are computed from the training period; no evaluation outcome is
+    used.
+    """
+    repeat_share = np.asarray(repeat_share, dtype=np.float64)
+    unique_buyers = np.asarray(unique_buyers, dtype=np.float64)
+    if repeat_share.shape != unique_buyers.shape:
+        raise ValueError("RepeatShare와 상품 구매고객 수 shape이 다릅니다")
+    valid = (
+        np.isfinite(repeat_share)
+        & np.isfinite(unique_buyers)
+        & (unique_buyers >= 0)
+    )
+    if valid.sum() < 2:
+        raise ValueError("RepeatShare 인기도 통제 회귀에 유효 상품이 부족합니다")
+    log_buyers = np.log1p(unique_buyers)
+    design = np.column_stack(
+        [np.ones(int(valid.sum()), dtype=np.float64), log_buyers[valid]]
+    )
+    beta, *_ = np.linalg.lstsq(design, repeat_share[valid], rcond=None)
+    predicted = beta[0] + beta[1] * log_buyers
+    residual = repeat_share - predicted
+    diagnostics = {
+        "intercept": float(beta[0]),
+        "log_unique_buyers_slope": float(beta[1]),
+        "raw_repeat_share_popularity_spearman": _spearman(
+            repeat_share, unique_buyers
+        ),
+        "controlled_repeat_share_popularity_spearman": _spearman(
+            residual, unique_buyers
+        ),
+        "raw_repeat_share_mean": float(np.mean(repeat_share[valid])),
+        "controlled_repeat_share_mean": float(np.mean(residual[valid])),
+        "controlled_repeat_share_std": float(np.std(residual[valid])),
+        "n_fitted_items": int(valid.sum()),
+    }
+    return residual.astype(np.float32), diagnostics
+
+
 def build_dual_item_profiles(
-    train: pd.DataFrame, n_items: int, is_date: bool
+    train: pd.DataFrame,
+    n_items: int,
+    is_date: bool,
+    *,
+    repeat_share_mode: str = "raw",
 ) -> DualItemProfile:
     required = {"u_idx", "i_idx", "cat_idx", "t", "up", "v"}
     missing = required.difference(train.columns)
@@ -122,6 +188,22 @@ def build_dual_item_profiles(
     item["repeat_share"] = (
         pairs.gt(1).groupby(level="i_idx").mean().reindex(item.index, fill_value=0.0)
     )
+    controlled_repeat_share, repeat_share_diagnostics = (
+        popularity_controlled_repeat_share(
+            item.repeat_share.to_numpy(dtype=float),
+            item.users.to_numpy(dtype=float),
+        )
+    )
+    if repeat_share_mode == "raw":
+        repeat_share_feature = item.repeat_share.to_numpy(dtype=float)
+        repeat_share_name = "repeat_purchase_share"
+    elif repeat_share_mode == "popularity_controlled":
+        repeat_share_feature = controlled_repeat_share
+        repeat_share_name = "popularity_controlled_repeat_purchase_share"
+    else:
+        raise ValueError(
+            "repeat_share_mode은 'raw' 또는 'popularity_controlled'이어야 합니다"
+        )
 
     dated = (
         train[["u_idx", "i_idx", "t"]]
@@ -162,7 +244,10 @@ def build_dual_item_profiles(
     activity_numeric = _standardize(
         np.column_stack(
             [
-                item.repeat_share,
+                repeat_share_feature,
+                # This is the only feature changed by the historical
+                # backtest.  The remaining item/user inputs and model are
+                # intentionally identical.
                 np.log1p(item.repeat_gap),
             ]
         )
@@ -194,7 +279,7 @@ def build_dual_item_profiles(
         value,
         valid_item,
         (
-            "repeat_purchase_share",
+            repeat_share_name,
             "log_median_repeat_gap",
             "repeat_gap_valid",
         ),
@@ -204,6 +289,8 @@ def build_dual_item_profiles(
             "log_mean_unit_price",
             "mean_transaction_value_share",
         ),
+        repeat_share_mode,
+        repeat_share_diagnostics,
     )
 
 

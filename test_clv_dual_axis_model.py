@@ -77,6 +77,29 @@ def test_item_axes_have_disjoint_named_features():
     assert np.isfinite(profile.value).all()
 
 
+def test_popularity_control_changes_only_repeat_share_item_feature():
+    from clv_dual_axis_model import build_dual_item_profiles
+
+    raw = build_dual_item_profiles(
+        _train(), n_items=4, is_date=False, repeat_share_mode="raw"
+    )
+    controlled = build_dual_item_profiles(
+        _train(),
+        n_items=4,
+        is_date=False,
+        repeat_share_mode="popularity_controlled",
+    )
+
+    assert controlled.activity_names[0] == (
+        "popularity_controlled_repeat_purchase_share"
+    )
+    assert not np.array_equal(raw.activity[:, 0], controlled.activity[:, 0])
+    np.testing.assert_array_equal(raw.activity[:, 1:], controlled.activity[:, 1:])
+    np.testing.assert_array_equal(raw.value, controlled.value)
+    np.testing.assert_array_equal(raw.valid_item, controlled.valid_item)
+    assert controlled.repeat_share_diagnostics["n_fitted_items"] == 4
+
+
 def test_dual_model_freezes_m1_and_lambda_zero_is_exact_base():
     from clv_dual_axis_model import (
         CLVDualAxisEmbeddingModel,
