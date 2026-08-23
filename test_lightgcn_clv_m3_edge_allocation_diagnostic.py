@@ -3,6 +3,8 @@ import pandas as pd
 import pytest
 
 import lightgcn_clv_m3_edge_allocation_diagnostic as diagnostic
+import lightgcn_clv_axis_specific_behavior_diagnostic as common
+import lightgcn_clv_v3 as v3
 
 
 def test_intervention_table_measures_edge_ratio_and_item_dispersion():
@@ -136,3 +138,23 @@ def test_preflight_forbids_training_and_final_test(tmp_path):
         diagnostic.configure_m3_edge_allocation_diagnostic(
             out_dir=str(tmp_path / "results_m3_final_test")
         )
+
+
+def test_numeric_day_item_traits_ignore_stale_date_schema(monkeypatch):
+    train = pd.DataFrame(
+        {
+            "u_idx": [0, 0],
+            "i_idx": [0, 0],
+            "t": [1.0, 3.0],
+            "i_raw": ["i0", "i0"],
+            "cat_raw": ["c", "c"],
+            "up": [2.0, 2.0],
+            "v": [2.0, 2.0],
+            "b_raw": ["b1", "b2"],
+        }
+    )
+    # Historical runner passes the Dunnhumby schema locally, while the global
+    # schema can have been restored to H&M. Actual time dtype must be authoritative.
+    monkeypatch.setattr(v3, "DCFG", v3.SCHEMA["hm"])
+    traits = common._raw_item_traits(train, n_items=1)
+    assert traits.loc[0, "median_repeat_gap"] == 2.0

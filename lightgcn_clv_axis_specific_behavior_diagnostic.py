@@ -367,7 +367,7 @@ def _raw_item_traits(train: pd.DataFrame, n_items: int) -> pd.DataFrame:
         ["u_idx", "i_idx", "t"]
     )
     gap = dated.groupby(["u_idx", "i_idx"], sort=False)["t"].diff()
-    if v3.DCFG["is_date"]:
+    if pd.api.types.is_timedelta64_dtype(gap.dtype):
         gap = gap.dt.total_seconds() / 86400.0
     dated = dated.assign(_gap=np.asarray(gap, dtype=float))
     repeat_gap = dated.groupby("i_idx", sort=False)["_gap"].median()
