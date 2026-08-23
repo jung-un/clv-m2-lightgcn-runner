@@ -142,36 +142,43 @@ def preflight_summary(cfg: M3EdgeAllocationBacktestConfig) -> dict:
 
 
 def _base_config(cfg: M3EdgeAllocationBacktestConfig) -> dict:
-    base = dict(
-        v3.configure_run(
-            cfg.dataset,
-            out_dir=cfg.out_dir,
-            ARCH="pref_only",
-            SEED_LIST=[cfg.seed],
-            WINDOW_DAYS=None,
-            TIME_CUTOFF=cfg.time_cutoff,
-            TRAIN_ON_VAL=True,
-            VAL_DAYS=7,
-            TEST_DAYS=cfg.evaluation_days,
-            HOLDOUT_DAYS=0,
-            EVAL_TEST=True,
-            EVAL_HOLDOUT=False,
-            GRAPH_MODE="binary",
-            LOSS_MODE="plain",
-            NEG_MODE="uniform",
-            GATE_MODE="none",
-            MIN_USER_INTER=1,
-            MIN_ITEM_INTER=1,
-            DIM=cfg.dim,
-            N_LAYERS=cfg.n_layers,
-            BATCH_SIZE=cfg.batch_size,
-            LR=cfg.lr,
-            PREF_REG=cfg.pref_reg,
-            EPOCHS=cfg.epochs,
-            EARLY_STOP=cfg.epochs,
-            REPORT_LEGACY_VALUE_FEATURES=False,
+    previous_cfg = dict(v3.CFG)
+    previous_dcfg = v3.DCFG
+    try:
+        base = dict(
+            v3.configure_run(
+                cfg.dataset,
+                out_dir=cfg.out_dir,
+                ARCH="pref_only",
+                SEED_LIST=[cfg.seed],
+                WINDOW_DAYS=None,
+                TIME_CUTOFF=cfg.time_cutoff,
+                TRAIN_ON_VAL=True,
+                VAL_DAYS=7,
+                TEST_DAYS=cfg.evaluation_days,
+                HOLDOUT_DAYS=0,
+                EVAL_TEST=True,
+                EVAL_HOLDOUT=False,
+                GRAPH_MODE="binary",
+                LOSS_MODE="plain",
+                NEG_MODE="uniform",
+                GATE_MODE="none",
+                MIN_USER_INTER=1,
+                MIN_ITEM_INTER=1,
+                DIM=cfg.dim,
+                N_LAYERS=cfg.n_layers,
+                BATCH_SIZE=cfg.batch_size,
+                LR=cfg.lr,
+                PREF_REG=cfg.pref_reg,
+                EPOCHS=cfg.epochs,
+                EARLY_STOP=cfg.epochs,
+                REPORT_LEGACY_VALUE_FEATURES=False,
+            )
         )
-    )
+    finally:
+        v3.CFG.clear()
+        v3.CFG.update(previous_cfg)
+        v3.DCFG = previous_dcfg
     required = {
         "TIME_CUTOFF": 690,
         "TRAIN_ON_VAL": True,
@@ -215,7 +222,7 @@ def _prepare(cfg: M3EdgeAllocationBacktestConfig) -> dict:
     input_hash = moe.manifest_hash(manifest)
     revision = moe.source_revision()
     base_cfg = _base_config(cfg)
-    data = v3.prepare_data(base_cfg, v3.DCFG)
+    data = v3.prepare_data(base_cfg, v3.SCHEMA[cfg.dataset])
     if set(data["splits"]) != {"test"}:
         raise RuntimeError(f"historical evaluation contamination: {data['splits']}")
     if float(data["train"]["t"].max()) != 683.0:

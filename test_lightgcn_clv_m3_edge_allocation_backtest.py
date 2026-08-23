@@ -2,6 +2,7 @@ import pandas as pd
 import pytest
 
 import lightgcn_clv_m3_edge_allocation_backtest as pilot
+import lightgcn_clv_v3 as v3
 
 
 def test_pilot_is_locked_to_historical_seed42_without_selection(tmp_path):
@@ -21,6 +22,8 @@ def test_pilot_is_locked_to_historical_seed42_without_selection(tmp_path):
 
 
 def test_base_config_preserves_m3_boundaries(tmp_path):
+    previous_cfg = dict(v3.CFG)
+    previous_dcfg = v3.DCFG
     cfg = pilot.configure_m3_edge_allocation_backtest(out_dir=str(tmp_path))
     base = pilot._base_config(cfg)
     assert base["TIME_CUTOFF"] == 690
@@ -33,6 +36,8 @@ def test_base_config_preserves_m3_boundaries(tmp_path):
     assert base["LOSS_MODE"] == "plain"
     assert base["NEG_MODE"] == "uniform"
     assert base["MIN_USER_INTER"] == base["MIN_ITEM_INTER"] == 1
+    assert v3.CFG == previous_cfg
+    assert v3.DCFG is previous_dcfg
 
 
 @pytest.mark.parametrize(
