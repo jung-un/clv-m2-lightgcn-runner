@@ -80,12 +80,12 @@ def build_clv_profile_item_graph(
     normalized = ppmi / row_mass[:, None]
     rows, cols = np.nonzero(normalized)
     values = normalized[rows, cols].astype(np.float32)
-    operator = torch.sparse_coo_tensor(
-        torch.from_numpy(np.stack([rows, cols])).long(),
-        torch.from_numpy(values),
-        size=(n_profile_bins, n_items),
-        check_invariants=True,
-    ).coalesce()
+    with torch.sparse.check_sparse_tensor_invariants():
+        operator = torch.sparse_coo_tensor(
+            torch.from_numpy(np.stack([rows, cols])).long(),
+            torch.from_numpy(values),
+            size=(n_profile_bins, n_items),
+        ).coalesce()
 
     diagnostics = {
         "definition": {
