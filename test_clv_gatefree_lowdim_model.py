@@ -23,7 +23,13 @@ def _adj(n_users=3, n_items=4):
     return torch.sparse_coo_tensor(indices, norm, raw.shape).coalesce()
 
 
-def _model(layers=1, axis_budget=0.1, training_axis_balance_delta=0.0):
+def _model(
+    layers=1,
+    axis_budget=0.1,
+    training_axis_balance_delta=0.0,
+    independent_item_axes=False,
+    axis_keep_probability=1.0,
+):
     return GateFreeLowDimNVLightGCN(
         n_users=3,
         n_items=4,
@@ -44,6 +50,8 @@ def _model(layers=1, axis_budget=0.1, training_axis_balance_delta=0.0):
         n_layers=layers,
         axis_budget=axis_budget,
         training_axis_balance_delta=training_axis_balance_delta,
+        independent_item_axes=independent_item_axes,
+        axis_keep_probability=axis_keep_probability,
         pref_reg=1e-4,
     )
 
@@ -180,3 +188,121 @@ def test_evaluation_embeddings_do_not_apply_training_perturbation():
 
     torch.testing.assert_close(perturbed_user, plain_user)
     torch.testing.assert_close(perturbed_item, plain_item)
+
+
+def test_independent_item_axes_do_not_route_axis_gradients_into_id_item_table():
+    model = _model(layers=0, independent_item_axes=True)
+    _, item = model.layer0_embeddings()
+
+    item[:, model.id_dim :].sum().backward()
+
+    assert (
+        model.E_i.weight.grad is None
+        or model.E_i.weight.grad.abs().sum() == 0
+    )
+    assert model.activity_item_embedding.weight.grad.abs().sum() > 0
+    assert model.value_item_embedding.weight.grad.abs().sum() > 0
+
+
+def test_training_block_dropout_uses_independent_inverted_axis_masks():
+    model = _model(
+        layers=1,
+        independent_item_axes=True,
+        axis_keep_probability=0.5,
+    )
+    users = torch.tensor([0, 1])
+    positives = torch.tensor([0, 2])
+    negatives = torch.tensor([3, 0])
+    model.train()
+
+    torch.manual_seed(123)
+    rng_state = torch.get_rng_state()
+    loss, diagnostics = model.bpr_loss(
+        users, positives, negatives, None, 0.0, None
+    )
+
+    user, item = model.propagate()
+    id_end = model.id_dim
+    activity_end = id_end + model.axis_dim
+
+    def components(item_ids):
+        selected_user = user[users]
+        selected_item = item[item_ids]
+        return (
+            (selected_user[:, :id_end] * selected_item[:, :id_end]).sum(1),
+            (
+                selected_user[:, id_end:activity_end]
+                * selected_item[:, id_end:activity_end]
+            ).sum(1),
+            (
+                selected_user[:, activity_end:]
+                * selected_item[:, activity_end:]
+            ).sum(1),
+        )
+
+    positive = components(positives)
+    negative = components(negatives)
+    torch.set_rng_state(rng_state)
+    keep_probability = 0.5
+    activity_multiplier = (
+        torch.rand_like(positive[0]) < keep_probability
+    ).float() / keep_probability
+    value_multiplier = (
+        torch.rand_like(positive[0]) < keep_probability
+    ).float() / keep_probability
+    positive_score = (
+        positive[0]
+        + activity_multiplier * positive[1]
+        + value_multiplier * positive[2]
+    )
+    negative_score = (
+        negative[0]
+        + activity_multiplier * negative[1]
+        + value_multiplier * negative[2]
+    )
+    expected = -torch.nn.functional.logsigmoid(
+        positive_score - negative_score
+    ).mean() + model.batch_l2(users, positives, negatives)
+
+    torch.testing.assert_close(loss, expected)
+    assert diagnostics["axis_keep_probability"] == pytest.approx(0.5)
+    assert diagnostics["activity_axis_active_share"] == pytest.approx(
+        float((activity_multiplier > 0).float().mean())
+    )
+    assert diagnostics["value_axis_active_share"] == pytest.approx(
+        float((value_multiplier > 0).float().mean())
+    )
+
+
+def test_evaluation_loss_keeps_both_axes_active_with_block_dropout_configured():
+    model = _model(
+        layers=1,
+        independent_item_axes=True,
+        axis_keep_probability=0.5,
+    )
+    users = torch.tensor([0, 1])
+    positives = torch.tensor([0, 2])
+    negatives = torch.tensor([3, 0])
+    model.eval()
+
+    loss, diagnostics = model.bpr_loss(
+        users, positives, negatives, None, 0.0, None
+    )
+    user, item = model.propagate()
+    positive_score = (user[users] * item[positives]).sum(1)
+    negative_score = (user[users] * item[negatives]).sum(1)
+    expected = -torch.nn.functional.logsigmoid(
+        positive_score - negative_score
+    ).mean() + model.batch_l2(users, positives, negatives)
+
+    torch.testing.assert_close(loss, expected)
+    assert diagnostics["activity_axis_active_share"] == pytest.approx(1.0)
+    assert diagnostics["value_axis_active_share"] == pytest.approx(1.0)
+
+
+def test_balance_perturbation_and_block_dropout_cannot_be_combined():
+    with pytest.raises(ValueError, match="동시에"):
+        _model(
+            training_axis_balance_delta=0.3,
+            axis_keep_probability=0.5,
+        )

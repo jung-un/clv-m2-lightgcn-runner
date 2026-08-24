@@ -59,6 +59,8 @@ class GateFreeLowDimNVLightGCN(nn.Module):
         n_layers: int = 2,
         axis_budget: float = 0.1,
         training_axis_balance_delta: float = 0.0,
+        independent_item_axes: bool = False,
+        axis_keep_probability: float = 1.0,
         pref_reg: float = 1e-3,
     ):
         super().__init__()
@@ -74,6 +76,10 @@ class GateFreeLowDimNVLightGCN(nn.Module):
             raise ValueError(
                 "training_axis_balance_delta는 0 이상 1 미만이어야 합니다"
             )
+        if not 0.0 < axis_keep_probability <= 1.0:
+            raise ValueError("axis_keep_probability는 0보다 크고 1 이하여야 합니다")
+        if training_axis_balance_delta > 0 and axis_keep_probability < 1.0:
+            raise ValueError("축 균형 교란과 축 블록 dropout은 동시에 사용할 수 없습니다")
 
         user_activity = np.asarray(user_activity, dtype=np.float32)
         user_value = np.asarray(user_value, dtype=np.float32)
@@ -96,6 +102,8 @@ class GateFreeLowDimNVLightGCN(nn.Module):
         self.n_layers = int(n_layers)
         self.axis_budget = float(axis_budget)
         self.training_axis_balance_delta = float(training_axis_balance_delta)
+        self.independent_item_axes = bool(independent_item_axes)
+        self.axis_keep_probability = float(axis_keep_probability)
         self.pref_reg = float(pref_reg)
 
         self.E_u = nn.Embedding(n_users, id_dim)
@@ -110,10 +118,18 @@ class GateFreeLowDimNVLightGCN(nn.Module):
         self.value_user = _UserAxisEncoder(
             user_value.shape[1], hidden_dim, residual_dim
         )
-        self.activity_item = nn.Linear(id_dim, axis_dim, bias=False)
-        self.value_item = nn.Linear(id_dim, axis_dim, bias=False)
-        nn.init.normal_(self.activity_item.weight, std=0.02)
-        nn.init.normal_(self.value_item.weight, std=0.02)
+        if self.independent_item_axes:
+            # N/V item coordinates are not projections of the shared ID table.
+            # They are still learned jointly by the same BPR loss and optimizer.
+            self.activity_item_embedding = nn.Embedding(n_items, axis_dim)
+            self.value_item_embedding = nn.Embedding(n_items, axis_dim)
+            nn.init.normal_(self.activity_item_embedding.weight, std=0.02)
+            nn.init.normal_(self.value_item_embedding.weight, std=0.02)
+        else:
+            self.activity_item = nn.Linear(id_dim, axis_dim, bias=False)
+            self.value_item = nn.Linear(id_dim, axis_dim, bias=False)
+            nn.init.normal_(self.activity_item.weight, std=0.02)
+            nn.init.normal_(self.value_item.weight, std=0.02)
 
         self.register_buffer("user_activity", torch.from_numpy(user_activity.copy()))
         self.register_buffer("user_value", torch.from_numpy(user_value.copy()))
@@ -159,10 +175,15 @@ class GateFreeLowDimNVLightGCN(nn.Module):
             self.user_value_valid,
             self.value_user,
         )
-        # Item responses are learned from item identity by the same BPR loss;
-        # no RepeatShare, degree, price, category, or transaction-value input.
-        item_n = torch.tanh(self.activity_item(self.E_i.weight))
-        item_v = torch.tanh(self.value_item(self.E_i.weight))
+        # Item responses receive no RepeatShare, degree, price, category, or
+        # transaction-value input.  The independent option prevents N/V axis
+        # gradients from changing the shared ID item table through a projection.
+        if self.independent_item_axes:
+            item_n = torch.tanh(self.activity_item_embedding.weight)
+            item_v = torch.tanh(self.value_item_embedding.weight)
+        else:
+            item_n = torch.tanh(self.activity_item(self.E_i.weight))
+            item_v = torch.tanh(self.value_item(self.E_i.weight))
         scale = float(np.sqrt(self.axis_budget))
         user = torch.cat([self.E_u.weight, scale * user_n, scale * user_v], dim=1)
         item = torch.cat([self.E_i.weight, scale * item_n, scale * item_v], dim=1)
@@ -217,17 +238,27 @@ class GateFreeLowDimNVLightGCN(nn.Module):
 
         positive_id, positive_activity, positive_value = components(positives)
         negative_id, negative_activity, negative_value = components(negatives)
-        if self.training and self.training_axis_balance_delta > 0:
+        if self.training and self.axis_keep_probability < 1.0:
+            activity_multiplier = (
+                torch.rand_like(positive_id) < self.axis_keep_probability
+            ).to(positive_id.dtype) / self.axis_keep_probability
+            value_multiplier = (
+                torch.rand_like(positive_id) < self.axis_keep_probability
+            ).to(positive_id.dtype) / self.axis_keep_probability
+            epsilon = torch.zeros_like(positive_id)
+        elif self.training and self.training_axis_balance_delta > 0:
             epsilon = (
                 torch.rand_like(positive_id) * 2.0 - 1.0
             ) * self.training_axis_balance_delta
+            activity_multiplier = 1.0 + epsilon
+            value_multiplier = 1.0 - epsilon
         else:
             epsilon = torch.zeros_like(positive_id)
-        activity_multiplier = 1.0 + epsilon
-        value_multiplier = 1.0 - epsilon
-        # The same epsilon is used for the positive and negative item of each
-        # BPR triplet.  Only the relative N/V balance changes; the total axis
-        # budget remains constant and both axes stay strictly positive.
+            activity_multiplier = torch.ones_like(positive_id)
+            value_multiplier = torch.ones_like(positive_id)
+        # Each triplet uses the same axis multipliers for its positive and
+        # negative item, so the training intervention changes the pairwise
+        # contribution of an entire axis instead of creating label leakage.
         positive_score = (
             positive_id
             + activity_multiplier * positive_activity
@@ -245,6 +276,13 @@ class GateFreeLowDimNVLightGCN(nn.Module):
                 "bpr": float(bpr),
                 "objective": "plain_bpr",
                 "training_axis_balance_delta": self.training_axis_balance_delta,
+                "axis_keep_probability": self.axis_keep_probability,
+                "activity_axis_active_share": float(
+                    (activity_multiplier > 0).float().mean()
+                ),
+                "value_axis_active_share": float(
+                    (value_multiplier > 0).float().mean()
+                ),
                 "axis_balance_epsilon_mean": float(epsilon.mean()),
                 "axis_balance_epsilon_std": float(
                     epsilon.std(unbiased=False)
@@ -258,17 +296,24 @@ class GateFreeLowDimNVLightGCN(nn.Module):
     @torch.no_grad()
     def representation_diagnostics(self) -> dict:
         user0, item0 = self.layer0_embeddings()
+        if self.axis_keep_probability < 1.0:
+            training_multiplier_range = [
+                0.0,
+                1.0 / self.axis_keep_probability,
+            ]
+        else:
+            training_multiplier_range = [
+                1.0 - self.training_axis_balance_delta,
+                1.0 + self.training_axis_balance_delta,
+            ]
         return {
             "axis_budget": self.axis_budget,
             "training_axis_balance_delta": self.training_axis_balance_delta,
-            "training_activity_multiplier_range": [
-                1.0 - self.training_axis_balance_delta,
-                1.0 + self.training_axis_balance_delta,
-            ],
-            "training_value_multiplier_range": [
-                1.0 - self.training_axis_balance_delta,
-                1.0 + self.training_axis_balance_delta,
-            ],
+            "independent_item_axes": self.independent_item_axes,
+            "axis_keep_probability": self.axis_keep_probability,
+            "training_axis_block_dropout": self.axis_keep_probability < 1.0,
+            "training_activity_multiplier_range": training_multiplier_range,
+            "training_value_multiplier_range": training_multiplier_range,
             "evaluation_activity_multiplier": 1.0,
             "evaluation_value_multiplier": 1.0,
             "total_dim": self.total_dim,
