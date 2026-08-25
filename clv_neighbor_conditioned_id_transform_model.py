@@ -174,9 +174,11 @@ class CLVNeighborConditionedIDTransformLightGCN(nn.Module):
             + self.E_i.weight[positives].pow(2).sum()
             + self.E_i.weight[negatives].pow(2).sum()
         ) / len(users)
-        # This is the same existing L2 term, extended symmetrically to the
-        # newly introduced transformation parameters; it is not a new loss.
-        return self.pref_reg * (sampled_id_l2 + self._transform_l2())
+        # Keep M1's sampled-ID regularisation unchanged.  The two global
+        # low-rank transforms are already restricted by rank, fixed rho and
+        # norm preservation; applying their full Frobenius norm every batch
+        # collapsed both corrections to the zero map in the first screen.
+        return self.pref_reg * sampled_id_l2
 
     def bpr_loss(self, users, positives, negatives, gate=None, lam=0.0, weights=None):
         if weights is not None:
@@ -200,11 +202,49 @@ class CLVNeighborConditionedIDTransformLightGCN(nn.Module):
         return loss, diagnostics
 
     @torch.no_grad()
+    def training_gradient_diagnostics(self) -> dict:
+        def gradient_norm(parameter: torch.Tensor) -> float:
+            if parameter.grad is None:
+                return 0.0
+            return float(parameter.grad.norm())
+
+        return {
+            "activity_down_gradient_norm": gradient_norm(
+                self.activity_transform.down.weight
+            ),
+            "activity_up_gradient_norm": gradient_norm(
+                self.activity_transform.up.weight
+            ),
+            "value_down_gradient_norm": gradient_norm(
+                self.value_transform.down.weight
+            ),
+            "value_up_gradient_norm": gradient_norm(
+                self.value_transform.up.weight
+            ),
+        }
+
+    @torch.no_grad()
+    def epoch_training_diagnostics(self) -> dict:
+        diagnostics = self.representation_diagnostics()
+        keys = (
+            "activity_correction_mean_norm",
+            "value_correction_mean_norm",
+            "activity_effective_ratio_to_id",
+            "value_effective_ratio_to_id",
+            "activity_transform_norm",
+            "value_transform_norm",
+            "transform_l2",
+            "mean_user_representation_change",
+        )
+        return {key: diagnostics[key] for key in keys}
+
+    @torch.no_grad()
     def representation_diagnostics(self) -> dict:
         user0, item0 = self.layer0_embeddings()
         base = self.E_u.weight
         shared = self.purchase_neighbour_expression()
         activity, value = self.axis_corrections()
+        base_mean_norm = base.norm(dim=1).mean().clamp_min(1e-12)
 
         def valid_mean(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
             selected = values[valid.bool()]
@@ -236,6 +276,12 @@ class CLVNeighborConditionedIDTransformLightGCN(nn.Module):
             "purchase_neighbour_mean_norm": float(shared.norm(dim=1).mean()),
             "activity_correction_mean_norm": float(activity.norm(dim=1).mean()),
             "value_correction_mean_norm": float(value.norm(dim=1).mean()),
+            "activity_effective_ratio_to_id": float(
+                self.rho * activity.norm(dim=1).mean() / base_mean_norm
+            ),
+            "value_effective_ratio_to_id": float(
+                self.rho * value.norm(dim=1).mean() / base_mean_norm
+            ),
             "activity_correction_population_mean_abs": float(
                 valid_mean(activity, self.user_activity_valid).abs().max()
             ),

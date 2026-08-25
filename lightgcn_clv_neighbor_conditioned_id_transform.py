@@ -20,8 +20,10 @@ import lightgcn_clv_moe as moe
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m2-neighbor-conditioned-id-transform-historical-screen-v1"
+CODE_VERSION = "m2-neighbor-conditioned-id-transform-historical-screen-v2"
 MODEL_ID = "m2_neighbor_conditioned_id_transform"
+MIN_EFFECTIVE_CORRECTION_RATIO = 1e-6
+MIN_MEAN_USER_REPRESENTATION_CHANGE = 1e-8
 
 
 @dataclass(frozen=True)
@@ -53,7 +55,7 @@ def configure_neighbor_conditioned_id_transform_run(
     defaults = {
         "out_dir": (
             f"{v3.default_out_dir('dunnhumby')}"
-            "_m2_neighbor_conditioned_id_transform_historical_screen_v1"
+            "_m2_neighbor_conditioned_id_transform_historical_screen_v2"
         ),
         "baseline_result_dir": (
             f"{v3.default_out_dir('dunnhumby')}"
@@ -127,7 +129,17 @@ def preflight_summary(cfg: NeighborConditionedIDTransformConfig) -> dict:
             "zero_transform_initialisation": True,
             "population_mean_correction_removed": True,
             "correction_source": "same_binary_graph_one_hop_item_ID_aggregate",
-            "existing_l2_extended_to_transforms": True,
+            "existing_l2_extended_to_transforms": False,
+            "transform_regularization": "none",
+            "epoch_liveness_diagnostics": True,
+            "liveness_fail_closed": {
+                "min_max_effective_correction_ratio": (
+                    MIN_EFFECTIVE_CORRECTION_RATIO
+                ),
+                "min_mean_user_representation_change": (
+                    MIN_MEAN_USER_REPRESENTATION_CHANGE
+                ),
+            },
         },
         "fixed": {
             "graph": "binary",
@@ -213,6 +225,29 @@ def _arm_hash(prepared: dict, cfg: NeighborConditionedIDTransformConfig) -> str:
     ).hexdigest()[:12]
 
 
+def _liveness_reading(diagnostics: dict) -> dict:
+    activity_ratio = float(diagnostics["activity_effective_ratio_to_id"])
+    value_ratio = float(diagnostics["value_effective_ratio_to_id"])
+    representation_change = float(
+        diagnostics["mean_user_representation_change"]
+    )
+    passed = bool(
+        max(activity_ratio, value_ratio) >= MIN_EFFECTIVE_CORRECTION_RATIO
+        and representation_change >= MIN_MEAN_USER_REPRESENTATION_CHANGE
+    )
+    return {
+        "passed": passed,
+        "status": "active_correction_path" if passed else "collapsed_correction_path",
+        "activity_effective_ratio_to_id": activity_ratio,
+        "value_effective_ratio_to_id": value_ratio,
+        "mean_user_representation_change": representation_change,
+        "min_max_effective_correction_ratio": MIN_EFFECTIVE_CORRECTION_RATIO,
+        "min_mean_user_representation_change": (
+            MIN_MEAN_USER_REPRESENTATION_CHANGE
+        ),
+    }
+
+
 def _run_model(prepared: dict, cfg: NeighborConditionedIDTransformConfig) -> dict:
     root = prepared["out_dir"] / "arms" / prepared["config_hash"]
     result_path = root / f"{MODEL_ID}_s{cfg.seed}.json"
@@ -237,6 +272,13 @@ def _run_model(prepared: dict, cfg: NeighborConditionedIDTransformConfig) -> dic
         model, params, prepared, cfg, MODEL_ID, cfg.seed, store
     )
     model.eval()
+    diagnostics = model.representation_diagnostics()
+    liveness = _liveness_reading(diagnostics)
+    if not liveness["passed"]:
+        raise RuntimeError(
+            "N/V correction path collapsed below the predeclared numerical "
+            f"liveness floor: {liveness}"
+        )
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = checkpoint_path.with_suffix(".pt.tmp")
     torch.save(
@@ -267,7 +309,8 @@ def _run_model(prepared: dict, cfg: NeighborConditionedIDTransformConfig) -> dic
         "split": "historical_development_days_684_690",
         "final_epoch": cfg.epochs,
         "metrics": test10._public_metrics(metrics),
-        "diagnostics": model.representation_diagnostics(),
+        "diagnostics": diagnostics,
+        "liveness": liveness,
         "training": training,
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": file_sha256(checkpoint_path),
@@ -308,6 +351,8 @@ def _comparison(frame: pd.DataFrame) -> pd.DataFrame:
         "purchase_neighbour_mean_norm",
         "activity_correction_mean_norm",
         "value_correction_mean_norm",
+        "activity_effective_ratio_to_id",
+        "value_effective_ratio_to_id",
         "activity_correction_population_mean_abs",
         "value_correction_population_mean_abs",
         "activity_transform_norm",

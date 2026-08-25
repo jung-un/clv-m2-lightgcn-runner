@@ -161,7 +161,24 @@ def test_one_plain_bpr_jointly_trains_id_items_and_both_transforms():
     assert model.value_transform.down.weight.grad.abs().sum() > 0
 
 
-def test_existing_l2_regularises_transform_parameters_too():
+def test_liveness_diagnostics_report_gradient_and_effective_correction_ratios():
+    model = _model(layers=1)
+    users = torch.tensor([0, 2])
+    positives = torch.tensor([0, 3])
+    negatives = torch.tensor([2, 1])
+
+    loss, _ = model.bpr_loss(users, positives, negatives, None, 0.0, None)
+    loss.backward()
+    gradients = model.training_gradient_diagnostics()
+    representation = model.representation_diagnostics()
+
+    assert gradients["activity_up_gradient_norm"] > 0
+    assert gradients["value_up_gradient_norm"] > 0
+    assert representation["activity_effective_ratio_to_id"] >= 0
+    assert representation["value_effective_ratio_to_id"] >= 0
+
+
+def test_existing_l2_regularises_sampled_id_but_not_transform_parameters():
     model = _model(layers=0)
     users = torch.tensor([0, 2])
     positives = torch.tensor([0, 3])
@@ -170,9 +187,13 @@ def test_existing_l2_regularises_transform_parameters_too():
     with torch.no_grad():
         model.activity_transform.up.weight.fill_(2.0)
         model.value_transform.up.weight.fill_(2.0)
-    after = model.batch_l2(users, positives, negatives)
+    after_transform_change = model.batch_l2(users, positives, negatives)
+    with torch.no_grad():
+        model.E_u.weight[users] = model.E_u.weight[users] * 2.0
+    after_id_change = model.batch_l2(users, positives, negatives)
 
-    assert after > before
+    torch.testing.assert_close(after_transform_change, before)
+    assert after_id_change > after_transform_change
 
 
 def test_m3_m4_and_external_score_interventions_are_rejected():

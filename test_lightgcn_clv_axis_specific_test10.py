@@ -2,8 +2,32 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 import lightgcn_clv_axis_specific_test10 as final10
+
+
+class _DiagnosticModel:
+    def epoch_training_diagnostics(self):
+        return {
+            "correction_ratio": torch.tensor(0.125),
+            "active": True,
+        }
+
+
+def test_optional_epoch_diagnostics_are_flattened_to_plain_scalars():
+    diagnostics = final10._optional_model_diagnostics(
+        _DiagnosticModel(), "epoch_training_diagnostics"
+    )
+
+    assert diagnostics == {
+        "correction_ratio": pytest.approx(0.125),
+        "active": True,
+    }
+
+
+def test_optional_epoch_diagnostics_are_a_noop_for_other_models():
+    assert final10._optional_model_diagnostics(object(), "missing") == {}
 
 
 def test_final_protocol_is_locked_to_ten_paired_seeds_and_four_models(tmp_path):

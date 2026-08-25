@@ -370,6 +370,27 @@ def _progress_store(
     )
 
 
+def _optional_model_diagnostics(model, method_name: str) -> dict:
+    """Read optional model diagnostics without coupling the shared trainer."""
+
+    method = getattr(model, method_name, None)
+    if method is None:
+        return {}
+    values = method()
+    if not isinstance(values, dict):
+        raise TypeError(f"{method_name}() must return a dict")
+    result = {}
+    for key, value in values.items():
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise ValueError(f"diagnostic {key!r} must be scalar")
+            value = value.detach().cpu().item()
+        elif isinstance(value, np.generic):
+            value = value.item()
+        result[str(key)] = value
+    return result
+
+
 def _fixed_epoch_train(
     model,
     params,
@@ -414,6 +435,7 @@ def _fixed_epoch_train(
         epoch_started = time.time()
         permutation = rng.permutation(n_train)
         loss_sum = bpr_sum = correct_sum = 0.0
+        gradient_diagnostics = {}
         for batch in range(n_batches):
             index = permutation[
                 batch * cfg.batch_size : (batch + 1) * cfg.batch_size
@@ -439,6 +461,10 @@ def _fixed_epoch_train(
             )
             optimizer.zero_grad()
             loss.backward()
+            if batch == 0:
+                gradient_diagnostics = _optional_model_diagnostics(
+                    model, "training_gradient_diagnostics"
+                )
             optimizer.step()
             loss_sum += float(loss)
             bpr_sum += float(diagnostics["bpr"])
@@ -460,6 +486,10 @@ def _fixed_epoch_train(
             "p_correct": correct_sum / n_batches,
             "epoch_sec": time.time() - epoch_started,
         }
+        record.update(gradient_diagnostics)
+        record.update(
+            _optional_model_diagnostics(model, "epoch_training_diagnostics")
+        )
         if (
             isinstance(model, JointNVLightGCN)
             and model.activity_axis_weight is not None
@@ -491,6 +521,13 @@ def _fixed_epoch_train(
             f"  [{model_id} s{seed}] ep {epoch:3d}/{cfg.epochs} | "
             f"loss {record['loss']:.4f} | P(pos>neg) {record['p_correct']:.3f} | "
             f"{record['epoch_sec']:.0f}s"
+            + (
+                " | correction/id "
+                f"N={record['activity_effective_ratio_to_id']:.2e} "
+                f"V={record['value_effective_ratio_to_id']:.2e}"
+                if "activity_effective_ratio_to_id" in record
+                else ""
+            )
         )
     if last_epoch != cfg.epochs:
         raise RuntimeError(f"고정 100 epoch 미완료: {last_epoch}")

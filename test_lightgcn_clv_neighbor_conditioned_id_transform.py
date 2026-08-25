@@ -25,7 +25,13 @@ def test_preflight_freezes_architecture_and_m2_boundaries(tmp_path):
     assert summary["m2"]["rho"] == pytest.approx(0.05)
     assert summary["m2"]["population_mean_correction_removed"] is True
     assert summary["m2"]["explicit_item_features"] is False
-    assert summary["m2"]["existing_l2_extended_to_transforms"] is True
+    assert summary["m2"]["existing_l2_extended_to_transforms"] is False
+    assert summary["m2"]["transform_regularization"] == "none"
+    assert summary["m2"]["epoch_liveness_diagnostics"] is True
+    assert summary["m2"]["liveness_fail_closed"] == {
+        "min_max_effective_correction_ratio": pytest.approx(1e-6),
+        "min_mean_user_representation_change": pytest.approx(1e-8),
+    }
     assert summary["fixed"]["graph"] == "binary"
     assert summary["fixed"]["negative_sampling"] == "uniform"
     assert summary["fixed"]["sample_weighting"] is False
@@ -70,3 +76,24 @@ def test_unplanned_screen_variants_are_rejected(tmp_path, override, message):
             baseline_result_dir=str(tmp_path / "old"),
             **override,
         )
+
+
+def test_liveness_reading_passes_only_when_correction_changes_representation():
+    alive = runner._liveness_reading(
+        {
+            "activity_effective_ratio_to_id": 2e-4,
+            "value_effective_ratio_to_id": 3e-4,
+            "mean_user_representation_change": 5e-4,
+        }
+    )
+    collapsed = runner._liveness_reading(
+        {
+            "activity_effective_ratio_to_id": 2e-12,
+            "value_effective_ratio_to_id": 3e-12,
+            "mean_user_representation_change": 5e-13,
+        }
+    )
+
+    assert alive["passed"] is True
+    assert collapsed["passed"] is False
+    assert collapsed["status"] == "collapsed_correction_path"
