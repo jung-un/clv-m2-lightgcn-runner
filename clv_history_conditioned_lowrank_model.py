@@ -132,6 +132,8 @@ class CLVHistoryConditionedLowRankLightGCN(nn.Module):
 
     def _conditioned_user_layer0(self) -> torch.Tensor:
         history = self.purchase_history_expression()
+        if self.rho == 0.0:
+            return history
         activity = self.c_n[:, None] * self.activity_transform(history)
         value = self.c_v[:, None] * self.value_transform(history)
         raw = history + self.rho * (activity + value)

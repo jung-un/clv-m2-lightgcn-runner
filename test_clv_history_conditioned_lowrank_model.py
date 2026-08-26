@@ -97,6 +97,22 @@ def test_rho_zero_is_exactly_the_history_only_representation():
     torch.testing.assert_close(item, model.E_i.weight, atol=0, rtol=0)
 
 
+def test_rho_zero_bypasses_conditional_maps_and_norm_rescaling(monkeypatch):
+    class FailIfCalled(torch.nn.Module):
+        def forward(self, values):
+            raise AssertionError("rho=0에서 조건부 변환을 호출하면 안 됩니다")
+
+    model = _model(rho=0.0, layers=0)
+    history = torch.randn(model.n_users, model.embedding_dim)
+    monkeypatch.setattr(model, "purchase_history_expression", lambda: history)
+    model.activity_transform = FailIfCalled()
+    model.value_transform = FailIfCalled()
+
+    user, _ = model.layer0_embeddings()
+
+    assert user is history
+
+
 def test_clv_cannot_create_a_user_direction_without_purchase_history():
     model = _model(layers=0)
     _make_transforms_nonzero(model)
