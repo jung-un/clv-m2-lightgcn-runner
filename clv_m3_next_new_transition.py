@@ -44,6 +44,11 @@ class TransitionGraphs:
     edge_support: sparse.csr_matrix
 
 
+MODEL_GLOBAL = "transition_global"
+MODEL_CLV = "transition_clv"
+MODEL_SHUFFLE = "transition_clv_shuffle"
+
+
 def _require_transaction_columns(transactions: pd.DataFrame) -> None:
     missing = REQUIRED_TRANSACTION_COLUMNS.difference(transactions.columns)
     if missing:
@@ -248,3 +253,234 @@ def build_transition_graphs(
         shuffled_clv_relation=shuffled_relation,
         edge_support=support,
     )
+
+
+def rank_transition_candidates(
+    relation: sparse.csr_matrix,
+    *,
+    last_basket_items: dict[int, np.ndarray],
+    seen_items: dict[int, np.ndarray],
+    eval_users: np.ndarray,
+    top_k: int = 50,
+) -> dict[int, np.ndarray]:
+    """Rank positive transition candidates without any fallback."""
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    relation = relation.tocsr()
+    rankings: dict[int, np.ndarray] = {}
+    for raw_user in np.asarray(eval_users):
+        user = int(raw_user)
+        sources = np.unique(
+            np.asarray(last_basket_items.get(user, []), dtype=np.int64)
+        )
+        if sources.size == 0:
+            rankings[user] = np.empty(0, dtype=np.int32)
+            continue
+        if np.any((sources < 0) | (sources >= relation.shape[0])):
+            raise ValueError(f"last-basket source outside relation: user={user}")
+        scores = np.asarray(relation[sources].sum(axis=0)).ravel() / sources.size
+        seen = np.asarray(seen_items.get(user, []), dtype=np.int64)
+        seen = seen[(seen >= 0) & (seen < relation.shape[1])]
+        scores[seen] = 0.0
+        candidates = np.flatnonzero(scores > 0)
+        if candidates.size:
+            order = np.lexsort((candidates, -scores[candidates]))
+            candidates = candidates[order[:top_k]]
+        rankings[user] = candidates.astype(np.int32, copy=False)
+    return rankings
+
+
+def _discounted_gain(ranked: np.ndarray, truth: set[int], k: int) -> float:
+    if not truth:
+        return 0.0
+    hits = np.fromiter(
+        (int(item) in truth for item in ranked[:k]), dtype=np.float64
+    )
+    if hits.size == 0:
+        return 0.0
+    dcg = float((hits / np.log2(np.arange(2, hits.size + 2))).sum())
+    ideal_size = min(len(truth), k)
+    idcg = float((1.0 / np.log2(np.arange(2, ideal_size + 2))).sum())
+    return dcg / idcg if idcg else 0.0
+
+
+def _exposure_metrics(
+    rankings: dict[int, np.ndarray], *, n_items: int, k: int
+) -> dict[str, float]:
+    exposure = np.zeros(n_items, dtype=np.int64)
+    for ranked in rankings.values():
+        selected = np.asarray(ranked[:k], dtype=np.int64)
+        if selected.size:
+            np.add.at(exposure, selected, 1)
+    positive = exposure[exposure > 0]
+    total = int(positive.sum())
+    if total:
+        probabilities = positive / total
+        entropy = float(-(probabilities * np.log(probabilities)).sum())
+        descending = np.sort(positive)[::-1]
+        top10_share = float(descending[:10].sum() / total)
+        top100_share = float(descending[:100].sum() / total)
+    else:
+        entropy = 0.0
+        top10_share = 0.0
+        top100_share = 0.0
+    return {
+        f"coverage@{k}": float(len(positive) / n_items),
+        f"n_distinct@{k}": int(len(positive)),
+        f"exposure_entropy@{k}": entropy,
+        f"eff_catalog@{k}": float(np.exp(entropy)),
+        f"top10_share@{k}": top10_share,
+        f"top100_share@{k}": top100_share,
+    }
+
+
+def evaluate_transition_ranking(
+    rankings: dict[int, np.ndarray],
+    *,
+    truth: dict[int, np.ndarray],
+    n_items: int,
+    ks: tuple[int, ...] = (10, 20, 50),
+) -> tuple[dict[str, float], pd.DataFrame]:
+    """Evaluate binary new-item truths and return aggregate and per-user rows."""
+    if not truth:
+        raise ValueError("truth must contain at least one evaluation user")
+    rows: list[dict[str, float | int]] = []
+    for user in sorted(truth):
+        truth_set = set(np.asarray(truth[user], dtype=np.int64).tolist())
+        if not truth_set:
+            continue
+        ranked = np.asarray(rankings.get(user, []), dtype=np.int64)
+        row: dict[str, float | int] = {
+            "user_idx": int(user),
+            "n_truth": len(truth_set),
+            "n_positive_candidates": len(ranked),
+        }
+        for k in ks:
+            hits = sum(int(item) in truth_set for item in ranked[:k])
+            row[f"recall@{k}"] = hits / len(truth_set)
+            row[f"ndcg@{k}"] = _discounted_gain(ranked, truth_set, k)
+        rows.append(row)
+    per_user = pd.DataFrame(rows)
+    if per_user.empty:
+        raise ValueError("no nonempty evaluation truths")
+    metrics: dict[str, float] = {
+        "n_eval_users": int(len(per_user)),
+        "mean_positive_candidates": float(per_user.n_positive_candidates.mean()),
+    }
+    for k in ks:
+        metrics[f"recall@{k}"] = float(per_user[f"recall@{k}"].mean())
+        metrics[f"ndcg@{k}"] = float(per_user[f"ndcg@{k}"].mean())
+        metrics.update(_exposure_metrics(rankings, n_items=n_items, k=k))
+    return metrics, per_user
+
+
+def reachable_truth_share(
+    relation: sparse.csr_matrix,
+    *,
+    last_basket_items: dict[int, np.ndarray],
+    seen_items: dict[int, np.ndarray],
+    truth: dict[int, np.ndarray],
+) -> float:
+    """Share of evaluation truths reachable by a positive relation edge."""
+    relation = relation.tocsr()
+    reached = 0
+    total = 0
+    for user, raw_truth in truth.items():
+        truth_items = set(np.asarray(raw_truth, dtype=np.int64).tolist())
+        total += len(truth_items)
+        sources = np.unique(
+            np.asarray(last_basket_items.get(int(user), []), dtype=np.int64)
+        )
+        if sources.size == 0:
+            continue
+        candidates = set(relation[sources].indices.tolist())
+        candidates.difference_update(
+            np.asarray(seen_items.get(int(user), []), dtype=np.int64).tolist()
+        )
+        reached += len(truth_items.intersection(candidates))
+    return reached / total if total else 0.0
+
+
+def decide_pilot(metric_table: pd.DataFrame) -> dict[str, object]:
+    """Apply the six fixed Phase-1 feasibility conditions."""
+    required_models = {MODEL_GLOBAL, MODEL_CLV, MODEL_SHUFFLE}
+    if set(metric_table["model_id"]) != required_models:
+        raise ValueError(f"metric table must contain exactly {sorted(required_models)}")
+    rows = metric_table.set_index("model_id")
+    global_row = rows.loc[MODEL_GLOBAL]
+    clv_row = rows.loc[MODEL_CLV]
+    shuffle_row = rows.loc[MODEL_SHUFFLE]
+
+    accuracy_metrics = [
+        f"{metric}@{k}"
+        for metric in ("recall", "ndcg")
+        for k in (10, 20, 50)
+    ]
+    accuracy_ratios = {
+        metric: (
+            float(clv_row[metric] / global_row[metric])
+            if float(global_row[metric]) != 0
+            else (1.0 if float(clv_row[metric]) == 0 else float("inf"))
+        )
+        for metric in accuracy_metrics
+    }
+    accuracy_guard = all(value >= 0.99 for value in accuracy_ratios.values())
+
+    recall10_cmp = float(clv_row["recall@10"] - global_row["recall@10"])
+    ndcg10_cmp = float(clv_row["ndcg@10"] - global_row["ndcg@10"])
+    shallow_rank_improved = (
+        (recall10_cmp > 0 and ndcg10_cmp > 0)
+        or (recall10_cmp > 0 and np.isclose(ndcg10_cmp, 0.0))
+        or (ndcg10_cmp > 0 and np.isclose(recall10_cmp, 0.0))
+    )
+
+    shuffle_recall_delta = float(
+        clv_row["recall@10"] - shuffle_row["recall@10"]
+    )
+    shuffle_ndcg_delta = float(clv_row["ndcg@10"] - shuffle_row["ndcg@10"])
+    assignment_guard = (
+        shuffle_recall_delta >= 0
+        and shuffle_ndcg_delta >= 0
+        and (shuffle_recall_delta > 0 or shuffle_ndcg_delta > 0)
+    )
+    reachable_guard = float(clv_row["reachable_truth_share"]) >= 0.99 * float(
+        global_row["reachable_truth_share"]
+    )
+    catalog_guard = float(clv_row["n_distinct@10"]) >= 0.95 * float(
+        global_row["n_distinct@10"]
+    )
+    exposure_delta = float(
+        clv_row["top10_share@10"] - global_row["top10_share@10"]
+    )
+    exposure_guard = exposure_delta <= 0.01
+
+    checks = {
+        "accuracy_guard": bool(accuracy_guard),
+        "shallow_rank_improved": bool(shallow_rank_improved),
+        "correct_assignment_guard": bool(assignment_guard),
+        "reachable_truth_guard": bool(reachable_guard),
+        "catalog_guard": bool(catalog_guard),
+        "exposure_guard": bool(exposure_guard),
+    }
+    return {
+        "passes_pilot": all(checks.values()),
+        "checks": checks,
+        "accuracy_ratios_vs_global": accuracy_ratios,
+        "recall@10_delta_vs_global": recall10_cmp,
+        "ndcg@10_delta_vs_global": ndcg10_cmp,
+        "recall@10_delta_vs_shuffle": shuffle_recall_delta,
+        "ndcg@10_delta_vs_shuffle": shuffle_ndcg_delta,
+        "reachable_truth_ratio_vs_global": float(
+            clv_row["reachable_truth_share"]
+            / max(float(global_row["reachable_truth_share"]), np.finfo(float).eps)
+        ),
+        "catalog_ratio_vs_global": float(
+            clv_row["n_distinct@10"]
+            / max(float(global_row["n_distinct@10"]), np.finfo(float).eps)
+        ),
+        "top10_share_absolute_delta": exposure_delta,
+        "interpretation": (
+            "exploratory train-only feasibility diagnostic; no significance, "
+            "generalization, or final-test claim"
+        ),
+    }

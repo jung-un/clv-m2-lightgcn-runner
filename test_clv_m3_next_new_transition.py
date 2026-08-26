@@ -5,6 +5,10 @@ from clv_m3_next_new_transition import (
     build_historical_clv,
     build_transition_graphs,
     build_user_transition_events,
+    decide_pilot,
+    evaluate_transition_ranking,
+    rank_transition_candidates,
+    reachable_truth_share,
 )
 
 
@@ -103,3 +107,114 @@ def test_transition_graphs_are_row_normalized_without_pruning():
     )
     assert graphs.edge_support[1, 2] == 2
     assert graphs.edge_support[1, 3] == 1
+
+
+def test_candidate_ranking_averages_last_basket_rows_and_excludes_seen_items():
+    from scipy import sparse
+
+    relation = sparse.csr_matrix(
+        np.array(
+            [
+                [0.0, 0.0, 0.4, 0.6, 0.0],
+                [0.0, 0.0, 0.8, 0.0, 0.2],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+            ]
+        )
+    )
+    ranked = rank_transition_candidates(
+        relation,
+        last_basket_items={0: np.array([0, 1]), 1: np.array([2])},
+        seen_items={0: np.array([2]), 1: np.array([], dtype=int)},
+        eval_users=np.array([0, 1]),
+        top_k=10,
+    )
+
+    # Mean scores are item 2=.6 (seen), item 3=.3, item 4=.1.
+    np.testing.assert_array_equal(ranked[0], [3, 4])
+    # No positive candidates means an empty list: no popularity backfill.
+    assert ranked[1].size == 0
+
+
+def test_candidate_ranking_breaks_equal_scores_by_item_index():
+    from scipy import sparse
+
+    relation = sparse.csr_matrix(np.array([[0.0, 0.0, 0.5, 0.5]] * 4))
+    ranked = rank_transition_candidates(
+        relation,
+        last_basket_items={0: np.array([0])},
+        seen_items={0: np.array([], dtype=int)},
+        eval_users=np.array([0]),
+        top_k=2,
+    )
+    np.testing.assert_array_equal(ranked[0], [2, 3])
+
+
+def test_ranking_metrics_and_reachable_truth_are_computed_per_user():
+    from scipy import sparse
+
+    rankings = {0: np.array([2, 3]), 1: np.array([3])}
+    truth = {0: np.array([2, 4]), 1: np.array([4])}
+    metrics, per_user = evaluate_transition_ranking(
+        rankings,
+        truth=truth,
+        n_items=5,
+        ks=(1, 2),
+    )
+    assert np.isclose(metrics["recall@1"], 0.25)
+    assert np.isclose(metrics["recall@2"], 0.25)
+    assert metrics["n_distinct@1"] == 2
+    assert np.isclose(metrics["top10_share@1"], 1.0)
+    assert len(per_user) == 2
+
+    relation = sparse.csr_matrix(
+        np.array(
+            [
+                [0, 0, 1, 1, 0],
+                [0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 1],
+                [0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0],
+            ],
+            dtype=float,
+        )
+    )
+    share = reachable_truth_share(
+        relation,
+        last_basket_items={0: np.array([0]), 1: np.array([2])},
+        seen_items={0: np.array([], dtype=int), 1: np.array([], dtype=int)},
+        truth=truth,
+    )
+    assert np.isclose(share, 2 / 3)
+
+
+def _pilot_row(model_id: str, scale: float = 1.0) -> dict:
+    row = {
+        "model_id": model_id,
+        "reachable_truth_share": 0.5,
+        "n_distinct@10": 100,
+        "top10_share@10": 0.2,
+    }
+    for metric in ("recall", "ndcg"):
+        for k in (10, 20, 50):
+            row[f"{metric}@{k}"] = scale
+    return row
+
+
+def test_pilot_decision_requires_all_predeclared_guards():
+    table = pd.DataFrame(
+        [
+            _pilot_row("transition_global", 1.0),
+            _pilot_row("transition_clv", 1.01),
+            _pilot_row("transition_clv_shuffle", 1.005),
+        ]
+    )
+    decision = decide_pilot(table)
+    assert decision["passes_pilot"] is True
+    assert all(decision["checks"].values())
+
+    table.loc[table.model_id == "transition_clv", "recall@50"] = 0.98
+    failed = decide_pilot(table)
+    assert failed["passes_pilot"] is False
+    assert failed["checks"]["accuracy_guard"] is False
