@@ -1,6 +1,6 @@
 # M3 CLV-Weighted Next-New-Item Transition Diagnostic Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Implement a locked, CPU-only, train-only Dunnhumby diagnostic that tests whether historical-CLV-weighted next-new-item transitions rank future new-item truths better than the identical unweighted and shuffled-CLV relations.
 
@@ -29,17 +29,17 @@
 - Create: `clv_m3_next_new_transition.py`
 - Create: `test_clv_m3_next_new_transition.py`
 
-- [ ] **Step 1: Write failing tests for consecutive-basket target construction**
+- [x] **Step 1: Write failing tests for consecutive-basket target construction**
 
   Add hand-built users where a later basket contains repeat and first-purchase items. Assert that only first-purchase targets remain and that users with no next-new target contribute no event.
 
-- [ ] **Step 2: Run the focused test and confirm failure**
+- [x] **Step 2: Run the focused test and confirm failure**
 
   Run: `pytest -q test_clv_m3_next_new_transition.py -k next_new`
 
   Expected: import or missing-function failure.
 
-- [ ] **Step 3: Implement `build_user_transition_events`**
+- [x] **Step 3: Implement `build_user_transition_events`**
 
   Interface:
 
@@ -62,17 +62,17 @@
 
   Require columns `u_idx`, `i_idx`, `t`, and `basket_id`. Deduplicate items within each basket, order baskets by `(t, basket_id)`, calculate `New_(u,t+1)`, allocate `1/(|B_t| |New_(t+1)|)`, then normalize all retained contributions for each user to sum to one.
 
-- [ ] **Step 4: Add and run tests for basket-size and user-level mass normalization**
+- [x] **Step 4: Add and run tests for basket-size and user-level mass normalization**
 
   Run: `pytest -q test_clv_m3_next_new_transition.py -k 'normalization or next_new'`
 
   Expected: all selected tests pass.
 
-- [ ] **Step 5: Write failing tests for CLV coefficients and constrained shuffle**
+- [x] **Step 5: Write failing tests for CLV coefficients and constrained shuffle**
 
   Assert `N_hat` equals distinct basket count, `V_hat` equals mean basket total, `CLV=N_hat*V_hat`, coefficient mean is one, and the shuffle preserves the coefficient multiset within every `N_hat` midrank decile.
 
-- [ ] **Step 6: Implement CLV and shuffle functions**
+- [x] **Step 6: Implement CLV and shuffle functions**
 
   Interfaces:
 
@@ -97,11 +97,11 @@
 
   Basket value is the train-only sum of `v` per `(user,basket)`. Percentiles use deterministic midranks. Shuffle only `coefficient` within `activity_decile`.
 
-- [ ] **Step 7: Write failing tests for sparse graph aggregation and row normalization**
+- [x] **Step 7: Write failing tests for sparse graph aggregation and row normalization**
 
   Assert each nonempty source row sums to one, empty rows remain zero, CLV changes contributor allocation, and all three graphs keep the same shape.
 
-- [ ] **Step 8: Implement `build_transition_graphs`**
+- [x] **Step 8: Implement `build_transition_graphs`**
 
   Interface:
 
@@ -125,13 +125,13 @@
 
   Aggregate without PPMI, minimum-support filtering, or Top-M pruning. Row-normalize each relation independently.
 
-- [ ] **Step 9: Run all core tests**
+- [x] **Step 9: Run all core tests**
 
   Run: `pytest -q test_clv_m3_next_new_transition.py`
 
   Expected: all tests pass.
 
-- [ ] **Step 10: Commit Task 1**
+- [x] **Step 10: Commit Task 1**
 
   ```bash
   git add clv_m3_next_new_transition.py test_clv_m3_next_new_transition.py
@@ -145,11 +145,11 @@
 - Modify: `clv_m3_next_new_transition.py`
 - Modify: `test_clv_m3_next_new_transition.py`
 
-- [ ] **Step 1: Write failing tests for last-basket candidate scoring**
+- [x] **Step 1: Write failing tests for last-basket candidate scoring**
 
   Assert the user score is the mean relation row over last-basket sources, construction purchases are excluded, no popularity backfill occurs, and ties use deterministic item-index order.
 
-- [ ] **Step 2: Implement `rank_transition_candidates`**
+- [x] **Step 2: Implement `rank_transition_candidates`**
 
   Interface:
 
@@ -167,11 +167,11 @@
 
   Return only positive-score candidates, sorted by score descending then item index ascending.
 
-- [ ] **Step 3: Write failing tests for evaluation and pass rule**
+- [x] **Step 3: Write failing tests for evaluation and pass rule**
 
   Cover Recall/NDCG @10/20/50, reachable-truth share, distinct Top-10, top-10-item exposure share, and all six predeclared pass conditions, including exact boundary cases.
 
-- [ ] **Step 4: Implement evaluation helpers and `decide_pilot`**
+- [x] **Step 4: Implement evaluation helpers and `decide_pilot`**
 
   Interfaces:
 
@@ -182,13 +182,13 @@
 
   Include support strata, CLV quintiles, candidate counts, item-popularity correlation, item-price-percentile correlation, coverage, entropy, effective catalog, top-10 share, and top-100 share. Treat unavailable price data as an explicit missing diagnostic, never as zero.
 
-- [ ] **Step 5: Run focused and full core tests**
+- [x] **Step 5: Run focused and full core tests**
 
   Run: `pytest -q test_clv_m3_next_new_transition.py`
 
   Expected: all tests pass.
 
-- [ ] **Step 6: Commit Task 2**
+- [x] **Step 6: Commit Task 2**
 
   ```bash
   git add clv_m3_next_new_transition.py test_clv_m3_next_new_transition.py
@@ -202,11 +202,11 @@
 - Create: `lightgcn_clv_m3_next_new_transition_diagnostic.py`
 - Create: `test_lightgcn_clv_m3_next_new_transition_diagnostic.py`
 
-- [ ] **Step 1: Write failing configuration and leakage-guard tests**
+- [x] **Step 1: Write failing configuration and leakage-guard tests**
 
   Assert fixed dataset `dunnhumby`, construction end `662`, pseudo-future start/end `663/669`, shuffle seed `20260826`, `MIN_USER_INTER=1`, `MIN_ITEM_INTER=1`, no holdout, and rejection of any transaction with `t>669` entering the prepared frame.
 
-- [ ] **Step 2: Implement locked configuration and preflight summary**
+- [x] **Step 2: Implement locked configuration and preflight summary**
 
   Interfaces:
 
@@ -225,19 +225,19 @@
   def preflight_summary(cfg) -> dict: ...
   ```
 
-- [ ] **Step 3: Write failing tests for split preparation**
+- [x] **Step 3: Write failing tests for split preparation**
 
   Use a small synthetic frame to assert construction/evaluation boundaries, construction-pair exclusion from truth, last construction basket extraction, and no future leakage into CLV, transition events, or item diagnostics.
 
-- [ ] **Step 4: Implement `_prepare_transactions` and `_build_truth`**
+- [x] **Step 4: Implement `_prepare_transactions` and `_build_truth`**
 
   Load through `lightgcn_clv_v3.load_transactions`, merge Dunnhumby item metadata, apply the train-based one-pass-converged k-core with thresholds one, index users/items from the capped DAY 1--669 frame, and retain `basket_id` from `b_raw` (fall back to `t` only if the schema lacks it). The truth is unique DAY 663--669 items absent from each user's DAY 1--662 history.
 
-- [ ] **Step 5: Write failing artifact and integrity tests**
+- [x] **Step 5: Write failing artifact and integrity tests**
 
   Assert saved configuration includes input manifest/hash/source revision, all row-mass invariants pass, no construction pair appears in truth or recommendations, metric recomputation matches, and filenames include the run hash.
 
-- [ ] **Step 6: Implement `run_m3_next_new_transition_diagnostic`**
+- [x] **Step 6: Implement `run_m3_next_new_transition_diagnostic`**
 
   Interface:
 
@@ -250,19 +250,19 @@
 
   Save absolute metrics, pairwise comparison, segment metrics, support diagnostics, integrity checks, and one JSON record. Attach `quality_passed`, `pilot_decision`, and `result_paths` to the returned DataFrame attributes.
 
-- [ ] **Step 7: Run runner tests**
+- [x] **Step 7: Run runner tests**
 
   Run: `pytest -q test_lightgcn_clv_m3_next_new_transition_diagnostic.py`
 
   Expected: all tests pass.
 
-- [ ] **Step 8: Run combined focused suite**
+- [x] **Step 8: Run combined focused suite**
 
   Run: `pytest -q test_clv_m3_next_new_transition.py test_lightgcn_clv_m3_next_new_transition_diagnostic.py`
 
   Expected: all tests pass.
 
-- [ ] **Step 9: Commit Task 3**
+- [x] **Step 9: Commit Task 3**
 
   ```bash
   git add lightgcn_clv_m3_next_new_transition_diagnostic.py test_lightgcn_clv_m3_next_new_transition_diagnostic.py
@@ -276,11 +276,11 @@
 - Create: `clv_m3_next_new_transition_diagnostic_colab.ipynb`
 - Modify: `RESEARCH_STATUS.md`
 
-- [ ] **Step 1: Create the minimal Colab notebook**
+- [x] **Step 1: Create the minimal Colab notebook**
 
   Cells must: mount Drive; clone or update `jung-un/clv-m2-lightgcn-runner` on `feat/m2-joint-nv-lightgcn`; install only missing dependencies; print `preflight_summary`; run the diagnostic; assert `quality_passed`; display the three-arm table, pilot decision, and result paths. Do not expose split or graph settings as editable notebook controls.
 
-- [ ] **Step 2: Validate notebook structure without executing the full dataset**
+- [x] **Step 2: Validate notebook structure without executing the full dataset**
 
   Run:
 
@@ -300,11 +300,11 @@
 
   Expected: both commands exit zero.
 
-- [ ] **Step 3: Update `RESEARCH_STATUS.md`**
+- [x] **Step 3: Update `RESEARCH_STATUS.md`**
 
   Record the approved hypothesis, locked DAY 1--662 / DAY 663--669 exploratory interval, Phase-1-only status, fixed controls, and the rule that no neural M3 model is built unless the diagnostic passes. Mark implementation as complete but experiment result as pending.
 
-- [ ] **Step 4: Run complete targeted verification**
+- [x] **Step 4: Run complete targeted verification**
 
   Run:
 
@@ -316,7 +316,7 @@
 
   Expected: tests pass, compilation succeeds, and no whitespace errors are reported.
 
-- [ ] **Step 5: Review spec coverage and placeholder hygiene**
+- [x] **Step 5: Review spec coverage and placeholder hygiene**
 
   Run:
 
@@ -328,7 +328,7 @@
 
   Manually verify every design-spec invariant and all six pilot conditions have at least one code path and one test assertion.
 
-- [ ] **Step 6: Commit and push the implementation**
+- [x] **Step 6: Commit and push the implementation**
 
   ```bash
   git add clv_m3_next_new_transition_diagnostic_colab.ipynb RESEARCH_STATUS.md docs/superpowers/plans/2026-08-26-m3-clv-weighted-next-new-item-transition-implementation.md
@@ -336,7 +336,7 @@
   git push origin feat/m2-joint-nv-lightgcn
   ```
 
-- [ ] **Step 7: Hand off the Colab URL**
+- [x] **Step 7: Hand off the Colab URL**
 
   Provide:
 
