@@ -290,6 +290,32 @@ def rank_transition_candidates(
     return rankings
 
 
+def count_transition_candidates(
+    relation: sparse.csr_matrix,
+    *,
+    last_basket_items: dict[int, np.ndarray],
+    seen_items: dict[int, np.ndarray],
+    eval_users: np.ndarray,
+) -> dict[int, int]:
+    """Count every positive unobserved candidate before Top-K truncation."""
+    relation = relation.tocsr()
+    counts: dict[int, int] = {}
+    for raw_user in np.asarray(eval_users):
+        user = int(raw_user)
+        sources = np.unique(
+            np.asarray(last_basket_items.get(user, []), dtype=np.int64)
+        )
+        if sources.size == 0:
+            counts[user] = 0
+            continue
+        scores = np.asarray(relation[sources].sum(axis=0)).ravel()
+        seen = np.asarray(seen_items.get(user, []), dtype=np.int64)
+        seen = seen[(seen >= 0) & (seen < relation.shape[1])]
+        scores[seen] = 0.0
+        counts[user] = int((scores > 0).sum())
+    return counts
+
+
 def _discounted_gain(ranked: np.ndarray, truth: set[int], k: int) -> float:
     if not truth:
         return 0.0

@@ -5,6 +5,7 @@ from clv_m3_next_new_transition import (
     build_historical_clv,
     build_transition_graphs,
     build_user_transition_events,
+    count_transition_candidates,
     decide_pilot,
     evaluate_transition_ranking,
     rank_transition_candidates,
@@ -135,6 +136,13 @@ def test_candidate_ranking_averages_last_basket_rows_and_excludes_seen_items():
     np.testing.assert_array_equal(ranked[0], [3, 4])
     # No positive candidates means an empty list: no popularity backfill.
     assert ranked[1].size == 0
+    counts = count_transition_candidates(
+        relation,
+        last_basket_items={0: np.array([0, 1]), 1: np.array([2])},
+        seen_items={0: np.array([2]), 1: np.array([], dtype=int)},
+        eval_users=np.array([0, 1]),
+    )
+    assert counts == {0: 2, 1: 0}
 
 
 def test_candidate_ranking_breaks_equal_scores_by_item_index():
