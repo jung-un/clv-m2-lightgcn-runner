@@ -113,6 +113,26 @@ def test_rho_zero_bypasses_conditional_maps_and_norm_rescaling(monkeypatch):
     assert user is history
 
 
+def test_rho_zero_diagnostics_do_not_compare_two_sparse_recomputations(monkeypatch):
+    model = _model(rho=0.0, layers=0)
+    base = torch.randn(model.n_users, model.embedding_dim)
+    calls = 0
+
+    def nondeterministic_sparse_result():
+        nonlocal calls
+        calls += 1
+        return base + calls * torch.finfo(base.dtype).eps
+
+    monkeypatch.setattr(
+        model, "purchase_history_expression", nondeterministic_sparse_result
+    )
+
+    diagnostics = model.representation_diagnostics()
+
+    assert diagnostics["mean_user_representation_change"] == 0.0
+    assert diagnostics["max_user_norm_change"] == 0.0
+
+
 def test_clv_cannot_create_a_user_direction_without_purchase_history():
     model = _model(layers=0)
     _make_transforms_nonzero(model)

@@ -232,7 +232,14 @@ class CLVHistoryConditionedLowRankLightGCN(nn.Module):
     @torch.no_grad()
     def representation_diagnostics(self) -> dict:
         history = self.purchase_history_expression()
-        user0, item0 = self.layer0_embeddings()
+        # At rho=0 the layer-0 user representation is structurally identical
+        # to ``history``.  Recomputing the sparse aggregate on a GPU can differ
+        # by a few floating-point ulps because sparse reductions use atomic
+        # accumulation, so reuse the same tensor for the exact identity check.
+        if self.rho == 0.0:
+            user0, item0 = history, self.E_i.weight
+        else:
+            user0, item0 = self.layer0_embeddings()
         activity, value = self.axis_corrections()
         history_mean_norm = history.norm(dim=1).mean().clamp_min(1e-12)
         return {
