@@ -68,6 +68,39 @@ def test_graph_strength_cannot_expand_clipped_lift_beyond_declared_range():
     assert float(raw_weight.min().detach()) >= (1.0 / 3.0) - 1e-6
 
 
+def test_sparse_adjacency_values_do_not_request_a_dense_adjacency_gradient():
+    model = _model((0.8, -0.6, 0.3))
+
+    adjacency = model.weighted_adjacency()
+
+    assert adjacency.layout == torch.sparse_coo
+    assert adjacency.values().requires_grad is False
+
+
+def test_manual_scalar_alpha_gradient_matches_finite_difference():
+    model = _model((0.8, -0.6, 0.3))
+    users = torch.tensor([0, 1])
+    positives = torch.tensor([0, 1])
+    negatives = torch.tensor([1, 0])
+    loss, _ = model.bpr_loss(users, positives, negatives, None, 0.0, None)
+    loss.backward()
+    analytic = float(model.raw_alpha.grad)
+
+    original = float(model.raw_alpha.detach())
+    epsilon = 1e-3
+    losses = []
+    for value in (original + epsilon, original - epsilon):
+        with torch.no_grad():
+            model.raw_alpha.fill_(value)
+        perturbed, _ = model.bpr_loss(
+            users, positives, negatives, None, 0.0, None
+        )
+        losses.append(float(perturbed.detach()))
+    numerical = (losses[0] - losses[1]) / (2.0 * epsilon)
+
+    assert np.isclose(analytic, numerical, rtol=2e-2, atol=2e-4)
+
+
 def test_m4_sample_weights_and_external_score_lambda_are_rejected():
     model = _model((0.8, -0.6, 0.3))
     users = torch.tensor([0])

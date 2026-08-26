@@ -10,6 +10,65 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class _SparseSymmetricMMWithScalar(torch.autograd.Function):
+    """Sparse matrix multiplication with an explicit scalar-value derivative.
+
+    PyTorch's generic sparse-value backward materialises a dense adjacency
+    gradient for this operation.  The graph depends on only one scalar, so its
+    gradient can instead be contracted edge by edge without that dense matrix.
+    """
+
+    @staticmethod
+    def forward(ctx, indices, values, value_derivative, x, alpha, size):
+        adjacency = torch.sparse_coo_tensor(
+            indices,
+            values,
+            size,
+            device=values.device,
+            check_invariants=False,
+        ).coalesce()
+        derivative_adjacency = torch.sparse_coo_tensor(
+            indices,
+            value_derivative,
+            size,
+            device=values.device,
+            check_invariants=False,
+        ).coalesce()
+        ctx.save_for_backward(
+            adjacency.indices(),
+            adjacency.values(),
+            derivative_adjacency.values(),
+            x,
+        )
+        ctx.size = size
+        return torch.sparse.mm(adjacency, x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        indices, values, value_derivative, x = ctx.saved_tensors
+        adjacency = torch.sparse_coo_tensor(
+            indices,
+            values,
+            ctx.size,
+            device=values.device,
+            is_coalesced=True,
+            check_invariants=False,
+        )
+        grad_x = torch.sparse.mm(adjacency, grad_output)
+        rows, columns = indices
+        grad_alpha = values.new_zeros(())
+        chunk_size = 131_072
+        for start in range(0, len(values), chunk_size):
+            stop = min(start + chunk_size, len(values))
+            edge_dot = (
+                grad_output[rows[start:stop]] * x[columns[start:stop]]
+            ).sum(dim=1)
+            grad_alpha = grad_alpha + (
+                value_derivative[start:stop] * edge_dot
+            ).sum()
+        return None, None, None, grad_x, grad_alpha, None
+
+
 class CLVLiftGraphLightGCN(nn.Module):
     """Apply CLV-group item lift to observed user-item graph edges."""
 
@@ -69,15 +128,35 @@ class CLVLiftGraphLightGCN(nn.Module):
     def alpha(self) -> torch.Tensor:
         return torch.sigmoid(self.raw_alpha)
 
-    def weighted_adjacency(self) -> torch.Tensor:
-        raw_weight = torch.exp(self.alpha() * self.edge_signal)
+    def _edge_values_and_derivative(self):
+        alpha = self.alpha().detach()
+        raw_weight = torch.exp(alpha * self.edge_signal)
+        raw_derivative = raw_weight * self.edge_signal
         user_degree = raw_weight.new_zeros(self.n_users)
         item_degree = raw_weight.new_zeros(self.n_items)
+        user_degree_derivative = raw_weight.new_zeros(self.n_users)
+        item_degree_derivative = raw_weight.new_zeros(self.n_items)
         user_degree.scatter_add_(0, self.edge_users, raw_weight)
         item_degree.scatter_add_(0, self.edge_items, raw_weight)
+        user_degree_derivative.scatter_add_(
+            0, self.edge_users, raw_derivative
+        )
+        item_degree_derivative.scatter_add_(
+            0, self.edge_items, raw_derivative
+        )
         normalised = raw_weight / torch.sqrt(
             user_degree[self.edge_users] * item_degree[self.edge_items]
         ).clamp_min(1e-12)
+        log_derivative = (
+            self.edge_signal
+            - 0.5
+            * user_degree_derivative[self.edge_users]
+            / user_degree[self.edge_users].clamp_min(1e-12)
+            - 0.5
+            * item_degree_derivative[self.edge_items]
+            / item_degree[self.edge_items].clamp_min(1e-12)
+        )
+        normalised_derivative = normalised * log_derivative
         item_nodes = self.edge_items + self.n_users
         indices = torch.stack(
             [
@@ -86,6 +165,13 @@ class CLVLiftGraphLightGCN(nn.Module):
             ]
         )
         values = torch.cat([normalised, normalised])
+        value_derivative = torch.cat(
+            [normalised_derivative, normalised_derivative]
+        )
+        return indices, values, value_derivative
+
+    def weighted_adjacency(self) -> torch.Tensor:
+        indices, values, _ = self._edge_values_and_derivative()
         return torch.sparse_coo_tensor(
             indices,
             values,
@@ -95,11 +181,31 @@ class CLVLiftGraphLightGCN(nn.Module):
         ).coalesce()
 
     def propagate(self) -> tuple[torch.Tensor, torch.Tensor]:
-        adjacency = self.weighted_adjacency()
+        indices, values, value_derivative = self._edge_values_and_derivative()
+        size = (self.n_users + self.n_items, self.n_users + self.n_items)
+        adjacency = None
+        if not torch.is_grad_enabled():
+            adjacency = torch.sparse_coo_tensor(
+                indices,
+                values,
+                size,
+                device=values.device,
+                check_invariants=False,
+            ).coalesce()
         current = torch.cat([self.E_u.weight, self.E_i.weight], dim=0)
         total = current
         for _ in range(self.n_layers):
-            current = torch.sparse.mm(adjacency, current)
+            if adjacency is None:
+                current = _SparseSymmetricMMWithScalar.apply(
+                    indices,
+                    values,
+                    value_derivative,
+                    current,
+                    self.alpha(),
+                    size,
+                )
+            else:
+                current = torch.sparse.mm(adjacency, current)
             total = total + current
         total = total / (self.n_layers + 1)
         return total[: self.n_users], total[self.n_users :]

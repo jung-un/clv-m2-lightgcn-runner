@@ -25,7 +25,7 @@ import lightgcn_clv_moe as moe
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m3-clv-lift-graph-historical-screen-v1"
+CODE_VERSION = "m3-clv-lift-graph-historical-screen-v2"
 MODEL_IDS = ("m3_clv_lift_graph", "m3_clv_lift_graph_shuffle")
 HISTORICAL_SPLIT = "historical_development_days_684_690"
 
