@@ -65,10 +65,10 @@ def build_user_transition_events(
     if n_users <= 0:
         raise ValueError("n_users must be positive")
 
-    event_users: list[int] = []
-    event_sources: list[int] = []
-    event_targets: list[int] = []
-    event_weights: list[float] = []
+    event_users: list[np.ndarray] = []
+    event_sources: list[np.ndarray] = []
+    event_targets: list[np.ndarray] = []
+    event_weights: list[np.ndarray] = []
     pair_counts = np.zeros(n_users, dtype=np.int32)
 
     basket_items = (
@@ -102,20 +102,31 @@ def build_user_transition_events(
         if not retained:
             continue
         user_scale = 1.0 / len(retained)
+        user_sources: list[np.ndarray] = []
+        user_targets: list[np.ndarray] = []
+        user_weights: list[np.ndarray] = []
         for current, new_targets in retained:
             weight = user_scale / (current.size * new_targets.size)
-            for source in current:
-                for target in new_targets:
-                    event_users.append(user)
-                    event_sources.append(int(source))
-                    event_targets.append(int(target))
-                    event_weights.append(weight)
+            pair_size = current.size * new_targets.size
+            user_sources.append(np.repeat(current, new_targets.size))
+            user_targets.append(np.tile(new_targets, current.size))
+            user_weights.append(np.full(pair_size, weight, dtype=np.float64))
+        sources = np.concatenate(user_sources)
+        event_users.append(np.full(sources.size, user, dtype=np.int32))
+        event_sources.append(sources)
+        event_targets.append(np.concatenate(user_targets))
+        event_weights.append(np.concatenate(user_weights))
+
+    def concatenate_or_empty(
+        chunks: list[np.ndarray], dtype: np.dtype,
+    ) -> np.ndarray:
+        return np.concatenate(chunks).astype(dtype, copy=False) if chunks else np.empty(0, dtype=dtype)
 
     return TransitionEvents(
-        user_idx=np.asarray(event_users, dtype=np.int32),
-        source_item_idx=np.asarray(event_sources, dtype=np.int32),
-        target_item_idx=np.asarray(event_targets, dtype=np.int32),
-        contribution=np.asarray(event_weights, dtype=np.float64),
+        user_idx=concatenate_or_empty(event_users, np.dtype(np.int32)),
+        source_item_idx=concatenate_or_empty(event_sources, np.dtype(np.int32)),
+        target_item_idx=concatenate_or_empty(event_targets, np.dtype(np.int32)),
+        contribution=concatenate_or_empty(event_weights, np.dtype(np.float64)),
         eligible_pair_count_by_user=pair_counts,
     )
 
