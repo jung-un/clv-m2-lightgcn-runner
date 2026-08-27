@@ -250,6 +250,9 @@ def fixed_axis_allocation(
         raise ValueError("q_C는 유한해야 합니다")
     if ((total_level < 0.0) | (total_level > 1.0)).any():
         raise ValueError("q_C는 0과 1 사이의 백분위여야 합니다")
+    both_valid = np.asarray(activity_valid, bool) & np.asarray(value_valid, bool)
+    if not np.allclose(total_level[~both_valid], 0.0):
+        raise ValueError("N과 V가 모두 유효하지 않은 사용자의 q_C는 0이어야 합니다")
     b_n = total_level * pi_n
     b_v = total_level * pi_v
     return pi_n, pi_v, b_n.astype(np.float32), b_v.astype(np.float32)
