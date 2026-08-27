@@ -1,8 +1,27 @@
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
 import lightgcn_clv_history_item_fit_diagnostic as diagnostic
+
+
+def test_raw_item_traits_exposes_item_idx_for_downstream_merges():
+    train = pd.DataFrame(
+        {
+            "u_idx": [0, 1],
+            "i_idx": [0, 1],
+            "i_raw": ["item-a", "item-b"],
+            "cat_raw": ["cat-a", "cat-b"],
+            "b_raw": ["basket-a", "basket-b"],
+            "up": [1.0, 2.0],
+        }
+    )
+
+    traits = diagnostic._raw_item_traits(train, n_items=2)
+
+    assert traits["item_idx"].tolist() == [0, 1]
+    assert traits["item_id"].tolist() == ["item-a", "item-b"]
 
 
 def test_axis_views_slice_exact_trained_blocks():

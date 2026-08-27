@@ -370,7 +370,9 @@ def _raw_item_traits(train: pd.DataFrame, n_items: int) -> pd.DataFrame:
         pct=True, method="average"
     )
     result = pd.DataFrame({"item_idx": np.arange(n_items, dtype=int)})
-    return result.merge(item.reset_index(), on="item_idx", how="left")
+    return result.merge(
+        item.rename_axis("item_idx").reset_index(), on="item_idx", how="left"
+    )
 
 
 def item_role_occurrences(
