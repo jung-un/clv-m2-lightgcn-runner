@@ -10,7 +10,7 @@ def test_preflight_locks_historical_screen_and_m2_boundaries(tmp_path):
     )
     summary = runner.preflight_summary(cfg)
 
-    assert summary["trained_models"] == ["m2_fixed_composition_nv"]
+    assert summary["trained_models"] == ["m2_total_level_composition_nv"]
     assert summary["reused_comparator"] == "m1_64"
     assert summary["historical_development_split"] == {
         "train_end_inclusive": 683,
@@ -20,7 +20,11 @@ def test_preflight_locks_historical_screen_and_m2_boundaries(tmp_path):
         "holdout_constructed": False,
     }
     assert summary["m2"]["architecture"] == "ID(64)|activity(4)|transaction-value(4)"
-    assert summary["m2"]["fixed_total_axis_budget"] == pytest.approx(0.05)
+    assert summary["m2"]["fixed_max_axis_scale"] == pytest.approx(0.05)
+    assert "q_C" in summary["m2"]["user_total_axis_level"]
+    assert summary["m2"]["user_axis_allocation"] == (
+        "b_N=q_C*pi_N, b_V=q_C*pi_V; b_N+b_V=q_C"
+    )
     assert summary["m2"]["learned_global_axis_weight"] is False
     assert summary["m2"]["raw_repeatshare_input"] is False
     assert summary["m2"]["raw_item_popularity_input"] is False

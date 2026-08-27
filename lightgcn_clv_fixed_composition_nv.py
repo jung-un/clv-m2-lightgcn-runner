@@ -20,6 +20,7 @@ import torch
 from clv_fixed_composition_nv_model import (
     FixedCompositionNVLightGCN,
     build_popularity_controlled_item_affinities,
+    fixed_total_level_percentile,
 )
 from clv_run_state import ProgressStore, RunIdentity, clone_state, file_sha256
 import lightgcn_clv_axis_specific_test10 as test10
@@ -30,8 +31,8 @@ import lightgcn_clv_residual as residual
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m2-fixed-composition-nv-historical-screen-v1"
-MODEL_ID = "m2_fixed_composition_nv"
+CODE_VERSION = "m2-total-level-composition-nv-historical-screen-v2"
+MODEL_ID = "m2_total_level_composition_nv"
 
 
 @dataclass(frozen=True)
@@ -58,7 +59,7 @@ def configure_fixed_composition_run(**overrides) -> FixedCompositionNVConfig:
     defaults = {
         "out_dir": (
             f"{v3.default_out_dir('dunnhumby')}"
-            "_m2_fixed_composition_nv_historical_screen_v1"
+            "_m2_total_level_composition_nv_historical_screen_v2"
         ),
         "baseline_result_dir": (
             f"{v3.default_out_dir('dunnhumby')}"
@@ -112,9 +113,15 @@ def preflight_summary(cfg: FixedCompositionNVConfig) -> dict:
             "architecture": "ID(64)|activity(4)|transaction-value(4)",
             "one_binary_lightgcn": True,
             "one_dot_score": True,
-            "fixed_total_axis_budget": cfg.rho,
+            "fixed_max_axis_scale": cfg.rho,
             "learned_global_axis_weight": False,
-            "user_axis_allocation": "softmax([q_N(u), q_V(u)])",
+            "user_total_axis_level": (
+                "q_C(u)=train-user percentile of historical N(u)*V(u) proxy"
+            ),
+            "user_axis_composition": "pi_N,pi_V=softmax([q_N(u),q_V(u)])",
+            "user_axis_allocation": (
+                "b_N=q_C*pi_N, b_V=q_C*pi_V; b_N+b_V=q_C"
+            ),
             "item_activity_input": (
                 "mean buyer q_N residual after train-only log-degree control"
             ),
@@ -126,9 +133,7 @@ def preflight_summary(cfg: FixedCompositionNVConfig) -> dict:
             "raw_item_popularity_input": False,
             "user_and_item_axis_l2_normalized": True,
             "total_dim": cfg.id_dim + 2 * cfg.axis_dim,
-            "limitation": (
-                "the fixed budget models N/V composition, not total CLV magnitude"
-            ),
+            "limitation": "q_C is a train-history CLV proxy percentile, not future CLV",
         },
         "fixed": {
             "graph": "binary",
@@ -191,11 +196,14 @@ def _prepare(cfg: FixedCompositionNVConfig) -> dict:
         data["train"], data["n_users"], v3.DCFG["is_date"], cfg.input_days
     )
     axes = joint.build_user_axis_inputs(snapshot, data["n_users"])
+    clv_valid = axes["activity_valid"] & axes["value_valid"]
+    axes["q_c"] = fixed_total_level_percentile(axes["clv_proxy"], clv_valid)
     item_affinity = build_popularity_controlled_item_affinities(
         data["train"],
         n_items=data["n_items"],
         q_n=axes["q_n"],
         q_v=axes["q_v"],
+        q_c=axes["q_c"],
         user_activity_valid=axes["activity_valid"],
         user_value_valid=axes["value_valid"],
     )
@@ -384,7 +392,7 @@ def run_fixed_composition_screen(
     )
     frame = pd.DataFrame(rows)
     comparison = _comparison(baseline, arm)
-    stem = f"m2_fixed_composition_nv_{prepared['config_hash']}"
+    stem = f"m2_total_level_composition_nv_{prepared['config_hash']}"
     paths = {
         "absolute_csv": prepared["out_dir"] / f"{stem}.csv",
         "comparison_csv": prepared["out_dir"] / f"{stem}_comparison.csv",

@@ -1,10 +1,11 @@
-"""Fixed-budget N/V blocks inside one LightGCN.
+"""Total-level and composition-aware N/V blocks inside one LightGCN.
 
 The module keeps the original ID block and adds two small CLV-related blocks.
-The total N/V intervention budget is fixed, while each user's activity/value
-composition allocates that budget.  Item-side axis inputs describe the N/V
-tendency of an item's historical buyers after removing the expected effect of
-item popularity (and, for V, category).
+The global N/V scale is fixed.  Each user's historical CLV-proxy percentile
+sets how much of that scale is used, while the user's activity/value
+composition allocates it between the two axes.  Item-side axis inputs describe
+the N/V tendency of an item's historical buyers after removing the expected
+effect of item popularity (and, for V, category).
 """
 
 from __future__ import annotations
@@ -208,6 +209,52 @@ def fixed_axis_composition(
     return pi_n.astype(np.float32), pi_v.astype(np.float32)
 
 
+def fixed_total_level_percentile(
+    clv_proxy: np.ndarray, valid: np.ndarray
+) -> np.ndarray:
+    """Return a train-user midrank percentile of the historical CLV proxy."""
+    proxy = np.asarray(clv_proxy, dtype=np.float64)
+    observed = np.asarray(valid, dtype=bool)
+    if proxy.shape != observed.shape:
+        raise ValueError("historical CLV proxy와 유효성 shape이 다릅니다")
+    if not np.isfinite(proxy[observed]).all():
+        raise ValueError("유효 사용자의 historical CLV proxy는 유한해야 합니다")
+    percentile = np.zeros_like(proxy, dtype=np.float32)
+    if observed.any():
+        ranks = pd.Series(proxy[observed]).rank(method="average").to_numpy()
+        percentile[observed] = ((ranks - 0.5) / observed.sum()).astype(np.float32)
+    return percentile
+
+
+def fixed_axis_allocation(
+    q_n: np.ndarray,
+    q_v: np.ndarray,
+    q_c: np.ndarray,
+    activity_valid: np.ndarray,
+    value_valid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Split each user's historical CLV level across N and V.
+
+    ``pi_n`` and ``pi_v`` retain the relative N/V composition.  The actual
+    axis allocations ``b_n`` and ``b_v`` additionally retain the total
+    historical CLV-proxy percentile, so ``b_n + b_v == q_c`` whenever both
+    component inputs are valid.
+    """
+    pi_n, pi_v = fixed_axis_composition(
+        q_n, q_v, activity_valid, value_valid
+    )
+    total_level = np.asarray(q_c, dtype=np.float32)
+    if total_level.shape != pi_n.shape:
+        raise ValueError("q_C와 q_N/q_V shape이 다릅니다")
+    if not np.isfinite(total_level).all():
+        raise ValueError("q_C는 유한해야 합니다")
+    if ((total_level < 0.0) | (total_level > 1.0)).any():
+        raise ValueError("q_C는 0과 1 사이의 백분위여야 합니다")
+    b_n = total_level * pi_n
+    b_v = total_level * pi_v
+    return pi_n, pi_v, b_n.astype(np.float32), b_v.astype(np.float32)
+
+
 class _NormalizedAxisEncoder(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
@@ -224,7 +271,7 @@ class _NormalizedAxisEncoder(nn.Module):
 
 
 class FixedCompositionNVLightGCN(nn.Module):
-    """ID(64)|N(4)|V(4) representation with fixed N/V composition."""
+    """ID(64)|N(4)|V(4) with fixed scale and user N/V allocation."""
 
     def __init__(
         self,
@@ -238,6 +285,7 @@ class FixedCompositionNVLightGCN(nn.Module):
         item_affinity: ItemAxisAffinity,
         q_n: np.ndarray,
         q_v: np.ndarray,
+        q_c: np.ndarray,
         adj: torch.Tensor,
         id_dim: int = 64,
         axis_dim: int = 4,
@@ -262,7 +310,9 @@ class FixedCompositionNVLightGCN(nn.Module):
             raise ValueError("사용자 축 입력 행 수가 n_users와 다릅니다")
         if item_affinity.activity.shape != (n_items, 1) or item_affinity.value.shape != (n_items, 1):
             raise ValueError("아이템 affinity는 축별 [n_items, 1]이어야 합니다")
-        pi_n, pi_v = fixed_axis_composition(q_n, q_v, activity_valid, value_valid)
+        pi_n, pi_v, allocation_n, allocation_v = fixed_axis_allocation(
+            q_n, q_v, q_c, activity_valid, value_valid
+        )
 
         self.n_users = int(n_users)
         self.n_items = int(n_items)
@@ -307,6 +357,9 @@ class FixedCompositionNVLightGCN(nn.Module):
         )
         self.register_buffer("pi_n", torch.from_numpy(pi_n))
         self.register_buffer("pi_v", torch.from_numpy(pi_v))
+        self.register_buffer("q_c", torch.from_numpy(np.asarray(q_c, np.float32)))
+        self.register_buffer("allocation_n", torch.from_numpy(allocation_n))
+        self.register_buffer("allocation_v", torch.from_numpy(allocation_v))
         self.register_buffer("adj", adj.coalesce())
 
     @property
@@ -322,8 +375,8 @@ class FixedCompositionNVLightGCN(nn.Module):
         user = torch.cat(
             [
                 self.E_u.weight,
-                scale * self.pi_n[:, None] * user_n,
-                scale * self.pi_v[:, None] * user_v,
+                scale * self.allocation_n[:, None] * user_n,
+                scale * self.allocation_v[:, None] * user_v,
             ],
             dim=1,
         )
@@ -390,6 +443,18 @@ class FixedCompositionNVLightGCN(nn.Module):
             "pi_v_mean": float(self.pi_v.mean()),
             "pi_v_std": float(self.pi_v.std(unbiased=False)),
             "composition_sum_mean": float((self.pi_n + self.pi_v).mean()),
+            "total_clv_level_mean": float(self.q_c.mean()),
+            "total_clv_level_std": float(self.q_c.std(unbiased=False)),
+            "allocation_n_mean": float(self.allocation_n.mean()),
+            "allocation_n_std": float(self.allocation_n.std(unbiased=False)),
+            "allocation_v_mean": float(self.allocation_v.mean()),
+            "allocation_v_std": float(self.allocation_v.std(unbiased=False)),
+            "allocation_sum_mean": float(
+                (self.allocation_n + self.allocation_v).mean()
+            ),
+            "allocation_sum_max_error_to_q_c": float(
+                (self.allocation_n + self.allocation_v - self.q_c).abs().max()
+            ),
             "mean_user_n_block_norm": float(user0[:, n_start:v_start].norm(dim=1).mean()),
             "mean_user_v_block_norm": float(user0[:, v_start:].norm(dim=1).mean()),
             "mean_item_n_block_norm": float(item0[:, n_start:v_start].norm(dim=1).mean()),

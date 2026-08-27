@@ -7,7 +7,9 @@ from clv_fixed_composition_nv_model import (
     FixedCompositionNVLightGCN,
     ItemAxisAffinity,
     build_popularity_controlled_item_affinities,
+    fixed_axis_allocation,
     fixed_axis_composition,
+    fixed_total_level_percentile,
 )
 
 
@@ -47,6 +49,7 @@ def _model():
         item_affinity=item,
         q_n=np.array([0.9, 0.1, 0.5], np.float32),
         q_v=np.array([0.1, 0.9, 0.5], np.float32),
+        q_c=np.array([0.9, 0.2, 0.5], np.float32),
         adj=_adj(),
         id_dim=6,
         axis_dim=2,
@@ -72,6 +75,27 @@ def test_fixed_composition_allocates_one_nonnegative_budget_per_valid_user():
     assert pi_n[3] == pytest.approx(0.0)
     assert pi_v[3] == pytest.approx(0.0)
     np.testing.assert_allclose((pi_n + pi_v)[:3], 1.0)
+
+
+def test_total_level_percentile_and_axis_allocation_keep_magnitude_and_composition():
+    q_c = fixed_total_level_percentile(
+        np.array([2.0, 8.0, 4.0, 99.0]),
+        np.array([True, True, True, False]),
+    )
+    pi_n, pi_v, b_n, b_v = fixed_axis_allocation(
+        np.array([0.9, 0.1, 0.5, 0.5]),
+        np.array([0.1, 0.9, 0.5, 0.5]),
+        q_c,
+        np.array([True, True, True, False]),
+        np.array([True, True, True, False]),
+    )
+
+    assert q_c[1] > q_c[2] > q_c[0] > q_c[3]
+    assert pi_n[0] > pi_v[0]
+    assert pi_n[1] < pi_v[1]
+    np.testing.assert_allclose(b_n + b_v, q_c, atol=1e-7)
+    assert b_n[0] > b_v[0]
+    assert b_n[1] < b_v[1]
 
 
 def test_item_affinity_uses_unique_buyers_and_removes_degree_direction():
@@ -121,12 +145,12 @@ def test_layer0_is_id_n_v_with_fixed_rho_and_normalized_axis_blocks():
     assert "rho" not in dict(model.named_parameters())
     np.testing.assert_allclose(
         user[:, 6:8].norm(dim=1).detach().numpy(),
-        np.sqrt(0.05) * model.pi_n.detach().numpy(),
+        np.sqrt(0.05) * model.allocation_n.detach().numpy(),
         rtol=1e-5,
     )
     np.testing.assert_allclose(
         user[:, 8:10].norm(dim=1).detach().numpy(),
-        np.sqrt(0.05) * model.pi_v.detach().numpy(),
+        np.sqrt(0.05) * model.allocation_v.detach().numpy(),
         rtol=1e-5,
     )
     np.testing.assert_allclose(
