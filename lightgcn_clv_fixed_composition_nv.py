@@ -31,7 +31,7 @@ import lightgcn_clv_residual as residual
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m2-total-level-composition-nv-historical-screen-v2"
+CODE_VERSION = "m2-total-level-composition-nv-historical-screen-v2.1"
 MODEL_ID = "m2_total_level_composition_nv"
 
 
@@ -203,7 +203,6 @@ def _prepare(cfg: FixedCompositionNVConfig) -> dict:
         n_items=data["n_items"],
         q_n=axes["q_n"],
         q_v=axes["q_v"],
-        q_c=axes["q_c"],
         user_activity_valid=axes["activity_valid"],
         user_value_valid=axes["value_valid"],
     )
@@ -243,6 +242,7 @@ def _build_model(prepared: dict, cfg: FixedCompositionNVConfig):
         item_affinity=prepared["item_affinity"],
         q_n=axes["q_n"],
         q_v=axes["q_v"],
+        q_c=axes["q_c"],
         adj=data["adj"],
         id_dim=cfg.id_dim,
         axis_dim=cfg.axis_dim,
