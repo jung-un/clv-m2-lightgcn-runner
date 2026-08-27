@@ -30,9 +30,11 @@ class PersonalHistoryWeights:
 def _spearman(left: np.ndarray, right: np.ndarray) -> float:
     if len(left) < 2:
         return 0.0
-    value = pd.Series(left).rank(method="average").corr(
-        pd.Series(right).rank(method="average")
-    )
+    left_rank = pd.Series(left).rank(method="average")
+    right_rank = pd.Series(right).rank(method="average")
+    if left_rank.nunique(dropna=True) < 2 or right_rank.nunique(dropna=True) < 2:
+        return 0.0
+    value = left_rank.corr(right_rank)
     return 0.0 if pd.isna(value) else float(value)
 
 
@@ -130,6 +132,189 @@ def build_personal_history_weights(
         ),
         "activity_share_mean": float(activity_share.mean()),
         "value_share_mean": float(value_share.mean()),
+    }
+    return PersonalHistoryWeights(
+        users=users,
+        items=items,
+        activity_share=activity_share.astype(np.float32),
+        value_share=value_share.astype(np.float32),
+        diagnostics=diagnostics,
+    )
+
+
+def build_temporally_decayed_personal_history_weights(
+    train: pd.DataFrame,
+    *,
+    n_users: int,
+    n_items: int,
+    is_date: bool,
+) -> PersonalHistoryWeights:
+    """Add a fixed relationship-recency decay to the two history shares.
+
+    The decay scale is each user's mean gap between distinct baskets.  Users
+    with fewer than two baskets (or a non-positive mean gap) fall back to the
+    original within-user shares.  All quantities are estimated from ``train``
+    only, and both decayed shares are renormalized within each user.
+    """
+    required = {"u_idx", "i_idx", "b_raw", "v", "t"}
+    missing = required.difference(train.columns)
+    if missing:
+        raise ValueError(f"시간감쇠 개인 구매이력 입력 열 누락: {sorted(missing)}")
+    if n_users <= 0 or n_items <= 0:
+        raise ValueError("n_users와 n_items는 양수여야 합니다")
+
+    columns = ["u_idx", "i_idx", "b_raw", "v", "t"]
+    frame = train.loc[:, columns].copy()
+    frame["positive_value"] = frame["v"].clip(lower=0.0)
+    if is_date:
+        frame["t"] = pd.to_datetime(frame["t"], errors="raise")
+    else:
+        frame["t"] = pd.to_numeric(frame["t"], errors="raise")
+
+    pairs = (
+        frame.groupby(["u_idx", "i_idx"], sort=True)
+        .agg(
+            basket_count=("b_raw", "nunique"),
+            purchase_amount=("positive_value", "sum"),
+            last_time=("t", "max"),
+        )
+        .reset_index()
+    )
+    users = pairs["u_idx"].to_numpy(np.int64)
+    items = pairs["i_idx"].to_numpy(np.int64)
+    if ((users < 0) | (users >= n_users)).any():
+        raise ValueError("u_idx가 사용자 범위를 벗어났습니다")
+    if ((items < 0) | (items >= n_items)).any():
+        raise ValueError("i_idx가 아이템 범위를 벗어났습니다")
+
+    baskets = (
+        frame.groupby(["u_idx", "b_raw"], sort=True)["t"]
+        .max()
+        .reset_index()
+        .sort_values(["u_idx", "t", "b_raw"], kind="stable")
+    )
+    time_gap = baskets.groupby("u_idx", sort=False)["t"].diff()
+    if is_date:
+        gap_days = time_gap.dt.total_seconds().div(86400.0)
+    else:
+        gap_days = pd.to_numeric(time_gap, errors="coerce")
+    baskets["gap_days"] = gap_days
+    mean_gap_by_user = baskets.groupby("u_idx", sort=False)["gap_days"].mean()
+    mean_gap = np.zeros(n_users, dtype=np.float64)
+    gap_users = mean_gap_by_user.index.to_numpy(np.int64)
+    mean_gap[gap_users] = mean_gap_by_user.to_numpy(np.float64)
+    gap_valid = np.isfinite(mean_gap) & (mean_gap > 0.0)
+
+    train_end = frame["t"].max()
+    if is_date:
+        recency_days = (
+            pd.Timestamp(train_end) - pd.to_datetime(pairs["last_time"])
+        ).dt.total_seconds().div(86400.0).to_numpy(np.float64)
+        train_end_value: str | float = str(pd.Timestamp(train_end))
+    else:
+        recency_days = (
+            float(train_end)
+            - pd.to_numeric(pairs["last_time"], errors="raise").to_numpy(np.float64)
+        )
+        train_end_value = float(train_end)
+    recency_days = np.maximum(recency_days, 0.0)
+    decay = np.ones(len(pairs), dtype=np.float64)
+    valid_pairs = gap_valid[users]
+    decay[valid_pairs] = np.exp(
+        -np.minimum(recency_days[valid_pairs] / mean_gap[users[valid_pairs]], 80.0)
+    )
+
+    raw_activity_mass = pairs["basket_count"].to_numpy(np.float64)
+    raw_value_mass = pairs["purchase_amount"].to_numpy(np.float64)
+    activity_mass = raw_activity_mass * decay
+    value_mass = raw_value_mass * decay
+    activity_total = np.bincount(
+        users, weights=activity_mass, minlength=n_users
+    ).astype(np.float64)
+    value_total = np.bincount(
+        users, weights=value_mass, minlength=n_users
+    ).astype(np.float64)
+    activity_share = np.divide(
+        activity_mass,
+        activity_total[users],
+        out=np.zeros_like(activity_mass),
+        where=activity_total[users] > 0,
+    )
+    value_share = np.divide(
+        value_mass,
+        value_total[users],
+        out=np.zeros_like(value_mass),
+        where=value_total[users] > 0,
+    )
+
+    raw_activity_total = np.bincount(
+        users, weights=raw_activity_mass, minlength=n_users
+    ).astype(np.float64)
+    raw_value_total = np.bincount(
+        users, weights=raw_value_mass, minlength=n_users
+    ).astype(np.float64)
+    raw_activity_share = raw_activity_mass / raw_activity_total[users]
+    raw_value_share = np.divide(
+        raw_value_mass,
+        raw_value_total[users],
+        out=np.zeros_like(raw_value_mass),
+        where=raw_value_total[users] > 0,
+    )
+
+    activity_row_sum = np.bincount(
+        users, weights=activity_share, minlength=n_users
+    )
+    value_row_sum = np.bincount(users, weights=value_share, minlength=n_users)
+    activity_valid = activity_total > 0
+    value_valid = value_total > 0
+    degree = np.bincount(items, minlength=n_items).astype(np.float64)
+    received_n = np.bincount(
+        items, weights=activity_share, minlength=n_items
+    ).astype(np.float64)
+    received_v = np.bincount(
+        items, weights=value_share, minlength=n_items
+    ).astype(np.float64)
+    observed_items = degree > 0
+    observed_users = np.bincount(users, minlength=n_users) > 0
+    diagnostics = {
+        "history_edge_count": int(len(pairs)),
+        "activity_valid_user_share": float(activity_valid.mean()),
+        "value_valid_user_share": float(value_valid.mean()),
+        "activity_row_sum_max_error": float(
+            np.abs(activity_row_sum[activity_valid] - 1.0).max()
+            if activity_valid.any()
+            else 0.0
+        ),
+        "value_row_sum_max_error": float(
+            np.abs(value_row_sum[value_valid] - 1.0).max()
+            if value_valid.any()
+            else 0.0
+        ),
+        "activity_received_mass_degree_spearman": _spearman(
+            received_n[observed_items], degree[observed_items]
+        ),
+        "value_received_mass_degree_spearman": _spearman(
+            received_v[observed_items], degree[observed_items]
+        ),
+        "activity_share_mean": float(activity_share.mean()),
+        "value_share_mean": float(value_share.mean()),
+        "temporal_train_end": train_end_value,
+        "temporal_gap_valid_user_share": float(gap_valid.mean()),
+        "temporal_fallback_user_share": float(
+            (observed_users & ~gap_valid).sum() / max(observed_users.sum(), 1)
+        ),
+        "temporal_mean_gap_days_valid": float(
+            mean_gap[gap_valid].mean() if gap_valid.any() else 0.0
+        ),
+        "temporal_recency_days_mean": float(recency_days.mean()),
+        "temporal_decay_mean": float(decay.mean()),
+        "temporal_decay_min": float(decay.min() if len(decay) else 1.0),
+        "temporal_activity_share_l1_shift_mean": float(
+            np.abs(activity_share - raw_activity_share).mean()
+        ),
+        "temporal_value_share_l1_shift_mean": float(
+            np.abs(value_share - raw_value_share).mean()
+        ),
     }
     return PersonalHistoryWeights(
         users=users,

@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -5,7 +7,9 @@ import torch
 
 from clv_history_item_fit_model import (
     HistoryItemFitLightGCN,
+    _spearman,
     build_personal_history_weights,
+    build_temporally_decayed_personal_history_weights,
 )
 
 
@@ -57,6 +61,15 @@ def _model():
     )
 
 
+def test_spearman_returns_zero_for_constant_input_without_numpy_warning():
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        value = _spearman(np.array([1.0, 1.0]), np.array([1.0, 2.0]))
+
+    assert value == 0.0
+    assert len(captured) == 0
+
+
 def test_personal_history_weights_are_normalized_within_each_user():
     history = build_personal_history_weights(
         _history_frame(), n_users=2, n_items=3
@@ -75,6 +88,65 @@ def test_personal_history_weights_are_normalized_within_each_user():
     assert by_key[1][1] == pytest.approx(0.7)
     assert history.diagnostics["activity_row_sum_max_error"] < 1e-7
     assert history.diagnostics["value_row_sum_max_error"] < 1e-7
+
+
+def test_temporal_decay_emphasizes_recent_items_and_renormalizes_each_user():
+    frame = pd.DataFrame(
+        [
+            {"u_idx": 0, "i_idx": 0, "b_raw": "old", "v": 10.0, "t": 0},
+            {"u_idx": 0, "i_idx": 1, "b_raw": "recent", "v": 10.0, "t": 9},
+            {"u_idx": 1, "i_idx": 2, "b_raw": "only", "v": 5.0, "t": 10},
+        ]
+    )
+
+    history = build_temporally_decayed_personal_history_weights(
+        frame, n_users=2, n_items=3, is_date=False
+    )
+    key = history.users * 3 + history.items
+    by_key = {
+        int(pair): (float(n), float(v))
+        for pair, n, v in zip(
+            key, history.activity_share, history.value_share, strict=True
+        )
+    }
+
+    assert by_key[1][0] > by_key[0][0]
+    assert by_key[1][1] > by_key[0][1]
+    assert by_key[0][0] + by_key[1][0] == pytest.approx(1.0)
+    assert by_key[0][1] + by_key[1][1] == pytest.approx(1.0)
+    assert by_key[5] == pytest.approx((1.0, 1.0))
+    assert history.diagnostics["temporal_gap_valid_user_share"] == pytest.approx(0.5)
+    assert history.diagnostics["temporal_fallback_user_share"] == pytest.approx(0.5)
+
+
+def test_temporal_decay_accepts_dates_and_uses_train_history_only():
+    frame = pd.DataFrame(
+        [
+            {
+                "u_idx": 0,
+                "i_idx": 0,
+                "b_raw": "a",
+                "v": 1.0,
+                "t": pd.Timestamp("2020-01-01"),
+            },
+            {
+                "u_idx": 0,
+                "i_idx": 1,
+                "b_raw": "b",
+                "v": 1.0,
+                "t": pd.Timestamp("2020-01-11"),
+            },
+        ]
+    )
+
+    history = build_temporally_decayed_personal_history_weights(
+        frame, n_users=1, n_items=2, is_date=True
+    )
+
+    assert history.diagnostics["temporal_train_end"] == "2020-01-11 00:00:00"
+    assert history.diagnostics["temporal_mean_gap_days_valid"] == pytest.approx(10.0)
+    assert history.activity_share.sum() == pytest.approx(1.0)
+    assert history.value_share.sum() == pytest.approx(1.0)
 
 
 def test_positive_item_is_removed_and_remaining_history_is_renormalized():
