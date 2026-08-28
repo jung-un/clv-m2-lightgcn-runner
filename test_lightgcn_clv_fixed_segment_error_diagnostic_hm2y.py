@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -88,3 +91,20 @@ def test_checkpoint_path_uses_exact_hm2y_m1_hash(tmp_path):
         diagnostic.v3.cfg_hash = original
 
     assert path == tmp_path / "ckpt_pref_only_hm_s42_abc12345.pt"
+
+
+def test_hm2y_diagnostic_colab_is_pinned_and_runs_once():
+    path = Path(__file__).with_name(
+        "clv_m1_fixed_clv_nv_segment_error_diagnostic_hm2y_colab.ipynb"
+    )
+    notebook = json.loads(path.read_text())
+    code = "\n".join(
+        "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if cell["cell_type"] == "code"
+    )
+
+    assert "46f485bcb266cb796aa170cf52290c7ebcc8bc5b" in code
+    assert code.count("run_hm2y_fixed_segment_error_diagnostic(cfg)") == 1
+    assert "summary['test_executed'] is False" in code
+    assert "summary['holdout_executed'] is False" in code
