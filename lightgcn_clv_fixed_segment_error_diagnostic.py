@@ -28,7 +28,7 @@ import lightgcn_clv_history_item_fit_diagnostic as item_fit
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m1-fixed-clv-segment-error-diagnostic-v1.1"
+CODE_VERSION = "m1-fixed-clv-segment-error-diagnostic-v1.2"
 SEGMENT_ORDER = tuple(v3.SEG_NAMES)
 ROLE_ORDER = (
     "truth_all",
@@ -136,6 +136,16 @@ def segments_for_users(cache, users: np.ndarray) -> np.ndarray:
     except KeyError as error:
         raise KeyError(f"unknown evaluation user: {int(error.args[0])}") from error
     return cache_segments[positions]
+
+
+def _raw_item_traits(train: pd.DataFrame, n_items: int) -> pd.DataFrame:
+    """Build item traits with the implementation owned by item-fit diagnostics.
+
+    The similarly named gate-free diagnostic module does not expose this
+    helper.  Keeping the adapter here makes the dependency explicit and gives
+    this diagnostic one stable call site.
+    """
+    return item_fit._raw_item_traits(train, n_items)
 
 
 def item_role_occurrences(
@@ -480,7 +490,7 @@ def run_fixed_segment_error_diagnostic(
         top50=top50,
         truth_amount=prepared["cache"].rev,
     )
-    item_traits = common._raw_item_traits(
+    item_traits = _raw_item_traits(
         prepared["data"]["train"], prepared["data"]["n_items"]
     )
     occurrences = occurrences.merge(item_traits, on="item_idx", how="left")

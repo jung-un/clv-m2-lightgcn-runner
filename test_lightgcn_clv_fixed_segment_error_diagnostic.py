@@ -5,6 +5,24 @@ from types import SimpleNamespace
 import lightgcn_clv_fixed_segment_error_diagnostic as diagnostic
 
 
+def test_raw_item_traits_is_available_for_the_segment_diagnostic():
+    train = pd.DataFrame(
+        {
+            "u_idx": [0, 1],
+            "i_idx": [0, 1],
+            "i_raw": ["item-a", "item-b"],
+            "cat_raw": ["cat-a", "cat-b"],
+            "b_raw": ["basket-a", "basket-b"],
+            "up": [1.0, 2.0],
+        }
+    )
+
+    traits = diagnostic._raw_item_traits(train, n_items=2)
+
+    assert traits["item_idx"].tolist() == [0, 1]
+    assert traits["item_id"].tolist() == ["item-a", "item-b"]
+
+
 def test_item_role_occurrences_separates_hits_misses_and_false_positives():
     frame = diagnostic.item_role_occurrences(
         users=np.array([0]),
