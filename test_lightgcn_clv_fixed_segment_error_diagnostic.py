@@ -19,8 +19,17 @@ def test_raw_item_traits_is_available_for_the_segment_diagnostic():
 
     traits = diagnostic._raw_item_traits(train, n_items=2)
 
+    assert {
+        "item_idx",
+        "item_id",
+        "category",
+        "train_user_count",
+        "price_percentile",
+        "repeat_purchase_share",
+    }.issubset(traits.columns)
     assert traits["item_idx"].tolist() == [0, 1]
     assert traits["item_id"].tolist() == ["item-a", "item-b"]
+    assert traits["repeat_purchase_share"].tolist() == [0.0, 0.0]
 
 
 def test_item_role_occurrences_separates_hits_misses_and_false_positives():

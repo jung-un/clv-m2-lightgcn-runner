@@ -28,7 +28,7 @@ import lightgcn_clv_history_item_fit_diagnostic as item_fit
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m1-fixed-clv-segment-error-diagnostic-v1.2"
+CODE_VERSION = "m1-fixed-clv-segment-error-diagnostic-v1.3"
 SEGMENT_ORDER = tuple(v3.SEG_NAMES)
 ROLE_ORDER = (
     "truth_all",
@@ -139,13 +139,28 @@ def segments_for_users(cache, users: np.ndarray) -> np.ndarray:
 
 
 def _raw_item_traits(train: pd.DataFrame, n_items: int) -> pd.DataFrame:
-    """Build item traits with the implementation owned by item-fit diagnostics.
+    """Build the exact train-only item columns consumed by this diagnostic."""
+    def modal(series: pd.Series):
+        mode = series.mode(dropna=True)
+        return mode.iat[0] if len(mode) else "UNKNOWN"
 
-    The similarly named gate-free diagnostic module does not expose this
-    helper.  Keeping the adapter here makes the dependency explicit and gives
-    this diagnostic one stable call site.
-    """
-    return item_fit._raw_item_traits(train, n_items)
+    item = train.groupby("i_idx", sort=True).agg(
+        item_id=("i_raw", "first"),
+        category=("cat_raw", modal),
+        train_user_count=("u_idx", "nunique"),
+        mean_unit_price=("up", "mean"),
+    )
+    pair_counts = train.groupby(["u_idx", "i_idx"], sort=False).size()
+    item["repeat_purchase_share"] = (
+        pair_counts.gt(1).groupby(level="i_idx").mean()
+    )
+    item["price_percentile"] = item["mean_unit_price"].rank(
+        pct=True, method="average"
+    )
+    result = pd.DataFrame({"item_idx": np.arange(n_items, dtype=np.int64)})
+    return result.merge(
+        item.rename_axis("item_idx").reset_index(), on="item_idx", how="left"
+    )
 
 
 def item_role_occurrences(
