@@ -145,3 +145,70 @@ def test_segments_for_users_maps_global_user_ids_through_eval_user_order():
 
 def test_segment_order_reuses_the_canonical_evaluation_labels():
     assert diagnostic.SEGMENT_ORDER == tuple(diagnostic.v3.SEG_NAMES)
+
+
+def test_user_value_groups_separate_quadrants_and_high_clv_composition():
+    q_n = np.array([0.1, 0.9, 0.1, 0.9, 0.1, 0.2, 0.45, 0.55, 0.7, 0.9])
+    q_v = np.array([0.1, 0.1, 0.9, 0.9, 0.9, 0.7, 0.55, 0.45, 0.2, 0.1])
+    clv = np.array([1.0, 2.0, 3.0, 4.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0])
+    axes = {
+        "q_n": q_n,
+        "q_v": q_v,
+        "n_behavior_score": np.arange(1.0, 11.0),
+        "v_behavior_score": np.arange(11.0, 21.0),
+        "clv_proxy": clv,
+        "valid_user": np.ones(10, dtype=bool),
+        "activity_valid": np.ones(10, dtype=bool),
+        "value_valid": np.ones(10, dtype=bool),
+    }
+
+    groups, thresholds = diagnostic.build_user_value_groups(
+        axes,
+        clv_thresholds=(2.0, 10.0),
+        evaluation_users=np.array([0, 4, 9]),
+    )
+
+    assert groups.loc[:3, "nv_quadrant"].tolist() == list(
+        diagnostic.NV_QUADRANT_ORDER
+    )
+    assert groups.loc[4:9, "high_clv_composition"].tolist() == [
+        "V우세 고CLV",
+        "V우세 고CLV",
+        "균형 고CLV",
+        "균형 고CLV",
+        "N우세 고CLV",
+        "N우세 고CLV",
+    ]
+    assert groups.loc[groups.is_evaluation_user, "user_idx"].tolist() == [0, 4, 9]
+    assert thresholds["high_clv_train_user_count"] == 6
+
+
+def test_metrics_and_item_contrasts_can_group_by_nv_quadrant():
+    membership = pd.DataFrame(
+        {
+            "user_idx": [0, 1],
+            "nv_quadrant": ["저N·저V", "고N·고V"],
+            "n_behavior_score": [1.0, 2.0],
+            "v_behavior_score": [3.0, 4.0],
+            "historical_clv_proxy": [3.0, 8.0],
+            "q_n": [0.1, 0.9],
+            "q_v": [0.2, 0.8],
+            "q_n_minus_q_v": [-0.1, 0.1],
+        }
+    )
+    per_user = pd.DataFrame(
+        {
+            "user_idx": [0, 1],
+            "truth_item_count": [2, 4],
+            "recall@10": [0.5, 0.25],
+        }
+    )
+    metrics = diagnostic.summarize_metrics_by_group(
+        per_user,
+        membership,
+        group_column="nv_quadrant",
+        group_order=diagnostic.NV_QUADRANT_ORDER,
+    )
+
+    assert metrics.loc[metrics.nv_quadrant.eq("저N·저V"), "recall@10"].iat[0] == 0.5
+    assert metrics.loc[metrics.nv_quadrant.eq("고N·고V"), "mean_truth_items"].iat[0] == 4.0

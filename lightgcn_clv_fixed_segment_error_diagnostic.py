@@ -28,8 +28,19 @@ import lightgcn_clv_history_item_fit_diagnostic as item_fit
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m1-fixed-clv-segment-error-diagnostic-v1.3"
+CODE_VERSION = "m1-fixed-clv-segment-error-diagnostic-v1.4"
 SEGMENT_ORDER = tuple(v3.SEG_NAMES)
+NV_QUADRANT_ORDER = (
+    "저N·저V",
+    "고N·저V",
+    "저N·고V",
+    "고N·고V",
+)
+HIGH_CLV_COMPOSITION_ORDER = (
+    "V우세 고CLV",
+    "균형 고CLV",
+    "N우세 고CLV",
+)
 ROLE_ORDER = (
     "truth_all",
     "truth_hit_top10",
@@ -87,6 +98,16 @@ def preflight_summary(cfg: FixedSegmentErrorDiagnosticConfig) -> dict:
         "split": "historical_development_days_684_690",
         "fixed_clv_source": "train-history N×V proxy at day 683",
         "segments": list(SEGMENT_ORDER),
+        "nv_quadrants": list(NV_QUADRANT_ORDER),
+        "high_clv_compositions": list(HIGH_CLV_COMPOSITION_ORDER),
+        "nv_group_definition": (
+            "q_N and q_V are train-history percentiles; low < 0.5 and "
+            "high >= 0.5"
+        ),
+        "high_clv_composition_definition": (
+            "within train-history high-CLV users, tertiles of q_N-q_V "
+            "define V-dominant, balanced, and N-dominant composition"
+        ),
         "roles": list(ROLE_ORDER),
         "comparison": (
             "held-out truth, Top-10 hits, Top-10 misses, and Top-10 false "
@@ -136,6 +157,115 @@ def segments_for_users(cache, users: np.ndarray) -> np.ndarray:
     except KeyError as error:
         raise KeyError(f"unknown evaluation user: {int(error.args[0])}") from error
     return cache_segments[positions]
+
+
+def build_user_value_groups(
+    axes: dict,
+    *,
+    clv_thresholds: tuple[float, float],
+    evaluation_users: np.ndarray,
+) -> tuple[pd.DataFrame, dict]:
+    """Build fixed train-only N/V groups without using evaluation outcomes."""
+    q_n = np.asarray(axes["q_n"], dtype=np.float64)
+    q_v = np.asarray(axes["q_v"], dtype=np.float64)
+    n_score = np.asarray(axes["n_behavior_score"], dtype=np.float64)
+    v_score = np.asarray(axes["v_behavior_score"], dtype=np.float64)
+    clv = np.asarray(axes["clv_proxy"], dtype=np.float64)
+    valid = (
+        np.asarray(axes["valid_user"], dtype=bool)
+        & np.asarray(axes["activity_valid"], dtype=bool)
+        & np.asarray(axes["value_valid"], dtype=bool)
+        & np.isfinite(q_n)
+        & np.isfinite(q_v)
+        & np.isfinite(clv)
+    )
+    lengths = {len(q_n), len(q_v), len(n_score), len(v_score), len(clv), len(valid)}
+    if len(lengths) != 1:
+        raise ValueError("N/V 사용자 입력의 길이가 서로 다릅니다")
+
+    low_clv, high_clv = map(float, clv_thresholds)
+    fixed_segment = np.where(
+        clv <= low_clv,
+        SEGMENT_ORDER[0],
+        np.where(clv >= high_clv, SEGMENT_ORDER[2], SEGMENT_ORDER[1]),
+    )
+    nv_quadrant = np.full(len(clv), "계산불가", dtype=object)
+    nv_quadrant[valid & (q_n < 0.5) & (q_v < 0.5)] = NV_QUADRANT_ORDER[0]
+    nv_quadrant[valid & (q_n >= 0.5) & (q_v < 0.5)] = NV_QUADRANT_ORDER[1]
+    nv_quadrant[valid & (q_n < 0.5) & (q_v >= 0.5)] = NV_QUADRANT_ORDER[2]
+    nv_quadrant[valid & (q_n >= 0.5) & (q_v >= 0.5)] = NV_QUADRANT_ORDER[3]
+
+    difference = q_n - q_v
+    high_valid = valid & fixed_segment.astype(str).__eq__(SEGMENT_ORDER[2])
+    if int(high_valid.sum()) < 3:
+        raise ValueError("고CLV 유효 학습고객이 3명보다 적어 구성 3분위를 만들 수 없습니다")
+    lower, upper = np.quantile(difference[high_valid], [1.0 / 3.0, 2.0 / 3.0])
+    composition = np.full(len(clv), "비고CLV", dtype=object)
+    composition[high_valid & (difference <= lower)] = HIGH_CLV_COMPOSITION_ORDER[0]
+    composition[high_valid & (difference > lower) & (difference < upper)] = (
+        HIGH_CLV_COMPOSITION_ORDER[1]
+    )
+    composition[high_valid & (difference >= upper)] = HIGH_CLV_COMPOSITION_ORDER[2]
+
+    evaluation_mask = np.zeros(len(clv), dtype=bool)
+    requested_users = np.asarray(evaluation_users, dtype=np.int64)
+    if len(requested_users) and (
+        requested_users.min() < 0 or requested_users.max() >= len(clv)
+    ):
+        raise ValueError("평가 사용자 ID가 사용자 입력 범위를 벗어났습니다")
+    evaluation_mask[requested_users] = True
+    membership = pd.DataFrame(
+        {
+            "user_idx": np.arange(len(clv), dtype=np.int64),
+            "fixed_clv_segment": fixed_segment,
+            "nv_quadrant": nv_quadrant,
+            "high_clv_composition": composition,
+            "n_behavior_score": n_score,
+            "v_behavior_score": v_score,
+            "historical_clv_proxy": clv,
+            "q_n": q_n,
+            "q_v": q_v,
+            "q_n_minus_q_v": difference,
+            "axis_valid": valid,
+            "is_evaluation_user": evaluation_mask,
+        }
+    )
+    thresholds = {
+        "fixed_clv_low_max": low_clv,
+        "fixed_clv_high_min": high_clv,
+        "nv_low_high_cutoff": 0.5,
+        "high_clv_qn_minus_qv_lower_tertile": float(lower),
+        "high_clv_qn_minus_qv_upper_tertile": float(upper),
+        "high_clv_train_user_count": int(high_valid.sum()),
+        "axis_valid_train_user_count": int(valid.sum()),
+    }
+    return membership, thresholds
+
+
+def summarize_user_groups(
+    membership: pd.DataFrame,
+    *,
+    group_column: str,
+    group_order: tuple[str, ...],
+) -> pd.DataFrame:
+    selected = membership[membership[group_column].isin(group_order)].copy()
+    selected[group_column] = pd.Categorical(
+        selected[group_column], categories=group_order, ordered=True
+    )
+    return (
+        selected.groupby(group_column, observed=False, sort=True)
+        .agg(
+            n_train_users=("user_idx", "size"),
+            n_evaluation_users=("is_evaluation_user", "sum"),
+            mean_n_behavior_score=("n_behavior_score", "mean"),
+            mean_v_behavior_score=("v_behavior_score", "mean"),
+            mean_historical_clv_proxy=("historical_clv_proxy", "mean"),
+            mean_q_n=("q_n", "mean"),
+            mean_q_v=("q_v", "mean"),
+            mean_q_n_minus_q_v=("q_n_minus_q_v", "mean"),
+        )
+        .reset_index()
+    )
 
 
 def _raw_item_traits(train: pd.DataFrame, n_items: int) -> pd.DataFrame:
@@ -283,7 +413,9 @@ def attach_history_relations(
     return output
 
 
-def summarize_segment_item_roles(occurrences: pd.DataFrame) -> pd.DataFrame:
+def summarize_item_roles_by(
+    occurrences: pd.DataFrame, *, group_column: str
+) -> pd.DataFrame:
     available = [trait for trait in TRAITS if trait in occurrences]
     aggregations = {
         "item_occurrence_count": ("item_idx", "size"),
@@ -291,16 +423,25 @@ def summarize_segment_item_roles(occurrences: pd.DataFrame) -> pd.DataFrame:
         **{f"mean_{trait}": (trait, "mean") for trait in available},
     }
     return (
-        occurrences.groupby(["segment", "role"], sort=False, dropna=False)
+        occurrences.groupby([group_column, "role"], sort=False, dropna=False)
         .agg(**aggregations)
         .reset_index()
     )
 
 
-def miss_false_positive_contrasts(summary: pd.DataFrame) -> pd.DataFrame:
+def summarize_segment_item_roles(occurrences: pd.DataFrame) -> pd.DataFrame:
+    return summarize_item_roles_by(occurrences, group_column="segment")
+
+
+def contrasts_by_group(
+    summary: pd.DataFrame,
+    *,
+    group_column: str,
+    group_order: tuple[str, ...],
+) -> pd.DataFrame:
     rows = []
-    for segment in SEGMENT_ORDER:
-        selected = summary[summary.segment.eq(segment)].set_index("role")
+    for group in group_order:
+        selected = summary[summary[group_column].eq(group)].set_index("role")
         if not {"truth_miss_top10", "false_positive_top10"}.issubset(selected.index):
             continue
         for trait in TRAITS:
@@ -311,7 +452,7 @@ def miss_false_positive_contrasts(summary: pd.DataFrame) -> pd.DataFrame:
             false_positive = float(selected.at["false_positive_top10", column])
             rows.append(
                 {
-                    "segment": segment,
+                    group_column: group,
                     "trait": trait,
                     "truth_miss_mean": missed,
                     "false_positive_mean": false_positive,
@@ -321,7 +462,13 @@ def miss_false_positive_contrasts(summary: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _segment_metrics(
+def miss_false_positive_contrasts(summary: pd.DataFrame) -> pd.DataFrame:
+    return contrasts_by_group(
+        summary, group_column="segment", group_order=SEGMENT_ORDER
+    )
+
+
+def _per_user_metrics(
     *, users: np.ndarray, top50: np.ndarray, prepared: dict
 ) -> pd.DataFrame:
     cache, meta, data = prepared["cache"], prepared["meta"], prepared["data"]
@@ -342,7 +489,6 @@ def _segment_metrics(
     frame = pd.DataFrame(
         {
             "user_idx": users,
-            "segment": segments_for_users(cache, users),
             "truth_item_count": cache.P_arr[users],
         }
     )
@@ -353,6 +499,56 @@ def _segment_metrics(
     for k, metrics in scored.items():
         for metric in ("recall", "precision", "ndcg", "hr", "map", "revenue", "arp"):
             frame[f"{aliases.get(metric, metric)}@{k}"] = metrics[metric]
+    return frame
+
+
+def summarize_metrics_by_group(
+    per_user: pd.DataFrame,
+    membership: pd.DataFrame,
+    *,
+    group_column: str,
+    group_order: tuple[str, ...],
+) -> pd.DataFrame:
+    user_columns = [
+        "user_idx",
+        group_column,
+        "n_behavior_score",
+        "v_behavior_score",
+        "historical_clv_proxy",
+        "q_n",
+        "q_v",
+        "q_n_minus_q_v",
+    ]
+    frame = per_user.merge(
+        membership[user_columns], on="user_idx", how="left", validate="one_to_one"
+    )
+    frame = frame[frame[group_column].isin(group_order)].copy()
+    frame[group_column] = pd.Categorical(
+        frame[group_column], categories=group_order, ordered=True
+    )
+    metric_columns = [column for column in frame if "@" in column]
+    return (
+        frame.groupby(group_column, observed=False, sort=True)
+        .agg(
+            n_users=("user_idx", "size"),
+            mean_truth_items=("truth_item_count", "mean"),
+            mean_n_behavior_score=("n_behavior_score", "mean"),
+            mean_v_behavior_score=("v_behavior_score", "mean"),
+            mean_historical_clv_proxy=("historical_clv_proxy", "mean"),
+            mean_q_n=("q_n", "mean"),
+            mean_q_v=("q_v", "mean"),
+            mean_q_n_minus_q_v=("q_n_minus_q_v", "mean"),
+            **{column: (column, "mean") for column in metric_columns},
+        )
+        .reset_index()
+    )
+
+
+def _segment_metrics(
+    *, users: np.ndarray, top50: np.ndarray, prepared: dict
+) -> pd.DataFrame:
+    frame = _per_user_metrics(users=users, top50=top50, prepared=prepared)
+    frame["segment"] = segments_for_users(prepared["cache"], users)
     metric_columns = [column for column in frame if "@" in column]
     return (
         frame.groupby("segment", sort=False)
@@ -365,7 +561,9 @@ def _segment_metrics(
     )
 
 
-def _category_summary(occurrences: pd.DataFrame, top_n: int) -> pd.DataFrame:
+def _category_summary(
+    occurrences: pd.DataFrame, top_n: int, *, group_column: str = "segment"
+) -> pd.DataFrame:
     focused = occurrences[
         occurrences.role.isin(
             ["truth_hit_top10", "truth_miss_top10", "false_positive_top10"]
@@ -374,33 +572,35 @@ def _category_summary(occurrences: pd.DataFrame, top_n: int) -> pd.DataFrame:
     if focused.empty:
         return focused.copy()
     grouped = (
-        focused.groupby(["segment", "role", "category"], dropna=False)
+        focused.groupby([group_column, "role", "category"], dropna=False)
         .size()
         .rename("item_occurrence_count")
         .reset_index()
     )
     grouped["share_within_segment_role"] = grouped.groupby(
-        ["segment", "role"]
+        [group_column, "role"]
     ).item_occurrence_count.transform(lambda values: values / values.sum())
     return (
         grouped.sort_values(
-            ["segment", "role", "item_occurrence_count"],
+            [group_column, "role", "item_occurrence_count"],
             ascending=[True, True, False],
         )
-        .groupby(["segment", "role"], sort=False)
+        .groupby([group_column, "role"], sort=False)
         .head(top_n)
         .reset_index(drop=True)
     )
 
 
-def _examples(occurrences: pd.DataFrame, top_n: int) -> pd.DataFrame:
+def _examples(
+    occurrences: pd.DataFrame, top_n: int, *, group_column: str = "segment"
+) -> pd.DataFrame:
     focused = occurrences[
         occurrences.role.isin(["truth_miss_top10", "false_positive_top10"])
     ]
     if focused.empty:
         return focused.copy()
     grouped = (
-        focused.groupby(["segment", "role", "item_idx"], dropna=False)
+        focused.groupby([group_column, "role", "item_idx"], dropna=False)
         .agg(
             occurrence_count=("item_idx", "size"),
             affected_user_count=("user_idx", "nunique"),
@@ -417,10 +617,10 @@ def _examples(occurrences: pd.DataFrame, top_n: int) -> pd.DataFrame:
     )
     return (
         grouped.sort_values(
-            ["segment", "role", "occurrence_count", "mean_evaluation_purchase_amount"],
+            [group_column, "role", "occurrence_count", "mean_evaluation_purchase_amount"],
             ascending=[True, True, False, False],
         )
-        .groupby(["segment", "role"], sort=False)
+        .groupby([group_column, "role"], sort=False)
         .head(top_n)
         .reset_index(drop=True)
     )
@@ -431,6 +631,19 @@ def _persist(report: dict, cfg: FixedSegmentErrorDiagnosticConfig) -> dict[str, 
     root.mkdir(parents=True, exist_ok=True)
     paths = {
         "segment_metrics_csv": root / "m1_fixed_clv_segment_metrics.csv",
+        "user_value_groups_csv": root / "m1_fixed_clv_nv_user_groups.csv",
+        "nv_quadrant_population_csv": root / "m1_fixed_clv_nv_quadrant_population.csv",
+        "nv_quadrant_metrics_csv": root / "m1_fixed_clv_nv_quadrant_metrics.csv",
+        "nv_quadrant_item_role_summary_csv": root / "m1_fixed_clv_nv_quadrant_item_role_summary.csv",
+        "nv_quadrant_contrasts_csv": root / "m1_fixed_clv_nv_quadrant_contrasts.csv",
+        "nv_quadrant_category_summary_csv": root / "m1_fixed_clv_nv_quadrant_category_summary.csv",
+        "nv_quadrant_examples_csv": root / "m1_fixed_clv_nv_quadrant_examples.csv",
+        "high_clv_composition_population_csv": root / "m1_fixed_clv_high_composition_population.csv",
+        "high_clv_composition_metrics_csv": root / "m1_fixed_clv_high_composition_metrics.csv",
+        "high_clv_composition_item_role_summary_csv": root / "m1_fixed_clv_high_composition_item_role_summary.csv",
+        "high_clv_composition_contrasts_csv": root / "m1_fixed_clv_high_composition_contrasts.csv",
+        "high_clv_composition_category_summary_csv": root / "m1_fixed_clv_high_composition_category_summary.csv",
+        "high_clv_composition_examples_csv": root / "m1_fixed_clv_high_composition_examples.csv",
         "item_role_occurrences_csv": root / "m1_fixed_clv_item_role_occurrences.csv",
         "item_role_summary_csv": root / "m1_fixed_clv_item_role_summary.csv",
         "miss_false_positive_contrasts_csv": root / "m1_fixed_clv_miss_false_positive_contrasts.csv",
@@ -440,6 +653,19 @@ def _persist(report: dict, cfg: FixedSegmentErrorDiagnosticConfig) -> dict[str, 
     }
     frame_mapping = {
         "segment_metrics_csv": "segment_metrics",
+        "user_value_groups_csv": "user_value_groups",
+        "nv_quadrant_population_csv": "nv_quadrant_population",
+        "nv_quadrant_metrics_csv": "nv_quadrant_metrics",
+        "nv_quadrant_item_role_summary_csv": "nv_quadrant_item_role_summary",
+        "nv_quadrant_contrasts_csv": "nv_quadrant_contrasts",
+        "nv_quadrant_category_summary_csv": "nv_quadrant_category_summary",
+        "nv_quadrant_examples_csv": "nv_quadrant_examples",
+        "high_clv_composition_population_csv": "high_clv_composition_population",
+        "high_clv_composition_metrics_csv": "high_clv_composition_metrics",
+        "high_clv_composition_item_role_summary_csv": "high_clv_composition_item_role_summary",
+        "high_clv_composition_contrasts_csv": "high_clv_composition_contrasts",
+        "high_clv_composition_category_summary_csv": "high_clv_composition_category_summary",
+        "high_clv_composition_examples_csv": "high_clv_composition_examples",
         "item_role_occurrences_csv": "item_role_occurrences",
         "item_role_summary_csv": "item_role_summary",
         "miss_false_positive_contrasts_csv": "contrasts",
@@ -453,7 +679,26 @@ def _persist(report: dict, cfg: FixedSegmentErrorDiagnosticConfig) -> dict[str, 
         "config": asdict(cfg),
         "preflight": preflight_summary(cfg),
         "checkpoint": report["checkpoint"],
+        "group_thresholds": report["group_thresholds"],
         "segment_metrics": report["segment_metrics"].to_dict("records"),
+        "nv_quadrant_population": report["nv_quadrant_population"].to_dict("records"),
+        "nv_quadrant_metrics": report["nv_quadrant_metrics"].to_dict("records"),
+        "nv_quadrant_item_role_summary": report[
+            "nv_quadrant_item_role_summary"
+        ].to_dict("records"),
+        "nv_quadrant_contrasts": report["nv_quadrant_contrasts"].to_dict("records"),
+        "high_clv_composition_population": report[
+            "high_clv_composition_population"
+        ].to_dict("records"),
+        "high_clv_composition_metrics": report[
+            "high_clv_composition_metrics"
+        ].to_dict("records"),
+        "high_clv_composition_item_role_summary": report[
+            "high_clv_composition_item_role_summary"
+        ].to_dict("records"),
+        "high_clv_composition_contrasts": report[
+            "high_clv_composition_contrasts"
+        ].to_dict("records"),
         "item_role_summary": report["item_role_summary"].to_dict("records"),
         "miss_false_positive_contrasts": report["contrasts"].to_dict("records"),
         "result_paths": {name: str(path) for name, path in paths.items()},
@@ -465,6 +710,15 @@ def _persist(report: dict, cfg: FixedSegmentErrorDiagnosticConfig) -> dict[str, 
             "otherwise": (
                 "do not implement CLV-segment embeddings; the fixed-CLV "
                 "partition does not explain M1 ranking errors"
+            ),
+            "supports_nv_conditioning_if": (
+                "high-N/low-V and low-N/high-V users, or N-dominant and "
+                "V-dominant high-CLV users, have meaningfully different "
+                "truth and error profiles"
+            ),
+            "otherwise_for_nv": (
+                "use one continuous fixed historical-CLV level rather than "
+                "separate N/V routing"
             ),
         },
         "interpretation_limits": [
@@ -498,9 +752,27 @@ def run_fixed_segment_error_diagnostic(
         max_k=50,
         batch_size=cfg.eval_batch_size,
     )
+    clv_values = np.asarray(prepared["axes"]["clv_proxy"], dtype=np.float64)
+    clv_edges = prepared["base_cfg"]["SEG_EDGES"]
+    non_missing_clv = clv_values[~np.isnan(clv_values)]
+    clv_thresholds = tuple(
+        float(value)
+        for value in np.quantile(non_missing_clv, [clv_edges[0], clv_edges[1]])
+    )
+    user_value_groups, group_thresholds = build_user_value_groups(
+        prepared["axes"],
+        clv_thresholds=clv_thresholds,
+        evaluation_users=users,
+    )
+    expected_segments = segments_for_users(prepared["cache"], users)
+    actual_segments = user_value_groups.set_index("user_idx").loc[
+        users, "fixed_clv_segment"
+    ].to_numpy()
+    if not np.array_equal(expected_segments, actual_segments):
+        raise RuntimeError("기존 저·중·고 CLV 구간과 N/V 분석 구간이 일치하지 않습니다")
     occurrences = item_role_occurrences(
         users=users,
-        segments=segments_for_users(prepared["cache"], users),
+        segments=expected_segments,
         truth=prepared["cache"].gt,
         top50=top50,
         truth_amount=prepared["cache"].rev,
@@ -515,15 +787,100 @@ def run_fixed_segment_error_diagnostic(
         item_embedding=item_embedding.detach().cpu().numpy(),
         n_users=prepared["data"]["n_users"],
     )
+    occurrences = occurrences.merge(
+        user_value_groups[
+            ["user_idx", "nv_quadrant", "high_clv_composition"]
+        ],
+        on="user_idx",
+        how="left",
+        validate="many_to_one",
+    )
+    per_user_metrics = _per_user_metrics(
+        users=users, top50=top50, prepared=prepared
+    )
     segment_metrics = _segment_metrics(
         users=users, top50=top50, prepared=prepared
     )
+    nv_quadrant_population = summarize_user_groups(
+        user_value_groups,
+        group_column="nv_quadrant",
+        group_order=NV_QUADRANT_ORDER,
+    )
+    high_clv_composition_population = summarize_user_groups(
+        user_value_groups,
+        group_column="high_clv_composition",
+        group_order=HIGH_CLV_COMPOSITION_ORDER,
+    )
+    nv_quadrant_metrics = summarize_metrics_by_group(
+        per_user_metrics,
+        user_value_groups,
+        group_column="nv_quadrant",
+        group_order=NV_QUADRANT_ORDER,
+    )
+    high_clv_composition_metrics = summarize_metrics_by_group(
+        per_user_metrics,
+        user_value_groups,
+        group_column="high_clv_composition",
+        group_order=HIGH_CLV_COMPOSITION_ORDER,
+    )
     item_role_summary = summarize_segment_item_roles(occurrences)
     contrasts = miss_false_positive_contrasts(item_role_summary)
+    nv_occurrences = occurrences[
+        occurrences.nv_quadrant.isin(NV_QUADRANT_ORDER)
+    ].copy()
+    high_clv_occurrences = occurrences[
+        occurrences.high_clv_composition.isin(HIGH_CLV_COMPOSITION_ORDER)
+    ].copy()
+    nv_quadrant_item_role_summary = summarize_item_roles_by(
+        nv_occurrences, group_column="nv_quadrant"
+    )
+    high_clv_composition_item_role_summary = summarize_item_roles_by(
+        high_clv_occurrences, group_column="high_clv_composition"
+    )
+    nv_quadrant_contrasts = contrasts_by_group(
+        nv_quadrant_item_role_summary,
+        group_column="nv_quadrant",
+        group_order=NV_QUADRANT_ORDER,
+    )
+    high_clv_composition_contrasts = contrasts_by_group(
+        high_clv_composition_item_role_summary,
+        group_column="high_clv_composition",
+        group_order=HIGH_CLV_COMPOSITION_ORDER,
+    )
     category_summary = _category_summary(occurrences, cfg.top_examples)
     examples = _examples(occurrences, cfg.top_examples)
+    nv_quadrant_category_summary = _category_summary(
+        nv_occurrences, cfg.top_examples, group_column="nv_quadrant"
+    )
+    nv_quadrant_examples = _examples(
+        nv_occurrences, cfg.top_examples, group_column="nv_quadrant"
+    )
+    high_clv_composition_category_summary = _category_summary(
+        high_clv_occurrences,
+        cfg.top_examples,
+        group_column="high_clv_composition",
+    )
+    high_clv_composition_examples = _examples(
+        high_clv_occurrences,
+        cfg.top_examples,
+        group_column="high_clv_composition",
+    )
     report = {
         "segment_metrics": segment_metrics,
+        "user_value_groups": user_value_groups,
+        "group_thresholds": group_thresholds,
+        "nv_quadrant_population": nv_quadrant_population,
+        "nv_quadrant_metrics": nv_quadrant_metrics,
+        "nv_quadrant_item_role_summary": nv_quadrant_item_role_summary,
+        "nv_quadrant_contrasts": nv_quadrant_contrasts,
+        "nv_quadrant_category_summary": nv_quadrant_category_summary,
+        "nv_quadrant_examples": nv_quadrant_examples,
+        "high_clv_composition_population": high_clv_composition_population,
+        "high_clv_composition_metrics": high_clv_composition_metrics,
+        "high_clv_composition_item_role_summary": high_clv_composition_item_role_summary,
+        "high_clv_composition_contrasts": high_clv_composition_contrasts,
+        "high_clv_composition_category_summary": high_clv_composition_category_summary,
+        "high_clv_composition_examples": high_clv_composition_examples,
         "item_role_occurrences": occurrences,
         "item_role_summary": item_role_summary,
         "contrasts": contrasts,
@@ -538,13 +895,25 @@ def run_fixed_segment_error_diagnostic(
 
     print("\n===== 1) 고정 CLV 구간별 M1 성과 =====")
     print(segment_metrics.to_string(index=False))
-    print("\n===== 2) 정답·적중·오추천 상품 특성 =====")
+    print("\n===== 2) 전체 고객 N/V 4유형 구성과 M1 성과 =====")
+    print(nv_quadrant_population.to_string(index=False))
+    print(nv_quadrant_metrics.to_string(index=False))
+    print("\n===== 3) 고CLV 내부 N/V 구성과 M1 성과 =====")
+    print(high_clv_composition_population.to_string(index=False))
+    print(high_clv_composition_metrics.to_string(index=False))
+    print("\n===== 4) 정답·적중·오추천 상품 특성 =====")
     print(item_role_summary.to_string(index=False))
-    print("\\n===== 3) 정답 누락 - Top-10 오추천 격차 =====")
+    print("\n===== 5) 전체 N/V 4유형 정답 누락 - Top-10 오추천 격차 =====")
+    print(nv_quadrant_contrasts.to_string(index=False))
+    print("\n===== 6) 고CLV 내부 정답 누락 - Top-10 오추천 격차 =====")
+    print(high_clv_composition_contrasts.to_string(index=False))
+    print("\n===== 7) 기존 저·중·고 CLV 정답 누락 - Top-10 오추천 격차 =====")
     print(contrasts.to_string(index=False))
-    print("\\n===== 4) 실제 상품 예시 =====")
+    print("\n===== 8) 고CLV 내부 실제 상품 예시 =====")
+    print(high_clv_composition_examples.to_string(index=False))
+    print("\n===== 9) 기존 저·중·고 CLV 실제 상품 예시 =====")
     print(examples.to_string(index=False))
-    print("\\n결과 파일:", report["paths"])
+    print("\n결과 파일:", report["paths"])
     return report
 
 
