@@ -28,8 +28,8 @@ import lightgcn_clv_history_item_fit_diagnostic as item_fit
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m1-fixed-clv-segment-error-diagnostic-v1"
-SEGMENT_ORDER = ("ì €CLV", "ì¤‘CLV", "ê³ CLV")
+CODE_VERSION = "m1-fixed-clv-segment-error-diagnostic-v1.1"
+SEGMENT_ORDER = tuple(v3.SEG_NAMES)
 ROLE_ORDER = (
     "truth_all",
     "truth_hit_top10",
@@ -72,9 +72,9 @@ def configure_fixed_segment_error_diagnostic(
     values.update(overrides)
     cfg = FixedSegmentErrorDiagnosticConfig(**values)
     if not cfg.out_dir or not cfg.baseline_result_dir:
-        raise ValueError("out_dirì™€ baseline_result_dirê°€ í•„ìš”í•©ë‹ˆë‹¤")
+        raise ValueError("out_dir와 baseline_result_dir가 필요합니다")
     if cfg.eval_batch_size <= 0 or cfg.top_examples <= 0:
-        raise ValueError("ë°°ì¹˜ í‚¤ê¸°ì™€ ìƒˆì¶œ ì˜ˆì‹œ ìˆ˜ëŠ” ì–‘ìˆ˜ì—¬ì•¼ í•©ë‹ˆë‹¤")
+        raise ValueError("배치 크기와 산출 예시 수는 양수여야 합니다")
     return cfg
 
 
@@ -110,6 +110,32 @@ def _rank_bucket(rank: int) -> str:
     if rank <= 50:
         return "21-50"
     return ">50"
+
+
+def segments_for_users(cache, users: np.ndarray) -> np.ndarray:
+    """Return segment labels for global user IDs in the requested order.
+
+    ``EvalCache.seg`` is parallel to ``EvalCache.users``; it is not indexed by
+    the original global user ID.  Evaluation users can therefore contain IDs
+    larger than ``len(cache.seg) - 1``.
+    """
+    cache_users = np.asarray(cache.users, dtype=np.int64)
+    cache_segments = np.asarray(cache.seg)
+    if len(cache_users) != len(cache_segments):
+        raise ValueError("evaluation users and segment labels must be parallel")
+    position_by_user = {
+        int(user): position for position, user in enumerate(cache_users)
+    }
+    requested = np.asarray(users, dtype=np.int64)
+    try:
+        positions = np.fromiter(
+            (position_by_user[int(user)] for user in requested),
+            dtype=np.int64,
+            count=len(requested),
+        )
+    except KeyError as error:
+        raise KeyError(f"unknown evaluation user: {int(error.args[0])}") from error
+    return cache_segments[positions]
 
 
 def item_role_occurrences(
@@ -291,7 +317,7 @@ def _segment_metrics(
     frame = pd.DataFrame(
         {
             "user_idx": users,
-            "segment": cache.seg[users],
+            "segment": segments_for_users(cache, users),
             "truth_item_count": cache.P_arr[users],
         }
     )
@@ -449,7 +475,7 @@ def run_fixed_segment_error_diagnostic(
     )
     occurrences = item_role_occurrences(
         users=users,
-        segments=prepared["cache"].seg[users],
+        segments=segments_for_users(prepared["cache"], users),
         truth=prepared["cache"].gt,
         top50=top50,
         truth_amount=prepared["cache"].rev,
@@ -485,15 +511,15 @@ def run_fixed_segment_error_diagnostic(
     }
     report["paths"] = _persist(report, cfg)
 
-    print("\n===== 1) ê³ ì • CLV êµ¬ê°„ë³„ M1 ì„±ê³¼ =====")
+    print("\n===== 1) 고정 CLV 구간별 M1 성과 =====")
     print(segment_metrics.to_string(index=False))
-    print("\n===== 2) ì •ë‹µÂ·ì ›ì¤‘Â·ì˜¤ì¶“ì²œ ìƒÂí’ˆ íš¹ì„± =====")
+    print("\n===== 2) 정답·적중·오추천 상품 특성 =====")
     print(item_role_summary.to_string(index=False))
-    print("\n===== 3) ì •ë‹µ ëˆ„ë½ - Top-10 ì˜¤ì¶“ì²œ ê²©ì°¨ =====")
+    print("\\n===== 3) 정답 누락 - Top-10 오추천 격차 =====")
     print(contrasts.to_string(index=False))
-    print("\n===== 4) ì‹¤ì œ ìƒÂí’ˆ ì˜ˆì‹œ =====")
+    print("\\n===== 4) 실제 상품 예시 =====")
     print(examples.to_string(index=False))
-    print("\nê²°ê³¼ íŒŒì¼:", report["paths"])
+    print("\\n결과 파일:", report["paths"])
     return report
 
 

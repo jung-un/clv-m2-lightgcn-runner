@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from types import SimpleNamespace
 
 import lightgcn_clv_fixed_segment_error_diagnostic as diagnostic
 
@@ -7,7 +8,7 @@ import lightgcn_clv_fixed_segment_error_diagnostic as diagnostic
 def test_item_role_occurrences_separates_hits_misses_and_false_positives():
     frame = diagnostic.item_role_occurrences(
         users=np.array([0]),
-        segments=np.array(["ì¤‘CLV"]),
+        segments=np.array([diagnostic.SEGMENT_ORDER[1]]),
         truth={0: np.array([2, 11, 99])},
         top50=np.array([[2, *range(3, 11), 12, 11, *range(20, 58)]]),
         truth_amount={0: np.array([5.0, 7.0, 9.0])},
@@ -58,7 +59,12 @@ def test_attach_history_relations_marks_category_overlap_and_embedding_similarit
 def test_segment_role_summary_and_contrast_compare_misses_to_false_positives():
     frame = pd.DataFrame(
         {
-            "segment": ["ì €CLV", "ì €CLV", "ê³ CLV", "ê³ CLV"],
+            "segment": [
+                diagnostic.SEGMENT_ORDER[0],
+                diagnostic.SEGMENT_ORDER[0],
+                diagnostic.SEGMENT_ORDER[2],
+                diagnostic.SEGMENT_ORDER[2],
+            ],
             "role": [
                 "truth_miss_top10",
                 "false_positive_top10",
@@ -78,9 +84,9 @@ def test_segment_role_summary_and_contrast_compare_misses_to_false_positives():
     contrast = diagnostic.miss_false_positive_contrasts(summary)
 
     lookup = contrast.set_index(["segment", "trait"])
-    assert lookup.at[("ì €CLV", "price_percentile"), "miss_minus_false_positive"] == -0.3
-    assert lookup.at[("ê³ CLV", "price_percentile"), "miss_minus_false_positive"] == 0.5
-    assert lookup.at[("ì €CLV", "train_user_count"), "miss_minus_false_positive"] == -90.0
+    assert lookup.at[(diagnostic.SEGMENT_ORDER[0], "price_percentile"), "miss_minus_false_positive"] == -0.3
+    assert lookup.at[(diagnostic.SEGMENT_ORDER[2], "price_percentile"), "miss_minus_false_positive"] == 0.5
+    assert lookup.at[(diagnostic.SEGMENT_ORDER[0], "train_user_count"), "miss_minus_false_positive"] == -90.0
 
 
 def test_preflight_uses_only_historical_development_checkpoint(tmp_path):
@@ -94,3 +100,21 @@ def test_preflight_uses_only_historical_development_checkpoint(tmp_path):
     assert summary["checkpoint_selection"] is False
     assert summary["split"] == "historical_development_days_684_690"
     assert summary["fixed_clv_source"] == "train-history N×V proxy at day 683"
+
+
+def test_segments_for_users_maps_global_user_ids_through_eval_user_order():
+    cache = SimpleNamespace(
+        users=np.array([100, 1764, 2499]),
+        seg=np.array(["low", "mid", "high"]),
+    )
+
+    result = diagnostic.segments_for_users(
+        cache,
+        np.array([1764, 100]),
+    )
+
+    assert result.tolist() == ["mid", "low"]
+
+
+def test_segment_order_reuses_the_canonical_evaluation_labels():
+    assert diagnostic.SEGMENT_ORDER == tuple(diagnostic.v3.SEG_NAMES)
