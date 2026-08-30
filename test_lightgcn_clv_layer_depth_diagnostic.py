@@ -62,6 +62,23 @@ def test_full_layer_view_matches_the_models_normal_preference_embedding():
     diagnostic.assert_full_view_parity(model, views, atol=0.0)
 
 
+def test_parity_accepts_float32_sparse_accumulation_noise_by_default():
+    class Float32SparseNoiseModel(TinyLightGCN):
+        def propagate_pref(self):
+            user, item = super().propagate_pref()
+            noise = 7.2e-7
+            return user + noise, item - noise
+
+    model = Float32SparseNoiseModel()
+    views = diagnostic.aggregate_layer_views(
+        model, diagnostic.propagation_layers(model)
+    )
+
+    error = diagnostic.assert_full_view_parity(model, views)
+
+    assert 6.0e-7 < error < 1.0e-6
+
+
 def test_group_comparison_maps_global_user_ids_not_row_positions():
     users = np.array([100, 1764, 2499])
     membership = diagnostic.membership_for_evaluation_users(

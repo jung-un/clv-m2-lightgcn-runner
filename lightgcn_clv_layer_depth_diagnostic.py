@@ -179,8 +179,11 @@ def assert_full_view_parity(
     model,
     views: dict[str, tuple[torch.Tensor, torch.Tensor]],
     *,
-    atol: float = 1e-7,
+    atol: float = 1e-6,
 ) -> float:
+    # CUDA sparse.mm accumulates neighbouring rows with float32 atomics.  Two
+    # mathematically identical passes can therefore differ by several ULPs;
+    # 1e-6 accepts that numerical noise while still rejecting a changed view.
     expected_user, expected_item = model.propagate_pref()
     actual_user, actual_item = views[REFERENCE_VIEW]
     max_error = max(
@@ -507,4 +510,3 @@ def run_layer_depth_diagnostic(
     }
     test10._atomic_json(paths["json"], payload)
     return {name: str(path) for name, path in paths.items()}
-
