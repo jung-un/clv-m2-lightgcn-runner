@@ -7,6 +7,10 @@ from clv_conditioned_category_price_history_model import (
     ConditionedCategoryPriceHistoryLightGCN,
     build_conditioned_history_features,
 )
+from lightgcn_clv_conditioned_category_price_history_diagnostic import (
+    VIEW_MODES,
+    decomposition_views,
+)
 
 
 def _frame():
@@ -177,3 +181,78 @@ def test_m3_m4_controls_cannot_enter_the_m2_loss():
         model.bpr_loss(
             torch.tensor([0]), torch.tensor([0]), torch.tensor([2]), lam=0.1
         )
+
+
+def test_decomposition_views_reproduce_full_and_apply_declared_gates():
+    model = _model()
+    with torch.no_grad():
+        model.condition_mixer.weight.copy_(
+            torch.tensor(
+                [[0.5, -0.2, 0.1, 0.0], [-0.3, 0.4, -0.1, 0.2]],
+                dtype=torch.float32,
+            )
+        )
+    views, gates = decomposition_views(model, shuffle_seed=7)
+
+    assert tuple(views) == VIEW_MODES
+    full_user, full_item, _, _ = model.embeddings()
+    torch.testing.assert_close(views["learned_full"][0], full_user)
+    torch.testing.assert_close(views["learned_full"][1], full_item)
+    torch.testing.assert_close(
+        gates["equal_mix"], torch.full_like(gates["equal_mix"], 0.5)
+    )
+    torch.testing.assert_close(
+        gates["id_category_unit"][:, 0],
+        torch.ones(model.n_users),
+    )
+    torch.testing.assert_close(
+        gates["id_category_unit"][:, 1],
+        torch.zeros(model.n_users),
+    )
+    torch.testing.assert_close(
+        gates["id_price_unit"][:, 0],
+        torch.zeros(model.n_users),
+    )
+    torch.testing.assert_close(
+        gates["id_price_unit"][:, 1],
+        torch.ones(model.n_users),
+    )
+    category_user, category_item = views["id_category_unit"]
+    price_user, price_item = views["id_price_unit"]
+    torch.testing.assert_close(
+        category_user[:, model.id_dim + model.category_dim :],
+        torch.zeros_like(category_user[:, model.id_dim + model.category_dim :]),
+    )
+    torch.testing.assert_close(
+        category_item[:, model.id_dim + model.category_dim :],
+        torch.zeros_like(category_item[:, model.id_dim + model.category_dim :]),
+    )
+    torch.testing.assert_close(
+        price_user[:, model.id_dim : model.id_dim + model.category_dim],
+        torch.zeros_like(price_user[:, model.id_dim : model.id_dim + model.category_dim]),
+    )
+    torch.testing.assert_close(
+        price_item[:, model.id_dim : model.id_dim + model.category_dim],
+        torch.zeros_like(price_item[:, model.id_dim : model.id_dim + model.category_dim]),
+    )
+
+
+def test_shuffled_condition_is_deterministic_and_preserves_gate_distribution():
+    model = _model()
+    with torch.no_grad():
+        model.condition_mixer.weight.copy_(
+            torch.tensor(
+                [[0.5, -0.2, 0.1, 0.0], [-0.3, 0.4, -0.1, 0.2]],
+                dtype=torch.float32,
+            )
+        )
+    _, first = decomposition_views(model, shuffle_seed=11)
+    _, second = decomposition_views(model, shuffle_seed=11)
+
+    torch.testing.assert_close(
+        first["shuffled_condition"], second["shuffled_condition"]
+    )
+    torch.testing.assert_close(
+        first["shuffled_condition"].sort(dim=0).values,
+        first["learned_full"].sort(dim=0).values,
+    )
