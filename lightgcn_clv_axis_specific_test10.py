@@ -431,6 +431,9 @@ def _fixed_epoch_train(
     last_epoch = start_epoch - 1
     for epoch in range(start_epoch, cfg.epochs + 1):
         last_epoch = epoch
+        set_training_epoch = getattr(model, "set_training_epoch", None)
+        if set_training_epoch is not None:
+            set_training_epoch(epoch)
         model.train()
         epoch_started = time.time()
         permutation = rng.permutation(n_train)
