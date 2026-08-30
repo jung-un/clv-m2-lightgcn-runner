@@ -1,4 +1,6 @@
 from types import SimpleNamespace
+import json
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -140,3 +142,18 @@ def test_preflight_is_checkpoint_only_and_keeps_protected_splits_closed(tmp_path
         "layer0_1_mean",
         "layer0_1_2_mean",
     ]
+
+
+def test_colabs_reload_the_checked_out_diagnostic_module_before_running():
+    root = Path(__file__).parent
+    notebooks = (
+        "clv_m1_layer_depth_diagnostic_dunnhumby_colab.ipynb",
+        "clv_m1_layer_depth_diagnostic_hm2y_colab.ipynb",
+    )
+    for notebook in notebooks:
+        payload = json.loads((root / notebook).read_text(encoding="utf-8"))
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in payload["cells"]
+        )
+        assert "importlib.reload(depth_diagnostic)" in source
+        assert "assert parity_default == 1e-6" in source
