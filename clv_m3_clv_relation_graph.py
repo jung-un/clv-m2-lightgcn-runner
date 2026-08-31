@@ -1,16 +1,18 @@
-"""Train-only edge weights for two scalar-CLV M3 graph interventions.
+"""Train-only edge weights for scalar-CLV M3 graph interventions.
 
-The shared M1 user-item edge set is unchanged.  Four weighted variants isolate
-two questions:
+The shared M1 user-item edge set is unchanged.  The original four weighted
+variants and one matched shuffle control isolate two questions:
 
 * Does scalar historical CLV control how far propagation moves from a binary
   graph toward a price-free relationship graph?
 * Does using scalar historical CLV inside the edge relationship itself add
   value beyond the same relationship with CLV removed?
 
-All four variants preserve mean outgoing edge mass one inside every user.
-They change LightGCN propagation only; the BPR objective and negative sampling
-remain unchanged.
+The degree-stratified shuffle preserves the observed CLV values within binary
+user-degree strata while removing their customer assignment, then recomputes
+the item baselines and final gate.  Every variant preserves mean outgoing edge
+mass one inside every user.  They change LightGCN propagation only; the BPR
+objective and negative sampling remain unchanged.
 """
 
 from __future__ import annotations
@@ -35,9 +37,13 @@ class CLVRelationGraph:
     clv_gate_weights: np.ndarray
     allocated_relation_only_weights: np.ndarray
     clv_allocated_gate_weights: np.ndarray
+    clv_allocated_gate_shuffle_weights: np.ndarray
     clv_percentile: np.ndarray
+    clv_shuffle_percentile: np.ndarray
+    clv_shuffle_stratum: np.ndarray
     relation_signal: np.ndarray
     allocated_relation_signal: np.ndarray
+    allocated_relation_shuffle_signal: np.ndarray
     diagnostics: dict
 
 
@@ -163,6 +169,45 @@ def _item_mean(
     return (total + prior_strength * global_mean) / (count + prior_strength)
 
 
+def _degree_stratified_shuffle(
+    values: np.ndarray,
+    user_degree: np.ndarray,
+    *,
+    n_bins: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if n_bins < 1:
+        raise ValueError("shuffle_degree_bins must be positive")
+    values = np.asarray(values, dtype=np.float64)
+    user_degree = np.asarray(user_degree, dtype=np.float64)
+    if values.shape != user_degree.shape:
+        raise ValueError("CLV values and user degree must have the same shape")
+
+    shuffled = values.copy()
+    strata = np.full(len(values), -1, dtype=np.int16)
+    valid_idx = np.flatnonzero((user_degree > 0) & np.isfinite(values))
+    if not len(valid_idx):
+        return shuffled, strata
+
+    degree_rank = rankdata(user_degree[valid_idx], method="average")
+    strata_valid = np.floor(
+        (degree_rank - 0.5) * n_bins / len(valid_idx)
+    ).astype(np.int16)
+    strata_valid = np.minimum(strata_valid, n_bins - 1)
+    strata[valid_idx] = strata_valid
+
+    rng = np.random.default_rng(seed)
+    for stratum in np.unique(strata_valid):
+        idx = valid_idx[strata_valid == stratum]
+        if len(idx) < 2:
+            continue
+        source = rng.permutation(idx)
+        if np.array_equal(source, idx):
+            source = np.roll(source, 1)
+        shuffled[idx] = values[source]
+    return shuffled, strata
+
+
 def build_clv_relation_graph(
     train: pd.DataFrame,
     n_users: int,
@@ -173,8 +218,10 @@ def build_clv_relation_graph(
     beta_cap: float = DEFAULT_BETA_CAP,
     prior_strength: float = 20.0,
     epsilon: float = 1e-8,
+    shuffle_seed: int = 42,
+    shuffle_degree_bins: int = 10,
 ) -> CLVRelationGraph:
-    """Build two CLV graph proposals and their CLV-free controls."""
+    """Build CLV graph proposals, CLV-free controls, and an attribution shuffle."""
     required = {"u_idx", "i_idx", "up"}
     missing = required - set(train.columns)
     if missing:
@@ -267,11 +314,42 @@ def build_clv_relation_graph(
         )
     )
 
+    user_degree = np.bincount(edge_users, minlength=n_users)
+    clv_shuffle_percentile, clv_shuffle_stratum = _degree_stratified_shuffle(
+        clv_percentile,
+        user_degree,
+        n_bins=shuffle_degree_bins,
+        seed=shuffle_seed,
+    )
+    allocated_clv_shuffle = clv_shuffle_percentile[edge_users] * user_share
+    allocated_item_shuffle_mean = _item_mean(
+        allocated_clv_shuffle, edge_items, n_items, prior_strength
+    )
+    allocated_relation_shuffle_signal = np.log(
+        (allocated_clv_shuffle + epsilon)
+        / (allocated_item_shuffle_mean[edge_items] + epsilon)
+    )
+    (
+        beta_allocated_gate_shuffle,
+        clv_allocated_gate_shuffle,
+        allocated_gate_shuffle_strength,
+    ) = _match_strength(
+        allocated_relation_shuffle_signal,
+        clv_shuffle_percentile[edge_users],
+        target_strength,
+        edge_users,
+        edge_items,
+        n_users,
+        n_items,
+        beta_cap,
+    )
+
     arrays = {
         "relation_only_weights": relation_only,
         "clv_gate_weights": clv_gate_weights,
         "allocated_relation_only_weights": allocated_relation_only,
         "clv_allocated_gate_weights": clv_allocated_gate,
+        "clv_allocated_gate_shuffle_weights": clv_allocated_gate_shuffle,
     }
     for name, values in arrays.items():
         if not np.all(np.isfinite(values)) or np.any(values <= 0):
@@ -293,6 +371,9 @@ def build_clv_relation_graph(
             "clv_gate_weights": float(beta_gate),
             "allocated_relation_only_weights": float(beta_allocated_control),
             "clv_allocated_gate_weights": float(beta_allocated_gate),
+            "clv_allocated_gate_shuffle_weights": float(
+                beta_allocated_gate_shuffle
+            ),
         },
         "prior_strength": float(prior_strength),
         "n_edges": int(len(edge_users)),
@@ -300,6 +381,19 @@ def build_clv_relation_graph(
         "relation_signal": _stats(relation_signal),
         "allocated_control_signal": _stats(allocated_control_signal),
         "allocated_relation_signal": _stats(allocated_relation_signal),
+        "allocated_relation_shuffle_signal": _stats(
+            allocated_relation_shuffle_signal
+        ),
+        "clv_shuffle": {
+            "seed": int(shuffle_seed),
+            "degree_bins": int(shuffle_degree_bins),
+            "changed_user_count": int(
+                np.count_nonzero(clv_percentile != clv_shuffle_percentile)
+            ),
+            "actual_vs_shuffle_spearman": _safe_spearman(
+                clv_percentile, clv_shuffle_percentile
+            ),
+        },
         "relation_signal_item_price_spearman": _safe_spearman(
             relation_signal, item_price[edge_items]
         ),
@@ -321,6 +415,9 @@ def build_clv_relation_graph(
         "clv_gate_weights": float(gate_strength),
         "allocated_relation_only_weights": float(allocated_control_strength),
         "clv_allocated_gate_weights": float(allocated_gate_strength),
+        "clv_allocated_gate_shuffle_weights": float(
+            allocated_gate_shuffle_strength
+        ),
     }
 
     return CLVRelationGraph(
@@ -330,8 +427,16 @@ def build_clv_relation_graph(
         clv_gate_weights=clv_gate_weights.astype(np.float32),
         allocated_relation_only_weights=allocated_relation_only.astype(np.float32),
         clv_allocated_gate_weights=clv_allocated_gate.astype(np.float32),
+        clv_allocated_gate_shuffle_weights=clv_allocated_gate_shuffle.astype(
+            np.float32
+        ),
         clv_percentile=clv_percentile.astype(np.float32),
+        clv_shuffle_percentile=clv_shuffle_percentile.astype(np.float32),
+        clv_shuffle_stratum=clv_shuffle_stratum,
         relation_signal=relation_signal.astype(np.float32),
         allocated_relation_signal=allocated_relation_signal.astype(np.float32),
+        allocated_relation_shuffle_signal=allocated_relation_shuffle_signal.astype(
+            np.float32
+        ),
         diagnostics=diagnostics,
     )

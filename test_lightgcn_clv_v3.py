@@ -518,6 +518,28 @@ def test_graph_clv_nv_exposes_train_only_components(tmp_path):
     assert d["data_stats"]["clv_nv_graph"]["n_edges"] == len(eu)
 
 
+def test_graph_clv_allocated_shuffle_mode_uses_degree_matched_clv_weights(tmp_path):
+    cfg, dcfg = _tiny_dataset(tmp_path)
+    d = V3.prepare_data(
+        dict(
+            cfg,
+            GRAPH_MODE="clv_allocated_relation_gate_shuffle",
+            GRAPH_ALPHA=0.075,
+        ),
+        dcfg,
+    )
+    graph = d["m3_clv_relation_graph"]
+
+    np.testing.assert_allclose(
+        d["w_edge"],
+        graph.clv_allocated_gate_shuffle_weights,
+    )
+    assert graph.diagnostics["clv_shuffle"]["changed_user_count"] > 0
+    assert V3.model_id(
+        dict(V3.CFG, GRAPH_MODE="clv_allocated_relation_gate_shuffle")
+    ) == "m3_clv_allocated_relation_gate_shuffle"
+
+
 def test_graph_alpha_scales_weights(tmp_path):
     cfg, dcfg = _tiny_dataset(tmp_path)
     lo = V3.prepare_data(dict(cfg, GRAPH_MODE="value", GRAPH_ALPHA=0.5), dcfg)["adj"].coalesce()

@@ -652,6 +652,7 @@ def prepare_data(cfg, dcfg):
         "clv_relation_gate",
         "allocated_relation_only",
         "clv_allocated_relation_gate",
+        "clv_allocated_relation_gate_shuffle",
     }:
         m3_clv_relation_graph = build_clv_relation_graph(
             train,
@@ -672,6 +673,9 @@ def prepare_data(cfg, dcfg):
             "clv_relation_gate": "clv_gate_weights",
             "allocated_relation_only": "allocated_relation_only_weights",
             "clv_allocated_relation_gate": "clv_allocated_gate_weights",
+            "clv_allocated_relation_gate_shuffle": (
+                "clv_allocated_gate_shuffle_weights"
+            ),
         }[cfg["GRAPH_MODE"]]
         w_edge = getattr(m3_clv_relation_graph, weight_key)
         data_stats["m3_clv_relation_graph"] = m3_clv_relation_graph.diagnostics
@@ -843,7 +847,8 @@ def prepare_data(cfg, dcfg):
                              "clv_direct_user|clv_direct_spend_control|"
                              "clv_direct_user_spend|relation_only|"
                              "clv_relation_gate|allocated_relation_only|"
-                             "clv_allocated_relation_gate")
+                             "clv_allocated_relation_gate|"
+                             "clv_allocated_relation_gate_shuffle")
         print(f"  가치그래프({cfg['GRAPH_MODE']}, α={a}): 엣지 {len(eu):,} | "
               f"w 평균 {w_edge.mean():.3f} 중앙값 {np.median(w_edge):.3f} 최대 {w_edge.max():.3f}")
 

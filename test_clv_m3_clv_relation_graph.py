@@ -81,3 +81,64 @@ def test_weights_do_not_depend_on_price_values():
         "clv_allocated_gate_weights",
     ):
         assert np.allclose(getattr(first, name), getattr(second, name))
+
+
+def test_degree_stratified_shuffle_preserves_clv_values_inside_each_stratum():
+    graph = build_clv_relation_graph(
+        _train(),
+        3,
+        3,
+        np.array([0.1, 0.5, 0.9]),
+        target_strength=0.075,
+        shuffle_seed=42,
+        shuffle_degree_bins=10,
+    )
+
+    assert not np.array_equal(
+        graph.clv_percentile,
+        graph.clv_shuffle_percentile,
+    )
+    for stratum in np.unique(graph.clv_shuffle_stratum):
+        mask = graph.clv_shuffle_stratum == stratum
+        np.testing.assert_allclose(
+            np.sort(graph.clv_percentile[mask]),
+            np.sort(graph.clv_shuffle_percentile[mask]),
+        )
+
+
+def test_shuffled_clv_is_recomputed_in_both_allocated_relation_and_gate():
+    first = build_clv_relation_graph(
+        _train(),
+        3,
+        3,
+        np.array([0.1, 0.5, 0.9]),
+        target_strength=0.075,
+        shuffle_seed=42,
+    )
+    repeated = build_clv_relation_graph(
+        _train(),
+        3,
+        3,
+        np.array([0.1, 0.5, 0.9]),
+        target_strength=0.075,
+        shuffle_seed=42,
+    )
+
+    np.testing.assert_allclose(
+        first.clv_allocated_gate_shuffle_weights,
+        repeated.clv_allocated_gate_shuffle_weights,
+    )
+    assert not np.allclose(
+        first.allocated_relation_signal,
+        first.allocated_relation_shuffle_signal,
+    )
+    assert not np.allclose(
+        first.clv_allocated_gate_weights,
+        first.clv_allocated_gate_shuffle_weights,
+    )
+    for user in range(3):
+        mask = first.edge_users == user
+        assert np.isclose(
+            first.clv_allocated_gate_shuffle_weights[mask].mean(),
+            1.0,
+        )
