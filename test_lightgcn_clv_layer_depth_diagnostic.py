@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 
 import lightgcn_clv_layer_depth_diagnostic as diagnostic
@@ -122,6 +123,42 @@ def test_topk_overlap_is_set_based_and_grouped():
     assert by_user.at[5, "topk_jaccard"] == 1.0
     assert by_user.at[9, "topk_set_changed"] == 1.0
     assert np.isclose(by_user.at[9, "topk_jaccard"], 1.0 / 5.0)
+
+
+def test_comparison_preserves_view_name_and_joins_overlap_diagnostics():
+    summary = pd.DataFrame(
+        [
+            {
+                "view": "layer0",
+                "group_type": "overall",
+                "group": "전체",
+                "recall@10": 0.1,
+            },
+            {
+                "view": diagnostic.REFERENCE_VIEW,
+                "group_type": "overall",
+                "group": "전체",
+                "recall@10": 0.2,
+            },
+        ]
+    )
+    overlap = pd.DataFrame(
+        [
+            {
+                "view": "layer0",
+                "reference_view": diagnostic.REFERENCE_VIEW,
+                "group_type": "overall",
+                "group": "전체",
+                "n_users": 2,
+                "top10_set_changed_user_share": 0.5,
+            }
+        ]
+    )
+
+    comparison = diagnostic._comparison(summary, overlap)
+
+    assert comparison.at[0, "view"] == "layer0"
+    assert comparison.at[0, "top10_set_changed_user_share"] == 0.5
 
 
 def test_preflight_is_checkpoint_only_and_keeps_protected_splits_closed(tmp_path):

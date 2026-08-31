@@ -385,7 +385,7 @@ def _comparison(summary: pd.DataFrame, overlap: pd.DataFrame) -> pd.DataFrame:
             model_value = float(row[metric])
             rows.append(
                 {
-                    "view": row.view,
+                    "view": row["view"],
                     "reference_view": REFERENCE_VIEW,
                     "group_type": row.group_type,
                     "group": row.group,
