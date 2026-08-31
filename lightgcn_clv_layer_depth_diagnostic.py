@@ -179,11 +179,12 @@ def assert_full_view_parity(
     model,
     views: dict[str, tuple[torch.Tensor, torch.Tensor]],
     *,
-    atol: float = 1e-6,
+    atol: float = 1e-5,
 ) -> float:
     # CUDA sparse.mm accumulates neighbouring rows with float32 atomics.  Two
-    # mathematically identical passes can therefore differ by several ULPs;
-    # 1e-6 accepts that numerical noise while still rejecting a changed view.
+    # mathematically identical passes can therefore differ by several ULPs.
+    # H&M's 26.7M-edge graph reaches about 3.8e-6, so 1e-5 accepts numerical
+    # accumulation noise while still rejecting a materially changed view.
     expected_user, expected_item = model.propagate_pref()
     actual_user, actual_item = views[REFERENCE_VIEW]
     max_error = max(

@@ -69,7 +69,7 @@ def test_parity_accepts_float32_sparse_accumulation_noise_by_default():
     class Float32SparseNoiseModel(TinyLightGCN):
         def propagate_pref(self):
             user, item = super().propagate_pref()
-            noise = 7.2e-7
+            noise = 4.0e-6
             return user + noise, item - noise
 
     model = Float32SparseNoiseModel()
@@ -79,7 +79,22 @@ def test_parity_accepts_float32_sparse_accumulation_noise_by_default():
 
     error = diagnostic.assert_full_view_parity(model, views)
 
-    assert 6.0e-7 < error < 1.0e-6
+    assert 3.0e-6 < error < 1.0e-5
+
+
+def test_parity_still_rejects_a_material_view_mismatch():
+    class MaterialMismatchModel(TinyLightGCN):
+        def propagate_pref(self):
+            user, item = super().propagate_pref()
+            return user + 1.0e-3, item - 1.0e-3
+
+    model = MaterialMismatchModel()
+    views = diagnostic.aggregate_layer_views(
+        model, diagnostic.propagation_layers(model)
+    )
+
+    with np.testing.assert_raises(RuntimeError):
+        diagnostic.assert_full_view_parity(model, views)
 
 
 def test_group_comparison_maps_global_user_ids_not_row_positions():
@@ -193,4 +208,4 @@ def test_colabs_reload_the_checked_out_diagnostic_module_before_running():
             "".join(cell.get("source", [])) for cell in payload["cells"]
         )
         assert "importlib.reload(depth_diagnostic)" in source
-        assert "assert parity_default == 1e-6" in source
+        assert "assert parity_default == 1e-5" in source
