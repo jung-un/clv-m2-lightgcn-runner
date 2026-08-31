@@ -151,4 +151,3 @@
 - [ ] **Step 4: Commit and push**
 
   Commit the notebook/status update and push `feat/m2-joint-nv-lightgcn`.
-

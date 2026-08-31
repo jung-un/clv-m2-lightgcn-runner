@@ -156,4 +156,3 @@ def test_invalid_user_inputs_must_already_be_zero_masked():
             id_dim=6,
             context_dim=3,
         )
-
