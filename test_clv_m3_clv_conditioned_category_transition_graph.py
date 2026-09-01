@@ -5,6 +5,7 @@ from clv_m3_clv_conditioned_category_transition_graph import (
     ARM_ACTUAL,
     ARM_GENERAL,
     ARM_SHUFFLE,
+    _transition_evidence,
     build_clv_conditioned_category_transition_graph,
 )
 
@@ -111,3 +112,13 @@ def test_minimum_support_removes_auxiliary_relation_not_catalog_items():
     assert graph.user_category_operators[ARM_GENERAL]._nnz() == 0
     assert graph.category_item_operator._nnz() == n_items
 
+
+def test_transition_evidence_uses_user_date_when_basket_id_is_absent():
+    train, _ = _train()
+    hm_style = train.drop(columns="b_raw")
+
+    pair, recent, diagnostics = _transition_evidence(hm_style, n_users=6)
+
+    assert not pair.empty
+    assert recent.groupby("u_idx").recent_share.sum().eq(1.0).all()
+    assert diagnostics["n_baskets"] == hm_style[["u_idx", "t"]].drop_duplicates().shape[0]

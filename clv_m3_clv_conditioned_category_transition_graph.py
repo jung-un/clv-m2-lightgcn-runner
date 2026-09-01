@@ -150,11 +150,19 @@ def _degree_stratified_shuffle(
 
 
 def _basket_order(train: pd.DataFrame) -> pd.DataFrame:
-    baskets = train[["u_idx", "b_raw", "t"]].drop_duplicates()
-    duplicate_time = baskets.duplicated(["u_idx", "b_raw"], keep=False)
+    if "b_raw" in train:
+        baskets = train[["u_idx", "b_raw", "t"]].drop_duplicates().rename(
+            columns={"b_raw": "_basket_id"}
+        )
+    else:
+        # H&M has no basket identifier.  Its fixed project definition treats
+        # one (user, date) as one purchase occasion.
+        baskets = train[["u_idx", "t"]].drop_duplicates()
+        baskets["_basket_id"] = baskets["t"]
+    duplicate_time = baskets.duplicated(["u_idx", "_basket_id"], keep=False)
     if duplicate_time.any():
         raise ValueError("one user-basket pair is associated with multiple times")
-    baskets = baskets.assign(_basket_key=baskets["b_raw"].astype(str))
+    baskets = baskets.assign(_basket_key=baskets["_basket_id"].astype(str))
     baskets = baskets.sort_values(
         ["u_idx", "t", "_basket_key"], kind="stable"
     ).reset_index(drop=True)
@@ -167,12 +175,14 @@ def _transition_evidence(
     n_users: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     baskets = _basket_order(train)
+    basket_column = "b_raw" if "b_raw" in train else "t"
     lines = (
-        train[["u_idx", "b_raw", "i_idx", "cat_idx"]]
+        train[["u_idx", basket_column, "i_idx", "cat_idx"]]
         .drop_duplicates()
+        .rename(columns={basket_column: "_basket_id"})
         .merge(
-            baskets[["u_idx", "b_raw", "basket_order"]],
-            on=["u_idx", "b_raw"],
+            baskets[["u_idx", "_basket_id", "basket_order"]],
+            on=["u_idx", "_basket_id"],
             how="left",
             validate="many_to_one",
         )
