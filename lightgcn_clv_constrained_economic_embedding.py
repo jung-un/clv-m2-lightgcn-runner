@@ -1,4 +1,4 @@
-"""Seed-42 screen changing only the item side of the constrained M2."""
+"""Seed-42 screen with explicit CLV composition and price coordinates."""
 
 from __future__ import annotations
 
@@ -23,9 +23,9 @@ import lightgcn_clv_moe as moe
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m2-hybrid-item-clv-economic-embedding-historical-screen-v2"
+CODE_VERSION = "m2-clv-level-composition-price-embedding-historical-screen-v1"
 MATCHED_MODEL_ID = "m1_matched_rho0"
-MODEL_ID = "m2_hybrid_item_clv_economic_embedding"
+MODEL_ID = "m2_clv_level_composition_price_embedding"
 ID_ONLY_MODEL_ID = "m2_jointly_trained_id_only"
 RELATION_ONLY_MODEL_ID = "m2_id_plus_item_relation_only"
 PRICE_ONLY_MODEL_ID = "m2_id_plus_item_price_only"
@@ -39,7 +39,7 @@ class ConstrainedEconomicConfig:
     evaluation_days: int = 7
     epochs: int = 100
     id_dim: int = 64
-    clv_dim: int = 4
+    clv_dim: int = 3
     rho: float = 0.05
     item_price_budget: float = 0.25
     n_layers: int = 2
@@ -56,7 +56,7 @@ def configure_constrained_economic_run(**overrides) -> ConstrainedEconomicConfig
     defaults = {
         "out_dir": (
             f"{v3.default_out_dir('dunnhumby')}"
-            "_m2_hybrid_item_clv_economic_embedding_historical_screen_v2"
+            "_m2_clv_level_composition_price_embedding_historical_screen_v1"
         ),
         "baseline_result_dir": (
             f"{v3.default_out_dir('dunnhumby')}"
@@ -78,7 +78,7 @@ def validate_constrained_economic_config(
         "evaluation_days": 7,
         "epochs": 100,
         "id_dim": 64,
-        "clv_dim": 4,
+        "clv_dim": 3,
         "rho": 0.05,
         "item_price_budget": 0.25,
         "n_layers": 2,
@@ -111,17 +111,19 @@ def preflight_summary(cfg: ConstrainedEconomicConfig) -> dict:
             "holdout_constructed": False,
         },
         "m2": {
-            "architecture": "ID(64)|one CLV-conditioned hybrid item block(4)",
+            "architecture": "ID(64)|CLV relation(2)|explicit price fit(1)",
             "total_dim": cfg.id_dim + cfg.clv_dim,
-            "user_block": "q_C * unit(W_u[q_N,q_V])",
-            "item_block": "[sqrt(1-beta)*unit(P_z E_i^ID)(2)|sqrt(beta)*centred prices(2)]",
+            "user_block": "[sqrt(1-beta)*q_C*unit([q_C,q_N-q_V])(2)|sqrt(beta)*q_C*(2q_V-1)(1)]",
+            "item_block": "[sqrt(1-beta)*unit(P_z E_i^ID)(2)|sqrt(beta)*positive_mix(centred prices)(1)]",
             "user_tanh": False,
+            "learned_user_projection": False,
             "free_item_response_embedding": False,
             "item_inputs": [
                 "existing item ID embedding projected to 2 dimensions",
                 "overall price percentile",
                 "within-category price percentile",
             ],
+            "price_mixer": "two positive weights summing to one; learned by the same BPR",
             "item_price_budget": cfg.item_price_budget,
             "joint_graph_propagation": True,
             "one_dot_score": True,
@@ -447,7 +449,7 @@ def run_constrained_economic_screen(
         reading["positive_screen"] and reading["direct_clv_positive"]
     )
 
-    stem = f"m2_hybrid_item_clv_economic_embedding_{prepared['config_hash']}"
+    stem = f"m2_clv_level_composition_price_embedding_{prepared['config_hash']}"
     paths = {
         "absolute_csv": prepared["out_dir"] / f"{stem}.csv",
         "comparison_csv": prepared["out_dir"] / f"{stem}_comparison.csv",

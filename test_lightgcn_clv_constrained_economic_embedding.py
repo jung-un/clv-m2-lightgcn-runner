@@ -21,9 +21,10 @@ def test_preflight_freezes_the_two_removed_shortcuts_and_protected_split():
     assert summary["trained_models"] == [MATCHED_MODEL_ID, MODEL_ID]
     assert summary["historical_development_split"]["final_test_constructed"] is False
     assert summary["historical_development_split"]["holdout_constructed"] is False
-    assert summary["m2"]["architecture"] == "ID(64)|one CLV-conditioned hybrid item block(4)"
-    assert summary["m2"]["total_dim"] == 68
+    assert summary["m2"]["architecture"] == "ID(64)|CLV relation(2)|explicit price fit(1)"
+    assert summary["m2"]["total_dim"] == 67
     assert summary["m2"]["user_tanh"] is False
+    assert summary["m2"]["learned_user_projection"] is False
     assert summary["m2"]["free_item_response_embedding"] is False
     assert summary["m2"]["item_inputs"] == [
         "existing item ID embedding projected to 2 dimensions",
@@ -45,7 +46,7 @@ def test_preflight_freezes_the_two_removed_shortcuts_and_protected_split():
         {"seed": 43},
         {"rho": 0.1},
         {"item_price_budget": 0.5},
-        {"clv_dim": 8},
+        {"clv_dim": 4},
         {"id_dim": 60},
         {"time_cutoff": 697},
     ],

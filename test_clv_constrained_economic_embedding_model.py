@@ -39,30 +39,30 @@ def _model(*, rho=0.05, layers=1):
         item_economic_valid=np.ones(4, bool),
         adj=_adj(),
         id_dim=6,
-        clv_dim=4,
+        clv_dim=3,
         rho=rho,
         n_layers=layers,
         pref_reg=1e-4,
     )
 
 
-def test_user_clv_norm_is_total_level_and_direction_distinguishes_n_from_v():
+def test_user_coordinates_explicitly_encode_level_composition_and_value():
     model = _model(layers=0)
-    with torch.no_grad():
-        model.user_clv_projection.weight.zero_()
-        model.user_clv_projection.weight[0, 0] = 1.0
-        model.user_clv_projection.weight[1, 1] = 1.0
-
     user = model.clv_user_embeddings()
 
-    torch.testing.assert_close(
-        user.norm(dim=1), torch.tensor([0.8, 0.5, 0.2]), atol=1e-6, rtol=0
+    expected_norm = model.q_c * torch.sqrt(
+        0.75 + 0.25 * (2.0 * model.q_v - 1.0).pow(2)
     )
-    assert user[0, 0] > user[0, 1]  # N-dominant
-    assert user[2, 1] > user[2, 0]  # V-dominant
+    torch.testing.assert_close(
+        user.norm(dim=1), expected_norm, atol=1e-6, rtol=0
+    )
+    assert user[0, 1] > 0  # N-dominant composition
+    assert user[2, 1] < 0  # V-dominant composition
+    assert user[0, 2] < 0  # low-V price preference
+    assert user[2, 2] > 0  # high-V price preference
 
 
-def test_item_clv_block_uses_two_id_coordinates_and_two_fixed_price_coordinates():
+def test_item_clv_block_uses_two_id_coordinates_and_one_positive_price_mix():
     model = _model(layers=0)
     assert not hasattr(model, "item_response")
     with torch.no_grad():
@@ -72,7 +72,9 @@ def test_item_clv_block_uses_two_id_coordinates_and_two_fixed_price_coordinates(
 
     item = model.clv_item_embeddings()
 
-    expected_price = model.item_economic_features / np.sqrt(2.0) * np.sqrt(0.25)
+    expected_price = (
+        model.item_economic_features.mean(dim=1, keepdim=True) * np.sqrt(0.25)
+    )
     torch.testing.assert_close(item[:, 2:], expected_price)
     torch.testing.assert_close(
         item[:, :2].norm(dim=1),
@@ -83,12 +85,12 @@ def test_item_clv_block_uses_two_id_coordinates_and_two_fixed_price_coordinates(
     assert torch.all(item.norm(dim=1) <= 1.0 + 1e-6)
 
 
-def test_layer0_is_id_plus_one_bounded_four_dimensional_block():
+def test_layer0_is_id_plus_one_bounded_three_dimensional_block():
     model = _model(layers=0)
     user, item = model.layer0_embeddings()
 
-    assert user.shape == (3, 10)
-    assert item.shape == (4, 10)
+    assert user.shape == (3, 9)
+    assert item.shape == (4, 9)
     torch.testing.assert_close(user[:, :6], model.E_u.weight)
     torch.testing.assert_close(item[:, :6], model.E_i.weight)
     assert torch.all(user[:, 6:].norm(dim=1) <= np.sqrt(0.05) + 1e-6)
@@ -106,7 +108,7 @@ def test_rho_zero_is_exact_ordinary_lightgcn():
     torch.testing.assert_close(full_item[:, 6:], torch.zeros_like(full_item[:, 6:]))
 
 
-def test_one_bpr_trains_id_and_both_constrained_projections():
+def test_one_bpr_trains_id_relation_projection_and_positive_price_mix():
     model = _model(layers=1)
     users = torch.tensor([0, 1, 2])
     positives = torch.tensor([0, 1, 3])
@@ -120,8 +122,8 @@ def test_one_bpr_trains_id_and_both_constrained_projections():
     assert diagnostics["objective"] == "plain_bpr"
     assert model.E_u.weight.grad.abs().sum() > 0
     assert model.E_i.weight.grad.abs().sum() > 0
-    assert model.user_clv_projection.weight.grad.abs().sum() > 0
     assert model.item_collaborative_projection.weight.grad.abs().sum() > 0
+    assert model.item_price_logits.grad.abs().sum() > 0
 
 
 def test_relation_and_price_views_partition_the_auxiliary_coordinates():
