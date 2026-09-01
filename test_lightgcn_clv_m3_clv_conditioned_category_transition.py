@@ -27,6 +27,7 @@ def test_preflight_locks_one_seed_historical_graph_extension(tmp_path):
     assert summary["m3"]["category_level"] == "COMMODITY_DESC"
     assert summary["m3"]["cross_fit_folds"] == 5
     assert summary["m3"]["minimum_distinct_user_support"] == 5
+    assert summary["m3"]["max_target_categories_per_user"] == 20
     assert summary["fixed"]["negative_sampling"] == "uniform"
     assert summary["fixed"]["min_item_interactions"] == 1
     assert summary["reading_rule"]["accuracy_guardrails"] is False
@@ -41,6 +42,7 @@ def test_preflight_locks_one_seed_historical_graph_extension(tmp_path):
         {"kappa": 10.0},
         {"min_support_users": 3},
         {"cross_fit_folds": 4},
+        {"max_target_categories": 10},
         {"epochs": 50},
     ],
 )
@@ -82,4 +84,3 @@ def test_clv_attribution_requires_actual_to_beat_all_three_references():
     rows[-1] = {"model_id": runner.SHUFFLE_ID, **_metrics(1.03)}
     reading = runner.attribution_reading(pd.DataFrame(rows))
     assert reading["clv_attribution_supported"] is False
-
