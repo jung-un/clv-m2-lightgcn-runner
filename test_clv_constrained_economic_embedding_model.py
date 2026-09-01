@@ -1,10 +1,12 @@
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
 from clv_constrained_economic_embedding_model import (
     ConstrainedCLVEconomicLightGCN,
 )
+import lightgcn_clv_constrained_economic_embedding as runner
 
 
 def _adj(n_users=3, n_items=4):
@@ -153,3 +155,52 @@ def test_m3_m4_and_external_score_paths_are_rejected():
         )
     with pytest.raises(ValueError, match="외부"):
         model.bpr_loss(users, positives, negatives, None, 0.1, None)
+
+
+def test_rho10_attribution_config_is_fixed_before_execution():
+    cfg = runner.configure_rho10_attribution_run(
+        out_dir="/tmp/rho10",
+        baseline_result_dir="/tmp/baseline",
+    )
+
+    assert cfg.rho == 0.10
+    assert cfg.item_price_budget == 0.25
+    assert cfg.include_degree_matched_shuffle is True
+    assert cfg.shuffle_degree_bins == 10
+    assert runner.preflight_summary(cfg)["code_version"] == runner.RHO10_CODE_VERSION
+
+
+def test_degree_matched_shuffle_moves_joint_clv_tuples_only_within_strata():
+    n_users = 12
+    rows = []
+    for user in range(n_users):
+        for item in range(user + 1):
+            rows.append({"u_idx": user, "i_idx": item})
+    q_n = np.linspace(0.05, 0.95, n_users, dtype=np.float32)
+    q_v = np.linspace(0.95, 0.05, n_users, dtype=np.float32)
+    q_c = np.arange(n_users, dtype=np.float32) / n_users
+    prepared = {
+        "data": {
+            "train": pd.DataFrame(rows),
+            "n_users": n_users,
+        },
+        "q_n": q_n,
+        "q_v": q_v,
+        "q_c": q_c,
+        "clv_valid": np.ones(n_users, dtype=bool),
+    }
+    cfg = runner.ConstrainedEconomicConfig(
+        shuffle_degree_bins=3,
+        shuffle_seed=7,
+    )
+
+    shuffled = runner._degree_matched_clv_shuffle(prepared, cfg)
+    source = shuffled["source_user"]
+
+    assert shuffled["changed_valid_user_share"] > 0.0
+    np.testing.assert_array_equal(shuffled["q_n"], q_n[source])
+    np.testing.assert_array_equal(shuffled["q_v"], q_v[source])
+    np.testing.assert_array_equal(shuffled["q_c"], q_c[source])
+    np.testing.assert_array_equal(
+        shuffled["stratum"], shuffled["stratum"][source]
+    )
