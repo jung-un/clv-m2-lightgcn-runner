@@ -1,7 +1,11 @@
+import json
+
 import numpy as np
 import pytest
 import torch
 
+from clv_run_state import file_sha256
+import lightgcn_clv_m3_category_transition_diagnostic as diagnostic
 from lightgcn_clv_m3_category_transition_diagnostic import (
     clv_assignment_correlation,
     configure_m3_category_transition_diagnostic,
@@ -15,12 +19,72 @@ from lightgcn_clv_m3_category_transition_diagnostic import (
 )
 
 
+def test_load_arm_model_accepts_source_checkpoint_seed_inside_config(
+    tmp_path, monkeypatch
+):
+    cfg = configure_m3_category_transition_diagnostic(
+        source_out_dir=str(tmp_path / "source"),
+        diagnostic_out_dir=str(tmp_path / "diagnostic"),
+    )
+    model_id = "actual_model"
+    arm = "actual_clv"
+    record_dir = (
+        tmp_path / "source" / "arms" / cfg.source_result_id
+    )
+    record_dir.mkdir(parents=True)
+    checkpoint = record_dir / f"{model_id}_s42.pt"
+    source_model = torch.nn.Linear(2, 1)
+    torch.save(
+        {
+            "state": source_model.state_dict(),
+            "model_id": model_id,
+            "graph_arm": arm,
+            "config": {"seed": 42},
+            "training": {"final_epoch": 100},
+            "source_revision": "source-revision",
+            "input_hash": "input-hash",
+        },
+        checkpoint,
+    )
+    record = {
+        "model_id": model_id,
+        "graph_arm": arm,
+        "seed": 42,
+        "input_hash": "input-hash",
+        "checkpoint": str(checkpoint),
+        "checkpoint_sha256": file_sha256(checkpoint),
+    }
+    (record_dir / f"{model_id}_s42.json").write_text(
+        json.dumps(record), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        diagnostic.source_runner,
+        "_build_model",
+        lambda *_args: torch.nn.Linear(2, 1),
+    )
+
+    loaded, loaded_record, loaded_path = diagnostic._load_arm_model(
+        cfg,
+        {"input_hash": "input-hash"},
+        object(),
+        arm=arm,
+        model_id=model_id,
+    )
+
+    assert loaded_path == checkpoint
+    assert loaded_record == record
+    assert torch.equal(loaded.weight, source_model.weight)
+
+
 def test_preflight_locks_checkpoint_only_historical_diagnostic(tmp_path):
     cfg = configure_m3_category_transition_diagnostic(
         source_out_dir=str(tmp_path / "source"),
         diagnostic_out_dir=str(tmp_path / "diagnostic"),
     )
     summary = preflight_summary(cfg)
+    assert summary["code_version"] == (
+        "m3-clv-category-transition-failure-diagnostic-v2"
+    )
     assert summary["training"] is False
     assert summary["checkpoint_selection"] is False
     assert summary["source_split"] == "DAY 1--683 train; DAY 684--690 evaluation"

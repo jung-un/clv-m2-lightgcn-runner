@@ -23,7 +23,7 @@ import lightgcn_clv_moe as moe
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m3-clv-category-transition-failure-diagnostic-v1"
+CODE_VERSION = "m3-clv-category-transition-failure-diagnostic-v2"
 
 
 @dataclass(frozen=True)
@@ -46,7 +46,7 @@ def configure_m3_category_transition_diagnostic(
     )
     defaults = {
         "source_out_dir": source,
-        "diagnostic_out_dir": f"{source}/failure_mechanism_diagnostic_v1",
+        "diagnostic_out_dir": f"{source}/failure_mechanism_diagnostic_v2",
     }
     cfg = M3CategoryTransitionDiagnosticConfig(**(defaults | overrides))
     if cfg.dataset != "dunnhumby" or cfg.seed != 42 or cfg.rank_limit != 50:
@@ -537,17 +537,35 @@ def _load_arm_model(
     if expected_sha and file_sha256(checkpoint) != expected_sha:
         raise RuntimeError(f"checkpoint hash mismatch: {model_id}")
     blob = torch.load(checkpoint, map_location=v3.DEVICE, weights_only=False)
-    expected = {
+    expected_record = {
         "model_id": model_id,
         "graph_arm": arm,
         "seed": cfg.seed,
         "input_hash": prepared["input_hash"],
     }
     mismatches = {
-        key: {"expected": value, "actual": blob.get(key)}
-        for key, value in expected.items()
-        if blob.get(key) != value
+        f"record.{key}": {"expected": value, "actual": record.get(key)}
+        for key, value in expected_record.items()
+        if record.get(key) != value
     }
+    expected_checkpoint = {
+        "model_id": model_id,
+        "graph_arm": arm,
+        "input_hash": prepared["input_hash"],
+    }
+    mismatches.update(
+        {
+            f"checkpoint.{key}": {"expected": value, "actual": blob.get(key)}
+            for key, value in expected_checkpoint.items()
+            if blob.get(key) != value
+        }
+    )
+    checkpoint_seed = blob.get("config", {}).get("seed")
+    if checkpoint_seed != cfg.seed:
+        mismatches["checkpoint.config.seed"] = {
+            "expected": cfg.seed,
+            "actual": checkpoint_seed,
+        }
     if mismatches:
         raise RuntimeError(f"checkpoint identity mismatch: {mismatches}")
     model = source_runner._build_model(prepared, source_cfg, arm)
