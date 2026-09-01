@@ -1,4 +1,4 @@
-"""Seed-42 screen for a constrained CLV-economic layer-0 embedding."""
+"""Seed-42 screen changing only the item side of the constrained M2."""
 
 from __future__ import annotations
 
@@ -23,10 +23,12 @@ import lightgcn_clv_moe as moe
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m2-constrained-clv-economic-embedding-historical-screen-v1"
+CODE_VERSION = "m2-hybrid-item-clv-economic-embedding-historical-screen-v2"
 MATCHED_MODEL_ID = "m1_matched_rho0"
-MODEL_ID = "m2_constrained_clv_economic_embedding"
+MODEL_ID = "m2_hybrid_item_clv_economic_embedding"
 ID_ONLY_MODEL_ID = "m2_jointly_trained_id_only"
+RELATION_ONLY_MODEL_ID = "m2_id_plus_item_relation_only"
+PRICE_ONLY_MODEL_ID = "m2_id_plus_item_price_only"
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,7 @@ class ConstrainedEconomicConfig:
     id_dim: int = 64
     clv_dim: int = 4
     rho: float = 0.05
+    item_price_budget: float = 0.25
     n_layers: int = 2
     batch_size: int = 8192
     lr: float = 5e-4
@@ -53,7 +56,7 @@ def configure_constrained_economic_run(**overrides) -> ConstrainedEconomicConfig
     defaults = {
         "out_dir": (
             f"{v3.default_out_dir('dunnhumby')}"
-            "_m2_constrained_clv_economic_embedding_historical_screen_v1"
+            "_m2_hybrid_item_clv_economic_embedding_historical_screen_v2"
         ),
         "baseline_result_dir": (
             f"{v3.default_out_dir('dunnhumby')}"
@@ -77,6 +80,7 @@ def validate_constrained_economic_config(
         "id_dim": 64,
         "clv_dim": 4,
         "rho": 0.05,
+        "item_price_budget": 0.25,
         "n_layers": 2,
         "input_days": 365,
         "diagnostic_max_k": 50,
@@ -107,16 +111,18 @@ def preflight_summary(cfg: ConstrainedEconomicConfig) -> dict:
             "holdout_constructed": False,
         },
         "m2": {
-            "architecture": "ID(64)|one constrained CLV-economic block(4)",
+            "architecture": "ID(64)|one CLV-conditioned hybrid item block(4)",
             "total_dim": cfg.id_dim + cfg.clv_dim,
             "user_block": "q_C * unit(W_u[q_N,q_V])",
-            "item_block": "unit(W_p[overall price, within-category price])",
+            "item_block": "[sqrt(1-beta)*unit(P_z E_i^ID)(2)|sqrt(beta)*centred prices(2)]",
             "user_tanh": False,
             "free_item_response_embedding": False,
             "item_inputs": [
+                "existing item ID embedding projected to 2 dimensions",
                 "overall price percentile",
                 "within-category price percentile",
             ],
+            "item_price_budget": cfg.item_price_budget,
             "joint_graph_propagation": True,
             "one_dot_score": True,
             "rho": cfg.rho,
@@ -137,12 +143,12 @@ def preflight_summary(cfg: ConstrainedEconomicConfig) -> dict:
             "epochs": cfg.epochs,
             "validation_or_epoch_selection": False,
         },
-        "reading_rule": shared.preflight_summary(
-            shared.configure_joint_response_run(
-                out_dir=cfg.out_dir,
-                baseline_result_dir=cfg.baseline_result_dir,
-            )
-        )["reading_rule"],
+        "reading_rule": {
+            "baseline_accuracy": "all Recall/NDCG@10/20/50 >= 99% of matched rho=0",
+            "direct_clv": "full must beat jointly-trained ID-only on high-CLV Recall/NDCG@10 and weighted hit@10",
+            "mechanism": "report ID-only, relation-only, price-only, full and Top-10 changes",
+            "statistical_note": "seed 42 exploratory screen; no significance claim",
+        },
         "out_dir": cfg.out_dir,
         "baseline_result_dir": cfg.baseline_result_dir,
     }
@@ -186,10 +192,24 @@ def _build_model(prepared: dict, cfg: ConstrainedEconomicConfig, rho: float):
         id_dim=cfg.id_dim,
         clv_dim=cfg.clv_dim,
         rho=rho,
+        item_price_budget=cfg.item_price_budget,
         n_layers=cfg.n_layers,
         pref_reg=cfg.pref_reg,
     ).to(v3.DEVICE)
     return model, list(model.parameters())
+
+
+class _ComponentView(torch.nn.Module):
+    def __init__(self, parent: ConstrainedCLVEconomicLightGCN, component: str):
+        super().__init__()
+        self.parent = parent
+        self.component = component
+
+    def embeddings(self, need_value: bool = True):
+        user, item = self.parent.component_embeddings(self.component)
+        zero_user = user.new_zeros((self.parent.n_users, 1))
+        zero_item = item.new_zeros((self.parent.n_items, 1))
+        return user, item, zero_user, zero_item
 
 
 def _arm_paths(prepared: dict, model_id: str) -> dict[str, Path]:
@@ -321,6 +341,22 @@ def run_constrained_economic_screen(
         per_user=False,
     )
     id_metrics = test10._public_metrics(id_metrics_raw)
+    component_metrics = {}
+    for component, model_id in (
+        ("relation", RELATION_ONLY_MODEL_ID),
+        ("price", PRICE_ONLY_MODEL_ID),
+    ):
+        view = _ComponentView(active_model, component).to(v3.DEVICE)
+        raw_metrics, _ = moe._flat_evaluation(
+            view,
+            0.0,
+            prepared["cache"],
+            prepared["meta"],
+            prepared["data"],
+            prepared["base_cfg"],
+            per_user=False,
+        )
+        component_metrics[model_id] = test10._public_metrics(raw_metrics)
     users, matched_top50 = helpers._masked_topk(
         matched_model, prepared, max_k=cfg.diagnostic_max_k
     )
@@ -361,6 +397,17 @@ def run_constrained_economic_screen(
             **id_metrics,
         }
     )
+    for model_id, metrics in component_metrics.items():
+        rows.append(
+            {
+                "model_id": model_id,
+                "role": "joint_training_ablation",
+                "seed": cfg.seed,
+                "split": "historical_development_days_684_690",
+                "final_epoch": cfg.epochs,
+                **metrics,
+            }
+        )
     frame = pd.DataFrame(rows)
     metric_rows = {
         "m1_64": {
@@ -371,6 +418,7 @@ def run_constrained_economic_screen(
         MATCHED_MODEL_ID: matched["metrics"],
         MODEL_ID: active["metrics"],
         ID_ONLY_MODEL_ID: id_metrics,
+        **component_metrics,
     }
     comparison = helpers._metric_comparison(
         metric_rows, references=(MATCHED_MODEL_ID, "m1_64")
@@ -382,8 +430,24 @@ def run_constrained_economic_screen(
         matched["diagnostics"],
         id_only_metrics=id_metrics,
     )
+    direct_metrics = (
+        "고CLV_recall@10",
+        "고CLV_ndcg@10",
+        "price_purchase_amount_weighted_hit@10",
+    )
+    direct_deltas = {
+        metric: float(active["metrics"][metric] - id_metrics[metric])
+        for metric in direct_metrics
+    }
+    reading["direct_clv_deltas_vs_joint_id_only"] = direct_deltas
+    reading["direct_clv_positive"] = all(
+        delta > 0.0 for delta in direct_deltas.values()
+    )
+    reading["positive_screen"] = bool(
+        reading["positive_screen"] and reading["direct_clv_positive"]
+    )
 
-    stem = f"m2_constrained_clv_economic_embedding_{prepared['config_hash']}"
+    stem = f"m2_hybrid_item_clv_economic_embedding_{prepared['config_hash']}"
     paths = {
         "absolute_csv": prepared["out_dir"] / f"{stem}.csv",
         "comparison_csv": prepared["out_dir"] / f"{stem}_comparison.csv",

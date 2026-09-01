@@ -62,19 +62,25 @@ def test_user_clv_norm_is_total_level_and_direction_distinguishes_n_from_v():
     assert user[2, 1] > user[2, 0]  # V-dominant
 
 
-def test_item_clv_block_can_only_use_two_price_positions():
+def test_item_clv_block_uses_two_id_coordinates_and_two_fixed_price_coordinates():
     model = _model(layers=0)
     assert not hasattr(model, "item_response")
     with torch.no_grad():
-        model.item_economic_projection.weight.zero_()
-        model.item_economic_projection.weight[0, 0] = 1.0
-        model.item_economic_projection.weight[1, 1] = 1.0
+        model.item_collaborative_projection.weight.zero_()
+        model.item_collaborative_projection.weight[0, 0] = 1.0
+        model.item_collaborative_projection.weight[1, 1] = 1.0
 
     item = model.clv_item_embeddings()
 
-    assert item[0, 0] < 0 < item[3, 0]
-    assert item[0, 1] < 0 < item[3, 1]
-    torch.testing.assert_close(item.norm(dim=1), torch.ones(4), atol=1e-6, rtol=0)
+    expected_price = model.item_economic_features / np.sqrt(2.0) * np.sqrt(0.25)
+    torch.testing.assert_close(item[:, 2:], expected_price)
+    torch.testing.assert_close(
+        item[:, :2].norm(dim=1),
+        torch.full((4,), np.sqrt(0.75)),
+        atol=1e-6,
+        rtol=0,
+    )
+    assert torch.all(item.norm(dim=1) <= 1.0 + 1e-6)
 
 
 def test_layer0_is_id_plus_one_bounded_four_dimensional_block():
@@ -115,7 +121,22 @@ def test_one_bpr_trains_id_and_both_constrained_projections():
     assert model.E_u.weight.grad.abs().sum() > 0
     assert model.E_i.weight.grad.abs().sum() > 0
     assert model.user_clv_projection.weight.grad.abs().sum() > 0
-    assert model.item_economic_projection.weight.grad.abs().sum() > 0
+    assert model.item_collaborative_projection.weight.grad.abs().sum() > 0
+
+
+def test_relation_and_price_views_partition_the_auxiliary_coordinates():
+    model = _model(layers=1)
+    full_user, full_item = model.propagated_embeddings()
+    relation_user, relation_item = model.component_embeddings("relation")
+    price_user, price_item = model.component_embeddings("price")
+    id_user, id_item = model.id_embeddings()
+
+    torch.testing.assert_close(relation_user[:, 8:], torch.zeros_like(relation_user[:, 8:]))
+    torch.testing.assert_close(relation_item[:, 8:], torch.zeros_like(relation_item[:, 8:]))
+    torch.testing.assert_close(price_user[:, 6:8], torch.zeros_like(price_user[:, 6:8]))
+    torch.testing.assert_close(price_item[:, 6:8], torch.zeros_like(price_item[:, 6:8]))
+    torch.testing.assert_close(full_user[:, :6], id_user)
+    torch.testing.assert_close(full_item[:, :6], id_item)
 
 
 def test_m3_m4_and_external_score_paths_are_rejected():

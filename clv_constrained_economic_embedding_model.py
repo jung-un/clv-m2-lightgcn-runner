@@ -1,4 +1,4 @@
-"""One LightGCN with ID and one constrained CLV-economic layer-0 block."""
+"""One LightGCN with ID and one CLV-conditioned hybrid item block."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 
 class ConstrainedCLVEconomicLightGCN(nn.Module):
-    """Use CLV level as magnitude, N/V as direction, and price-only items."""
+    """Keep the user CLV map and give items identity and price coordinates."""
 
     def __init__(
         self,
@@ -28,6 +28,7 @@ class ConstrainedCLVEconomicLightGCN(nn.Module):
         id_dim: int = 64,
         clv_dim: int = 4,
         rho: float = 0.05,
+        item_price_budget: float = 0.25,
         n_layers: int = 2,
         pref_reg: float = 1e-3,
     ):
@@ -36,6 +37,10 @@ class ConstrainedCLVEconomicLightGCN(nn.Module):
             raise ValueError("사용자·상품·표현 차원은 양수여야 합니다")
         if not 0.0 <= rho <= 1.0:
             raise ValueError("rho는 0 이상 1 이하여야 합니다")
+        if clv_dim != 4:
+            raise ValueError("상품 혼합 보조표현은 4차원이어야 합니다")
+        if not 0.0 <= item_price_budget <= 1.0:
+            raise ValueError("상품 가격 예산은 0 이상 1 이하여야 합니다")
         if n_layers < 0 or pref_reg < 0:
             raise ValueError("n_layers와 pref_reg 설정이 잘못됐습니다")
 
@@ -70,6 +75,7 @@ class ConstrainedCLVEconomicLightGCN(nn.Module):
         self.id_dim = int(id_dim)
         self.clv_dim = int(clv_dim)
         self.rho = float(rho)
+        self.item_price_budget = float(item_price_budget)
         self.n_layers = int(n_layers)
         self.pref_reg = float(pref_reg)
 
@@ -80,9 +86,9 @@ class ConstrainedCLVEconomicLightGCN(nn.Module):
         nn.init.normal_(self.E_i.weight, std=0.1)
 
         self.user_clv_projection = nn.Linear(2, clv_dim, bias=False)
-        self.item_economic_projection = nn.Linear(2, clv_dim, bias=False)
+        self.item_collaborative_projection = nn.Linear(id_dim, 2, bias=False)
         nn.init.normal_(self.user_clv_projection.weight, std=0.05)
-        nn.init.normal_(self.item_economic_projection.weight, std=0.02)
+        nn.init.normal_(self.item_collaborative_projection.weight, std=0.02)
 
         self.register_buffer(
             "user_nv_composition",
@@ -127,10 +133,46 @@ class ConstrainedCLVEconomicLightGCN(nn.Module):
         )
 
     def clv_item_embeddings(self) -> torch.Tensor:
-        direction = self.item_economic_projection(
-            self.item_economic_features * self.item_economic_valid[:, None]
+        collaborative = F.normalize(
+            self.item_collaborative_projection(self.E_i.weight),
+            p=2,
+            dim=1,
+            eps=1e-12,
         )
-        return F.normalize(direction, p=2, dim=1, eps=1e-12)
+        # The two centred price percentiles already lie in [-1, 1]. Dividing by
+        # sqrt(2) preserves their sign and distance from the median while
+        # bounding the price-vector norm by one.
+        price = (
+            self.item_economic_features
+            * self.item_economic_valid[:, None]
+            / math.sqrt(2.0)
+        )
+        return torch.cat(
+            [
+                math.sqrt(1.0 - self.item_price_budget) * collaborative,
+                math.sqrt(self.item_price_budget) * price,
+            ],
+            dim=1,
+        )
+
+    def component_embeddings(
+        self, component: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if component not in {"relation", "price"}:
+            raise ValueError("component는 relation 또는 price여야 합니다")
+        scale = math.sqrt(self.rho)
+        user_clv = self.clv_user_embeddings().clone()
+        item_clv = self.clv_item_embeddings().clone()
+        if component == "relation":
+            user_clv[:, 2:] = 0.0
+            item_clv[:, 2:] = 0.0
+        else:
+            user_clv[:, :2] = 0.0
+            item_clv[:, :2] = 0.0
+        return self._propagate(
+            torch.cat([self.E_u.weight, scale * user_clv], dim=1),
+            torch.cat([self.E_i.weight, scale * item_clv], dim=1),
+        )
 
     def layer0_embeddings(self) -> tuple[torch.Tensor, torch.Tensor]:
         scale = math.sqrt(self.rho)
@@ -219,8 +261,8 @@ class ConstrainedCLVEconomicLightGCN(nn.Module):
             "user_clv_projection_gradient_norm": norm(
                 self.user_clv_projection.weight
             ),
-            "item_economic_projection_gradient_norm": norm(
-                self.item_economic_projection.weight
+            "item_collaborative_projection_gradient_norm": norm(
+                self.item_collaborative_projection.weight
             ),
         }
 
@@ -233,7 +275,7 @@ class ConstrainedCLVEconomicLightGCN(nn.Module):
                 "clv_user_mean_norm",
                 "clv_item_mean_norm",
                 "user_clv_projection_norm",
-                "item_economic_projection_norm",
+                "item_collaborative_projection_norm",
                 "user_clv_norm_qc_mae",
             )
         }
@@ -242,6 +284,8 @@ class ConstrainedCLVEconomicLightGCN(nn.Module):
     def representation_diagnostics(self) -> dict[str, float | int | bool]:
         user_clv = self.clv_user_embeddings()
         item_clv = self.clv_item_embeddings()
+        collaborative_item = item_clv[:, :2]
+        price_item = item_clv[:, 2:]
         expected_user_norm = self.q_c * self.user_clv_valid
         rho0_max = 0.0 if self.rho == 0.0 else float("nan")
         return {
@@ -252,6 +296,7 @@ class ConstrainedCLVEconomicLightGCN(nn.Module):
             "n_layers": self.n_layers,
             "historical_clv_input": True,
             "constrained_clv_economic_block": True,
+            "hybrid_item_block": True,
             "layer0_intervention": True,
             "joint_graph_propagation": True,
             "user_tanh": False,
@@ -264,9 +309,14 @@ class ConstrainedCLVEconomicLightGCN(nn.Module):
             "item_economic_valid_share": float(self.item_economic_valid.mean()),
             "clv_user_mean_norm": float(user_clv.norm(dim=1).mean()),
             "clv_item_mean_norm": float(item_clv.norm(dim=1).mean()),
+            "collaborative_item_mean_norm": float(
+                collaborative_item.norm(dim=1).mean()
+            ),
+            "price_item_mean_norm": float(price_item.norm(dim=1).mean()),
+            "item_price_budget": self.item_price_budget,
             "user_clv_projection_norm": float(self.user_clv_projection.weight.norm()),
-            "item_economic_projection_norm": float(
-                self.item_economic_projection.weight.norm()
+            "item_collaborative_projection_norm": float(
+                self.item_collaborative_projection.weight.norm()
             ),
             "user_clv_norm_qc_mae": float(
                 (user_clv.norm(dim=1) - expected_user_norm).abs().mean()
