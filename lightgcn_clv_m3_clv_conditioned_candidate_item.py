@@ -50,6 +50,7 @@ COMMON_SUPPORT_CODE_VERSION = (
     "m3-clv-conditioned-candidate-item-common-support-historical-screen-v2"
 )
 M1_ID = "m1_baseline"
+ARM_M1 = "binary_m1"
 GENERAL_ID = "m3_general_candidate_item_relation_control"
 ACTUAL_ID = "m3_clv_conditioned_candidate_item_relation"
 SHUFFLE_ID = "m3_clv_conditioned_candidate_item_relation_shuffle"
@@ -143,11 +144,8 @@ def configure_clv_candidate_item_common_support_run(
             f"{v3.default_out_dir('dunnhumby')}"
             "_m3_clv_candidate_item_common_support_historical_screen_v2"
         ),
-        "baseline_result_dir": (
-            f"{v3.default_out_dir('dunnhumby')}"
-            "_m2_repeatshare_historical_backtest_v1"
-        ),
         "relation_mode": RELATION_MODE_COMMON_SUPPORT,
+        "time_cutoff": 697,
     }
     return validate_clv_candidate_item_config(
         CLVCandidateItemConfig(**(defaults | overrides))
@@ -177,7 +175,11 @@ def validate_clv_candidate_item_config(
     required = {
         "dataset": "dunnhumby",
         "seed": 42,
-        "time_cutoff": 690,
+        "time_cutoff": (
+            697
+            if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT
+            else 690
+        ),
         "evaluation_days": 7,
         "epochs": 100,
         "id_dim": 64,
@@ -206,8 +208,13 @@ def validate_clv_candidate_item_config(
             )
     if cfg.batch_size <= 0 or cfg.lr <= 0 or cfg.pref_reg < 0:
         raise ValueError("학습 설정이 잘못됐습니다")
-    if not cfg.out_dir or not cfg.baseline_result_dir:
-        raise ValueError("out_dir와 baseline_result_dir가 필요합니다")
+    if not cfg.out_dir:
+        raise ValueError("out_dir가 필요합니다")
+    if (
+        cfg.relation_mode == RELATION_MODE_POSITIVE_EXCESS
+        and not cfg.baseline_result_dir
+    ):
+        raise ValueError("v1 screen은 baseline_result_dir가 필요합니다")
     return cfg
 
 
@@ -219,12 +226,19 @@ def preflight_summary(cfg: CLVCandidateItemConfig) -> dict:
         "code_version": _code_version(cfg),
         "dataset": cfg.dataset,
         "seed": cfg.seed,
-        "trained_models": [model_ids[arm] for arm in ACTIVE_ARMS],
-        "reused_comparator": M1_ID,
+        "trained_models": (
+            [M1_ID] + [model_ids[arm] for arm in ACTIVE_ARMS]
+            if common_support
+            else [model_ids[arm] for arm in ACTIVE_ARMS]
+        ),
+        "reused_comparator": None if common_support else M1_ID,
+        "trained_comparator": M1_ID if common_support else None,
         "historical_development_split": {
-            "train_end_inclusive": 683,
-            "evaluation_start_inclusive": 684,
-            "evaluation_end_inclusive": 690,
+            "train_end_inclusive": cfg.time_cutoff - cfg.evaluation_days,
+            "evaluation_start_inclusive": (
+                cfg.time_cutoff - cfg.evaluation_days + 1
+            ),
+            "evaluation_end_inclusive": cfg.time_cutoff,
             "final_test_constructed": False,
             "holdout_constructed": False,
         },
@@ -344,7 +358,7 @@ def _base_config(cfg: CLVCandidateItemConfig) -> dict:
     )
     base = dict(configured)
     required = {
-        "TIME_CUTOFF": 690,
+        "TIME_CUTOFF": cfg.time_cutoff,
         "TRAIN_ON_VAL": True,
         "TEST_DAYS": 7,
         "HOLDOUT_DAYS": 0,
@@ -388,7 +402,8 @@ def _prepare(cfg: CLVCandidateItemConfig) -> dict:
     data = v3.prepare_data(base_cfg, v3.DCFG)
     if set(data["splits"]) != {"test"}:
         raise RuntimeError(f"historical 개발분할 외 오염: {sorted(data['splits'])}")
-    if float(data["train"].t.max()) != 683.0:
+    expected_train_end = float(cfg.time_cutoff - cfg.evaluation_days)
+    if float(data["train"].t.max()) != expected_train_end:
         raise RuntimeError(f"historical train 종료일 오류: {data['train'].t.max()}")
     if data.get("loss_w") is not None:
         raise RuntimeError("M3 candidate-item screen에 M4 표본 가중치가 섞였습니다")
@@ -414,7 +429,11 @@ def _prepare(cfg: CLVCandidateItemConfig) -> dict:
         max_target_categories=cfg.max_target_categories,
         max_candidate_items=cfg.max_candidate_items,
     )
-    baseline = baseline_support._load_compatible_baseline(cfg, manifest)
+    baseline = (
+        None
+        if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT
+        else baseline_support._load_compatible_baseline(cfg, manifest)
+    )
     meta = v3.item_meta(data["train"], data["n_items"])
     thresholds = v3.segment_thresholds(graph.clv_proxy, base_cfg["SEG_EDGES"])
     cache = v3.EvalCache(
@@ -445,7 +464,7 @@ def _build_model(
     cfg: CLVCandidateItemConfig,
     arm: str,
 ) -> CLVCandidateItemLightGCN:
-    if arm not in ACTIVE_ARMS:
+    if arm not in (*ACTIVE_ARMS, ARM_M1):
         raise KeyError(arm)
     data = prepared["data"]
     v3.set_seed(cfg.seed)
@@ -458,14 +477,20 @@ def _build_model(
         data["n_items"],
         v3.DEVICE,
     )
+    if arm == ARM_M1:
+        relation = torch.sparse_coo_tensor(
+            torch.empty((2, 0), dtype=torch.long),
+            torch.empty(0, dtype=torch.float32),
+            size=(data["n_users"], data["n_items"]),
+        ).coalesce()
+    else:
+        relation = prepared["graph"].user_item_operators[arm]
     return CLVCandidateItemLightGCN(
         n_users=data["n_users"],
         n_items=data["n_items"],
         base_user_from_item=user_item,
         base_item_from_user=item_user,
-        user_candidate_item=(
-            prepared["graph"].user_item_operators[arm].to(v3.DEVICE)
-        ),
+        user_candidate_item=relation.to(v3.DEVICE),
         gamma=cfg.gamma,
         dim=cfg.id_dim,
         n_layers=cfg.n_layers,
@@ -558,17 +583,36 @@ def _run_arm(
         temporary,
     )
     os.replace(temporary, paths["checkpoint"])
+    split_label = (
+        "historical_development_days_"
+        f"{cfg.time_cutoff - cfg.evaluation_days + 1}_{cfg.time_cutoff}"
+    )
+    graph_diagnostics = (
+        {
+            "binary_m1_only": True,
+            "candidate_relation_edges": 0,
+            "candidate_relation_row_mass": 0.0,
+        }
+        if arm == ARM_M1
+        else prepared["graph"].diagnostics["arms"][arm]
+    )
     payload = {
         "model_id": model_id,
-        "role": "model" if arm == ARM_ACTUAL else "control",
+        "role": (
+            "baseline"
+            if arm == ARM_M1
+            else "model"
+            if arm == ARM_ACTUAL
+            else "control"
+        ),
         "graph_arm": arm,
         "seed": cfg.seed,
-        "split": "historical_development_days_684_690",
+        "split": split_label,
         "final_epoch": cfg.epochs,
         "input_hash": prepared["input_hash"],
         "metrics": fixed_train._public_metrics(metrics),
         "model_diagnostics": model_diagnostics,
-        "graph_diagnostics": prepared["graph"].diagnostics["arms"][arm],
+        "graph_diagnostics": graph_diagnostics,
         "training": training,
         "checkpoint": str(paths["checkpoint"]),
         "checkpoint_sha256": file_sha256(paths["checkpoint"]),
@@ -578,7 +622,7 @@ def _run_arm(
         epoch=cfg.epochs,
         max_epoch=cfg.epochs,
         selection="none",
-        split="historical_development_days_684_690",
+        split=split_label,
         checkpoint_path=str(paths["checkpoint"]),
         result_path=str(paths["result"]),
     )
@@ -727,6 +771,18 @@ def run_clv_candidate_item_screen(
     }
 
     arms = []
+    trained_baseline = None
+    if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT:
+        print(
+            f"\n===== {M1_ID} | seed {cfg.seed} | "
+            f"fixed {cfg.epochs} epochs ====="
+        )
+        trained_baseline = _run_arm(
+            prepared,
+            cfg,
+            arm=ARM_M1,
+            model_id=M1_ID,
+        )
     for graph_arm in ACTIVE_ARMS:
         model_id = arm_model_ids[graph_arm]
         print(
@@ -737,13 +793,31 @@ def run_clv_candidate_item_screen(
             _run_arm(prepared, cfg, arm=graph_arm, model_id=model_id)
         )
 
-    source_baseline = dict(prepared["baseline"])
-    baseline = {
-        **source_baseline,
-        "model_id": M1_ID,
-        "role": "reused_baseline",
-        "source_model_id": source_baseline.get("model_id"),
-    }
+    source_baseline = (
+        dict(trained_baseline)
+        if trained_baseline is not None
+        else dict(prepared["baseline"])
+    )
+    baseline = (
+        {
+            "model_id": M1_ID,
+            "role": "baseline",
+            "graph_arm": ARM_M1,
+            "seed": source_baseline["seed"],
+            "split": source_baseline["split"],
+            "final_epoch": source_baseline["final_epoch"],
+            **source_baseline["model_diagnostics"],
+            **source_baseline["graph_diagnostics"],
+            **source_baseline["metrics"],
+        }
+        if trained_baseline is not None
+        else {
+            **source_baseline,
+            "model_id": M1_ID,
+            "role": "reused_baseline",
+            "source_model_id": source_baseline.get("model_id"),
+        }
+    )
     rows = [baseline]
     for arm in arms:
         rows.append(
@@ -782,7 +856,16 @@ def run_clv_candidate_item_screen(
         "config": asdict(cfg),
         "preflight": preflight,
         "input_manifest": prepared["manifest"],
-        "reused_baseline_source": source_baseline.get("source_result"),
+        "reused_baseline_source": (
+            None
+            if trained_baseline is not None
+            else source_baseline.get("source_result")
+        ),
+        "trained_baseline_checkpoint": (
+            trained_baseline.get("checkpoint")
+            if trained_baseline is not None
+            else None
+        ),
         "graph_diagnostics": prepared["graph"].diagnostics,
         "absolute_rows": frame.to_dict("records"),
         "comparison_rows": comparison.to_dict("records"),

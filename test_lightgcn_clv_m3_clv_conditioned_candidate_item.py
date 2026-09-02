@@ -34,10 +34,20 @@ def test_preflight_locks_common_support_weight_screen(tmp_path):
 
     assert summary["code_version"] == runner.COMMON_SUPPORT_CODE_VERSION
     assert summary["trained_models"] == [
+        runner.M1_ID,
         runner.COMMON_SUPPORT_GENERAL_ID,
         runner.COMMON_SUPPORT_ACTUAL_ID,
         runner.COMMON_SUPPORT_SHUFFLE_ID,
     ]
+    assert summary["reused_comparator"] is None
+    assert summary["trained_comparator"] == runner.M1_ID
+    assert summary["historical_development_split"] == {
+        "train_end_inclusive": 690,
+        "evaluation_start_inclusive": 691,
+        "evaluation_end_inclusive": 697,
+        "final_test_constructed": False,
+        "holdout_constructed": False,
+    }
     assert summary["m3"]["candidate_support"] == (
         "pooled top candidates fixed identically across all arms"
     )
@@ -50,6 +60,14 @@ def test_common_support_config_rejects_old_relation_mode(tmp_path):
             out_dir=str(tmp_path / "m3-v2"),
             baseline_result_dir=str(tmp_path / "m1"),
             relation_mode=runner.RELATION_MODE_POSITIVE_EXCESS,
+        )
+
+
+def test_common_support_config_rejects_seen_development_interval(tmp_path):
+    with pytest.raises(ValueError, match="time_cutoff=697"):
+        runner.configure_clv_candidate_item_common_support_run(
+            out_dir=str(tmp_path / "m3-v2"),
+            time_cutoff=690,
         )
 
 
