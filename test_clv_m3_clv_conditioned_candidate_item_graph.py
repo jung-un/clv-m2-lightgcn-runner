@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 from clv_m3_clv_conditioned_candidate_item_graph import (
@@ -7,8 +8,10 @@ from clv_m3_clv_conditioned_candidate_item_graph import (
     ARM_GENERAL,
     ARM_SHUFFLE,
     RELATION_MODE_COMMON_SUPPORT,
+    RELATION_MODE_SUPPLEMENTAL,
     build_clv_conditioned_common_support_candidate_item_graph,
     build_clv_conditioned_candidate_item_graph,
+    build_clv_conditioned_supplemental_candidate_item_graph,
 )
 
 
@@ -25,6 +28,30 @@ def _train() -> pd.DataFrame:
             (100 + user * 10, 1, 0, 0),
             (101 + user * 10, 2, target_item, 1),
             (102 + user * 10, 3, 3, 0),
+        ):
+            rows.append(
+                {
+                    "u_idx": user,
+                    "i_idx": item,
+                    "cat_idx": category,
+                    "b_raw": basket,
+                    "t": time,
+                    "v": value,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _supplemental_train() -> pd.DataFrame:
+    rows = []
+    for user in range(12):
+        high_clv = user >= 6
+        value = 10.0 if high_clv else 1.0
+        target_item = (4 if high_clv else 1) + (user % 3)
+        for basket, time, item, category in (
+            (100 + user * 10, 1, 0, 0),
+            (101 + user * 10, 2, target_item, 1),
+            (102 + user * 10, 3, 7, 0),
         ):
             rows.append(
                 {
@@ -70,6 +97,24 @@ def _common_support_graph():
         cross_fit_folds=2,
         max_target_categories=2,
         max_candidate_items=3,
+    )
+
+
+def _supplemental_graph():
+    return build_clv_conditioned_supplemental_candidate_item_graph(
+        _supplemental_train(),
+        n_users=12,
+        n_items=8,
+        n_cat=2,
+        category_kappa=0.0,
+        category_min_support_users=1,
+        item_kappa=0.0,
+        item_min_support_users=1,
+        shuffle_degree_bins=1,
+        cross_fit_folds=2,
+        max_target_categories=2,
+        base_candidate_items=1,
+        supplemental_candidate_items=1,
     )
 
 
@@ -162,3 +207,50 @@ def test_common_support_uses_clv_for_direction_not_candidate_availability():
     np.testing.assert_array_equal(general > 0, actual > 0)
     assert actual[0, 4] > actual[0, 5]
     assert actual[4, 5] > actual[4, 4]
+
+
+def test_supplemental_graph_preserves_base_and_matches_block_mass():
+    graph = _supplemental_graph()
+    operators = graph.user_item_operators
+
+    for operator in operators.values():
+        dense = operator.to_dense().numpy()
+        np.testing.assert_allclose(dense.sum(axis=1), 1.0)
+        assert np.all((dense > 0).sum(axis=1) == 2)
+    support = graph.diagnostics["supplemental_support"]
+    assert support["base_edges_identical"] is True
+    assert support["base_mass"] == pytest.approx(0.5)
+    assert support["extra_mass"] == pytest.approx(0.5)
+    assert support["max_base_mass_error"] < 1e-7
+    assert support["max_extra_mass_error"] < 1e-7
+    assert graph.diagnostics["settings"]["relation_mode"] == (
+        RELATION_MODE_SUPPLEMENTAL
+    )
+
+
+def test_supplemental_candidates_are_outside_base_and_train_pairs():
+    graph = _supplemental_graph()
+    support = graph.diagnostics["supplemental_support"]
+
+    assert support["base_extra_overlap"] == 0
+    assert support["train_pair_edges"] == 0
+    assert support["edges_per_active_user"] == 2
+
+
+def test_supplemental_graph_fails_when_positive_excess_is_insufficient():
+    with pytest.raises(RuntimeError, match="positive excess candidates"):
+        build_clv_conditioned_supplemental_candidate_item_graph(
+            _supplemental_train(),
+            n_users=12,
+            n_items=8,
+            n_cat=2,
+            base_candidate_items=4,
+            supplemental_candidate_items=2,
+            category_kappa=0.0,
+            category_min_support_users=1,
+            item_kappa=0.0,
+            item_min_support_users=1,
+            shuffle_degree_bins=1,
+            cross_fit_folds=2,
+            max_target_categories=2,
+        )
