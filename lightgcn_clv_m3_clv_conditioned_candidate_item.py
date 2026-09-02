@@ -20,12 +20,16 @@ from clv_m3_clv_conditioned_candidate_item_graph import (
     ARM_SHUFFLE,
     DEFAULT_ITEM_KAPPA,
     DEFAULT_ITEM_MIN_SUPPORT_USERS,
+    DEFAULT_BASE_CANDIDATE_ITEMS,
     DEFAULT_MAX_CANDIDATE_ITEMS,
     DEFAULT_MAX_TARGET_CATEGORIES,
+    DEFAULT_SUPPLEMENTAL_CANDIDATE_ITEMS,
     RELATION_MODE_COMMON_SUPPORT,
     RELATION_MODE_POSITIVE_EXCESS,
+    RELATION_MODE_SUPPLEMENTAL,
     build_clv_conditioned_common_support_candidate_item_graph,
     build_clv_conditioned_candidate_item_graph,
+    build_clv_conditioned_supplemental_candidate_item_graph,
 )
 from clv_m3_clv_conditioned_category_transition_graph import (
     DEFAULT_CROSS_FIT_FOLDS,
@@ -49,6 +53,9 @@ CODE_VERSION = "m3-clv-conditioned-candidate-item-historical-screen-v1"
 COMMON_SUPPORT_CODE_VERSION = (
     "m3-clv-conditioned-candidate-item-common-support-historical-screen-v2"
 )
+SUPPLEMENTAL_CODE_VERSION = (
+    "m3-clv-supplemental-candidate-item-historical-screen-v1"
+)
 M1_ID = "m1_baseline"
 ARM_M1 = "binary_m1"
 GENERAL_ID = "m3_general_candidate_item_relation_control"
@@ -68,6 +75,20 @@ COMMON_SUPPORT_ARM_MODEL_IDS = {
     ARM_GENERAL: COMMON_SUPPORT_GENERAL_ID,
     ARM_ACTUAL: COMMON_SUPPORT_ACTUAL_ID,
     ARM_SHUFFLE: COMMON_SUPPORT_SHUFFLE_ID,
+}
+SUPPLEMENTAL_GENERAL_ID = (
+    "m3_general_supplemental_candidate_item_relation_control"
+)
+SUPPLEMENTAL_ACTUAL_ID = (
+    "m3_clv_conditioned_supplemental_candidate_item_relation"
+)
+SUPPLEMENTAL_SHUFFLE_ID = (
+    "m3_clv_conditioned_supplemental_candidate_item_relation_shuffle"
+)
+SUPPLEMENTAL_ARM_MODEL_IDS = {
+    ARM_GENERAL: SUPPLEMENTAL_GENERAL_ID,
+    ARM_ACTUAL: SUPPLEMENTAL_ACTUAL_ID,
+    ARM_SHUFFLE: SUPPLEMENTAL_SHUFFLE_ID,
 }
 ACCURACY_METRICS = (
     "recall@10",
@@ -101,7 +122,11 @@ class CLVCandidateItemConfig:
     cross_fit_folds: int = DEFAULT_CROSS_FIT_FOLDS
     max_target_categories: int = DEFAULT_MAX_TARGET_CATEGORIES
     max_candidate_items: int = DEFAULT_MAX_CANDIDATE_ITEMS
+    base_candidate_items: int = DEFAULT_BASE_CANDIDATE_ITEMS
+    supplemental_candidate_items: int = DEFAULT_SUPPLEMENTAL_CANDIDATE_ITEMS
     relation_mode: str = RELATION_MODE_POSITIVE_EXCESS
+    evaluation_authorized: bool = False
+    evaluation_protocol_label: str = ""
     out_dir: str = ""
     baseline_result_dir: str = ""
 
@@ -152,11 +177,35 @@ def configure_clv_candidate_item_common_support_run(
     )
 
 
+def configure_clv_candidate_item_supplemental_run(
+    **overrides,
+) -> CLVCandidateItemConfig:
+    if overrides.get(
+        "relation_mode", RELATION_MODE_SUPPLEMENTAL
+    ) != RELATION_MODE_SUPPLEMENTAL:
+        raise ValueError("supplemental candidate screen relation mode is fixed")
+    defaults = {
+        "out_dir": (
+            f"{v3.default_out_dir('dunnhumby')}"
+            "_m3_clv_supplemental_candidate_historical_screen_v1"
+        ),
+        "relation_mode": RELATION_MODE_SUPPLEMENTAL,
+        "time_cutoff": 690,
+        "evaluation_authorized": False,
+        "evaluation_protocol_label": "",
+    }
+    return validate_clv_candidate_item_config(
+        CLVCandidateItemConfig(**(defaults | overrides))
+    )
+
+
 def _code_version(cfg: CLVCandidateItemConfig) -> str:
     if cfg.relation_mode == RELATION_MODE_POSITIVE_EXCESS:
         return CODE_VERSION
     if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT:
         return COMMON_SUPPORT_CODE_VERSION
+    if cfg.relation_mode == RELATION_MODE_SUPPLEMENTAL:
+        return SUPPLEMENTAL_CODE_VERSION
     raise ValueError(f"unknown candidate relation mode: {cfg.relation_mode}")
 
 
@@ -165,6 +214,8 @@ def _arm_model_ids(cfg: CLVCandidateItemConfig) -> dict[str, str]:
         return ARM_MODEL_IDS
     if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT:
         return COMMON_SUPPORT_ARM_MODEL_IDS
+    if cfg.relation_mode == RELATION_MODE_SUPPLEMENTAL:
+        return SUPPLEMENTAL_ARM_MODEL_IDS
     raise ValueError(f"unknown candidate relation mode: {cfg.relation_mode}")
 
 
@@ -175,11 +226,6 @@ def validate_clv_candidate_item_config(
     required = {
         "dataset": "dunnhumby",
         "seed": 42,
-        "time_cutoff": (
-            697
-            if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT
-            else 690
-        ),
         "evaluation_days": 7,
         "epochs": 100,
         "id_dim": 64,
@@ -194,6 +240,8 @@ def validate_clv_candidate_item_config(
         "cross_fit_folds": 5,
         "max_target_categories": 20,
         "max_candidate_items": 100,
+        "base_candidate_items": 100,
+        "supplemental_candidate_items": 20,
     }
     for key, expected in required.items():
         actual = getattr(cfg, key)
@@ -206,6 +254,35 @@ def validate_clv_candidate_item_config(
             raise ValueError(
                 f"빠른 M3 candidate-item screen은 {key}={expected!r}이어야 합니다"
             )
+    if cfg.relation_mode == RELATION_MODE_POSITIVE_EXCESS:
+        expected_cutoff = 690
+    elif cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT:
+        expected_cutoff = 697
+    else:
+        expected_cutoff = None
+    if expected_cutoff is not None and cfg.time_cutoff != expected_cutoff:
+        raise ValueError(
+            "빠른 M3 candidate-item screen은 "
+            f"time_cutoff={expected_cutoff!r}이어야 합니다"
+        )
+    if cfg.relation_mode == RELATION_MODE_SUPPLEMENTAL:
+        if cfg.evaluation_authorized:
+            if cfg.time_cutoff <= 704:
+                raise ValueError(
+                    "already-seen DAY 684--704 cannot be reused for performance evaluation"
+                )
+            if not cfg.evaluation_protocol_label.strip():
+                raise ValueError(
+                    "evaluation_protocol_label is required for an authorized evaluation"
+                )
+        elif cfg.time_cutoff != 690:
+            raise ValueError(
+                "unapproved supplemental precheck is fixed to DAY 684--690"
+            )
+    elif cfg.evaluation_authorized or cfg.evaluation_protocol_label:
+        raise ValueError(
+            "evaluation authorization fields are only for the supplemental screen"
+        )
     if cfg.batch_size <= 0 or cfg.lr <= 0 or cfg.pref_reg < 0:
         raise ValueError("학습 설정이 잘못됐습니다")
     if not cfg.out_dir:
@@ -222,24 +299,34 @@ def preflight_summary(cfg: CLVCandidateItemConfig) -> dict:
     cfg = validate_clv_candidate_item_config(cfg)
     model_ids = _arm_model_ids(cfg)
     common_support = cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT
+    supplemental = cfg.relation_mode == RELATION_MODE_SUPPLEMENTAL
+    trains_baseline = common_support or supplemental
     return {
         "code_version": _code_version(cfg),
         "dataset": cfg.dataset,
         "seed": cfg.seed,
         "trained_models": (
             [M1_ID] + [model_ids[arm] for arm in ACTIVE_ARMS]
-            if common_support
+            if trains_baseline
             else [model_ids[arm] for arm in ACTIVE_ARMS]
         ),
-        "reused_comparator": None if common_support else M1_ID,
-        "trained_comparator": M1_ID if common_support else None,
+        "reused_comparator": None if trains_baseline else M1_ID,
+        "trained_comparator": M1_ID if trains_baseline else None,
+        "performance_evaluation_authorized": bool(
+            cfg.evaluation_authorized if supplemental else True
+        ),
+        "evaluation_protocol_label": (
+            cfg.evaluation_protocol_label if supplemental else ""
+        ),
         "historical_development_split": {
             "train_end_inclusive": cfg.time_cutoff - cfg.evaluation_days,
             "evaluation_start_inclusive": (
                 cfg.time_cutoff - cfg.evaluation_days + 1
             ),
             "evaluation_end_inclusive": cfg.time_cutoff,
-            "final_test_constructed": False,
+            "final_test_constructed": bool(
+                supplemental and cfg.evaluation_authorized
+            ),
             "holdout_constructed": False,
         },
         "research_question": (
@@ -262,6 +349,10 @@ def preflight_summary(cfg: CLVCandidateItemConfig) -> dict:
                 "CLV-conditioned first-acquisition item probability"
             ),
             "actual_candidate_edge": (
+                "fixed-mass actual-CLV positive-excess candidates outside "
+                "the shared pooled Top-100"
+                if supplemental
+                else
                 "actual-CLV conditional probability normalized on the "
                 "shared pooled candidate support"
                 if common_support
@@ -269,6 +360,9 @@ def preflight_summary(cfg: CLVCandidateItemConfig) -> dict:
                 "candidate-item distribution"
             ),
             "general_relation_control": (
+                "shared pooled Top-100 plus pooled ranks 101--120"
+                if supplemental
+                else
                 "pooled probability normalized on the same candidate support"
                 if common_support
                 else "pooled candidate-item probability"
@@ -287,7 +381,28 @@ def preflight_summary(cfg: CLVCandidateItemConfig) -> dict:
             "item_minimum_distinct_user_support": cfg.item_min_support_users,
             "max_target_categories_per_user": cfg.max_target_categories,
             "max_candidate_items_per_user": cfg.max_candidate_items,
+            "base_candidate_items": (
+                cfg.base_candidate_items if supplemental else None
+            ),
+            "supplemental_candidate_items": (
+                cfg.supplemental_candidate_items if supplemental else None
+            ),
+            "base_mass": (
+                cfg.base_candidate_items
+                / (cfg.base_candidate_items + cfg.supplemental_candidate_items)
+                if supplemental
+                else None
+            ),
+            "supplemental_mass": (
+                cfg.supplemental_candidate_items
+                / (cfg.base_candidate_items + cfg.supplemental_candidate_items)
+                if supplemental
+                else None
+            ),
             "candidate_support": (
+                "shared pooled Top-100 plus an arm-specific 20-item block"
+                if supplemental
+                else
                 "pooled top candidates fixed identically across all arms"
                 if common_support
                 else "selected separately inside each arm"
@@ -409,29 +524,40 @@ def _prepare(cfg: CLVCandidateItemConfig) -> dict:
         raise RuntimeError("M3 candidate-item screen에 M4 표본 가중치가 섞였습니다")
     data["loss_w"] = None
 
-    graph_builder = (
-        build_clv_conditioned_common_support_candidate_item_graph
-        if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT
-        else build_clv_conditioned_candidate_item_graph
-    )
+    if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT:
+        graph_builder = build_clv_conditioned_common_support_candidate_item_graph
+    elif cfg.relation_mode == RELATION_MODE_SUPPLEMENTAL:
+        graph_builder = build_clv_conditioned_supplemental_candidate_item_graph
+    else:
+        graph_builder = build_clv_conditioned_candidate_item_graph
+    graph_kwargs = {
+        "category_kappa": cfg.category_kappa,
+        "category_min_support_users": cfg.category_min_support_users,
+        "item_kappa": cfg.item_kappa,
+        "item_min_support_users": cfg.item_min_support_users,
+        "shuffle_seed": cfg.shuffle_seed,
+        "shuffle_degree_bins": cfg.shuffle_degree_bins,
+        "cross_fit_folds": cfg.cross_fit_folds,
+        "max_target_categories": cfg.max_target_categories,
+    }
+    if cfg.relation_mode == RELATION_MODE_SUPPLEMENTAL:
+        graph_kwargs.update(
+            base_candidate_items=cfg.base_candidate_items,
+            supplemental_candidate_items=cfg.supplemental_candidate_items,
+        )
+    else:
+        graph_kwargs["max_candidate_items"] = cfg.max_candidate_items
     graph = graph_builder(
         data["train"],
         data["n_users"],
         data["n_items"],
         data["n_cat"],
-        category_kappa=cfg.category_kappa,
-        category_min_support_users=cfg.category_min_support_users,
-        item_kappa=cfg.item_kappa,
-        item_min_support_users=cfg.item_min_support_users,
-        shuffle_seed=cfg.shuffle_seed,
-        shuffle_degree_bins=cfg.shuffle_degree_bins,
-        cross_fit_folds=cfg.cross_fit_folds,
-        max_target_categories=cfg.max_target_categories,
-        max_candidate_items=cfg.max_candidate_items,
+        **graph_kwargs,
     )
     baseline = (
         None
-        if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT
+        if cfg.relation_mode
+        in (RELATION_MODE_COMMON_SUPPORT, RELATION_MODE_SUPPLEMENTAL)
         else baseline_support._load_compatible_baseline(cfg, manifest)
     )
     meta = v3.item_meta(data["train"], data["n_items"])
@@ -650,9 +776,39 @@ def _six_metric_balance(actual: pd.Series, reference: pd.Series) -> float:
     return float(np.exp(np.log(ratios).mean()))
 
 
+def _candidate_truth_hit_counts(
+    graph,
+    ground_truth: dict[int, np.ndarray],
+) -> dict[str, int]:
+    if not ground_truth:
+        return {arm: 0 for arm in ACTIVE_ARMS}
+    truth_keys = np.concatenate(
+        [
+            np.asarray(items, dtype=np.int64)
+            + int(user) * graph.user_item_operators[ARM_GENERAL].shape[1]
+            for user, items in ground_truth.items()
+        ]
+    )
+    truth_keys = np.unique(truth_keys)
+    counts = {}
+    n_items = int(graph.user_item_operators[ARM_GENERAL].shape[1])
+    for arm, operator in graph.user_item_operators.items():
+        users, items = operator.coalesce().indices().cpu().numpy()
+        candidate_keys = users.astype(np.int64) * n_items + items.astype(
+            np.int64
+        )
+        counts[arm] = int(
+            np.intersect1d(
+                truth_keys, candidate_keys, assume_unique=False
+            ).size
+        )
+    return counts
+
+
 def attribution_reading(
     frame: pd.DataFrame,
     model_ids: dict[str, str] | None = None,
+    candidate_truth_hits: dict[str, int] | None = None,
 ) -> dict:
     model_ids = model_ids or {
         "m1": M1_ID,
@@ -679,13 +835,28 @@ def attribution_reading(
     }
     weighted_hit = "price_purchase_amount_weighted_hit@10"
     recommended_price = "mean_recommended_price_percentile@10"
+    performance_passed = bool(
+        all(value > 1.0 for value in balances.values())
+    )
+    candidate_passed = (
+        None
+        if candidate_truth_hits is None
+        else bool(
+            candidate_truth_hits[ARM_ACTUAL]
+            > candidate_truth_hits[ARM_SHUFFLE]
+        )
+    )
     return {
         "clv_attribution_supported": bool(
-            all(value > 1.0 for value in balances.values())
+            performance_passed and candidate_passed is not False
         ),
+        "performance_balance_passed": performance_passed,
+        "candidate_truth_advantage_passed": candidate_passed,
+        "candidate_truth_hits": candidate_truth_hits,
         "primary_rule": (
             "actual six-metric geometric balance > 1 against M1, pooled "
-            "candidate relation, and degree-matched CLV shuffle"
+            "candidate relation, and degree-matched CLV shuffle; supplemental "
+            "actual candidate truth hits must also exceed shuffle when supplied"
         ),
         "six_metric_balance_actual_vs_m1": balances["m1"],
         "six_metric_balance_actual_vs_general_candidate_relation": balances[
@@ -759,6 +930,13 @@ def run_clv_candidate_item_screen(
     cfg = validate_clv_candidate_item_config(
         cfg or configure_clv_candidate_item_run()
     )
+    if (
+        cfg.relation_mode == RELATION_MODE_SUPPLEMENTAL
+        and not cfg.evaluation_authorized
+    ):
+        raise RuntimeError(
+            "evaluation protocol approval is required before supplemental model training"
+        )
     preflight = preflight_summary(cfg)
     print(json.dumps(preflight, ensure_ascii=False, indent=2))
     prepared = _prepare(cfg)
@@ -772,7 +950,10 @@ def run_clv_candidate_item_screen(
 
     arms = []
     trained_baseline = None
-    if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT:
+    if cfg.relation_mode in (
+        RELATION_MODE_COMMON_SUPPORT,
+        RELATION_MODE_SUPPLEMENTAL,
+    ):
         print(
             f"\n===== {M1_ID} | seed {cfg.seed} | "
             f"fixed {cfg.epochs} epochs ====="
@@ -835,13 +1016,25 @@ def run_clv_candidate_item_screen(
         )
     frame = pd.DataFrame(rows)
     comparison = _comparison(frame, model_ids)
-    reading = attribution_reading(frame, model_ids)
-
-    stem_prefix = (
-        "m3_clv_candidate_item_common_support"
-        if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT
-        else "m3_clv_candidate_item"
+    candidate_truth_hits = (
+        _candidate_truth_hit_counts(
+            prepared["graph"], prepared["data"]["splits"]["test"][0]
+        )
+        if cfg.relation_mode == RELATION_MODE_SUPPLEMENTAL
+        else None
     )
+    reading = attribution_reading(
+        frame,
+        model_ids,
+        candidate_truth_hits=candidate_truth_hits,
+    )
+
+    if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT:
+        stem_prefix = "m3_clv_candidate_item_common_support"
+    elif cfg.relation_mode == RELATION_MODE_SUPPLEMENTAL:
+        stem_prefix = "m3_clv_supplemental_candidate_item"
+    else:
+        stem_prefix = "m3_clv_candidate_item"
     stem = f"{stem_prefix}_{prepared['config_hash']}"
     paths = {
         "absolute_csv": prepared["out_dir"] / f"{stem}.csv",
@@ -867,6 +1060,7 @@ def run_clv_candidate_item_screen(
             else None
         ),
         "graph_diagnostics": prepared["graph"].diagnostics,
+        "candidate_truth_hits": candidate_truth_hits,
         "absolute_rows": frame.to_dict("records"),
         "comparison_rows": comparison.to_dict("records"),
         "attribution_reading": reading,
@@ -892,6 +1086,19 @@ def run_clv_candidate_item_common_support_screen(
     cfg = cfg or configure_clv_candidate_item_common_support_run()
     if cfg.relation_mode != RELATION_MODE_COMMON_SUPPORT:
         raise ValueError("common-support screen requires its fixed relation mode")
+    return run_clv_candidate_item_screen(cfg)
+
+
+def run_clv_candidate_item_supplemental(
+    cfg: CLVCandidateItemConfig | None = None,
+) -> pd.DataFrame:
+    cfg = cfg or configure_clv_candidate_item_supplemental_run()
+    if cfg.relation_mode != RELATION_MODE_SUPPLEMENTAL:
+        raise ValueError("supplemental screen requires its fixed relation mode")
+    if not cfg.evaluation_authorized:
+        raise RuntimeError(
+            "evaluation protocol approval is required before supplemental model training"
+        )
     return run_clv_candidate_item_screen(cfg)
 
 

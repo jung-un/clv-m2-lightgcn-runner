@@ -71,6 +71,50 @@ def test_common_support_config_rejects_seen_development_interval(tmp_path):
         )
 
 
+def test_supplemental_preflight_locks_graph_and_blocks_unapproved_evaluation(
+    tmp_path,
+):
+    cfg = runner.configure_clv_candidate_item_supplemental_run(
+        out_dir=str(tmp_path / "m3-supplemental"),
+        evaluation_authorized=False,
+    )
+    summary = runner.preflight_summary(cfg)
+
+    assert summary["code_version"] == runner.SUPPLEMENTAL_CODE_VERSION
+    assert summary["trained_models"] == [
+        runner.M1_ID,
+        runner.SUPPLEMENTAL_GENERAL_ID,
+        runner.SUPPLEMENTAL_ACTUAL_ID,
+        runner.SUPPLEMENTAL_SHUFFLE_ID,
+    ]
+    assert summary["m3"]["base_candidate_items"] == 100
+    assert summary["m3"]["supplemental_candidate_items"] == 20
+    assert summary["m3"]["base_mass"] == pytest.approx(5 / 6)
+    assert summary["m3"]["supplemental_mass"] == pytest.approx(1 / 6)
+    assert summary["performance_evaluation_authorized"] is False
+    with pytest.raises(RuntimeError, match="evaluation protocol approval"):
+        runner.run_clv_candidate_item_supplemental(cfg)
+
+
+def test_supplemental_config_rejects_seen_evaluation_boundary(tmp_path):
+    with pytest.raises(ValueError, match="already-seen DAY 684--704"):
+        runner.configure_clv_candidate_item_supplemental_run(
+            out_dir=str(tmp_path / "m3-supplemental"),
+            time_cutoff=697,
+            evaluation_authorized=True,
+            evaluation_protocol_label="approved-new-test",
+        )
+
+
+def test_supplemental_authorized_config_requires_protocol_label(tmp_path):
+    with pytest.raises(ValueError, match="evaluation_protocol_label"):
+        runner.configure_clv_candidate_item_supplemental_run(
+            out_dir=str(tmp_path / "m3-supplemental"),
+            time_cutoff=711,
+            evaluation_authorized=True,
+        )
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -143,3 +187,42 @@ def test_common_support_attribution_uses_common_support_model_ids():
     reading = runner.attribution_reading(pd.DataFrame(rows), model_ids)
 
     assert reading["clv_attribution_supported"] is True
+
+
+def test_supplemental_attribution_requires_candidate_truth_advantage():
+    model_ids = {
+        "m1": runner.M1_ID,
+        "general": runner.SUPPLEMENTAL_GENERAL_ID,
+        "actual": runner.SUPPLEMENTAL_ACTUAL_ID,
+        "shuffle": runner.SUPPLEMENTAL_SHUFFLE_ID,
+    }
+    rows = [
+        {"model_id": model_ids["m1"], **_metrics(1.00)},
+        {"model_id": model_ids["general"], **_metrics(1.01)},
+        {"model_id": model_ids["actual"], **_metrics(1.03)},
+        {"model_id": model_ids["shuffle"], **_metrics(1.02)},
+    ]
+
+    failed = runner.attribution_reading(
+        pd.DataFrame(rows),
+        model_ids,
+        candidate_truth_hits={
+            runner.ARM_ACTUAL: 10,
+            runner.ARM_SHUFFLE: 10,
+            runner.ARM_GENERAL: 9,
+        },
+    )
+    assert failed["performance_balance_passed"] is True
+    assert failed["candidate_truth_advantage_passed"] is False
+    assert failed["clv_attribution_supported"] is False
+
+    passed = runner.attribution_reading(
+        pd.DataFrame(rows),
+        model_ids,
+        candidate_truth_hits={
+            runner.ARM_ACTUAL: 11,
+            runner.ARM_SHUFFLE: 10,
+            runner.ARM_GENERAL: 9,
+        },
+    )
+    assert passed["clv_attribution_supported"] is True
