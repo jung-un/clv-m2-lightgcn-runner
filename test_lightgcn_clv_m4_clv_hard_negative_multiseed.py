@@ -136,5 +136,7 @@ def test_colab_runs_the_multiseed_runner_once_and_never_opens_test():
 
     assert source.count("result_df = run_multiseed(cfg)") == 1
     assert "configure_multiseed_run" in source
+    assert "PIN_AFTER_LOCAL_COMMIT" not in source
+    assert "75af025" in source
     assert "EVAL_TEST=True" not in source
     assert "holdout" not in source.lower()
