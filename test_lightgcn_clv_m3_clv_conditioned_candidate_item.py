@@ -25,6 +25,34 @@ def test_preflight_locks_direct_candidate_item_screen(tmp_path):
     assert summary["reading_rule"]["accuracy_guardrails"] is False
 
 
+def test_preflight_locks_common_support_weight_screen(tmp_path):
+    cfg = runner.configure_clv_candidate_item_common_support_run(
+        out_dir=str(tmp_path / "m3-v2"),
+        baseline_result_dir=str(tmp_path / "m1"),
+    )
+    summary = runner.preflight_summary(cfg)
+
+    assert summary["code_version"] == runner.COMMON_SUPPORT_CODE_VERSION
+    assert summary["trained_models"] == [
+        runner.COMMON_SUPPORT_GENERAL_ID,
+        runner.COMMON_SUPPORT_ACTUAL_ID,
+        runner.COMMON_SUPPORT_SHUFFLE_ID,
+    ]
+    assert summary["m3"]["candidate_support"] == (
+        "pooled top candidates fixed identically across all arms"
+    )
+    assert summary["m3"]["positive_excess_clipping"] is False
+
+
+def test_common_support_config_rejects_old_relation_mode(tmp_path):
+    with pytest.raises(ValueError, match="common-support"):
+        runner.configure_clv_candidate_item_common_support_run(
+            out_dir=str(tmp_path / "m3-v2"),
+            baseline_result_dir=str(tmp_path / "m1"),
+            relation_mode=runner.RELATION_MODE_POSITIVE_EXCESS,
+        )
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -78,3 +106,22 @@ def test_clv_attribution_requires_actual_to_beat_all_references():
     assert runner.attribution_reading(pd.DataFrame(rows))[
         "clv_attribution_supported"
     ] is False
+
+
+def test_common_support_attribution_uses_common_support_model_ids():
+    model_ids = {
+        "m1": runner.M1_ID,
+        "general": runner.COMMON_SUPPORT_GENERAL_ID,
+        "actual": runner.COMMON_SUPPORT_ACTUAL_ID,
+        "shuffle": runner.COMMON_SUPPORT_SHUFFLE_ID,
+    }
+    rows = [
+        {"model_id": model_ids["m1"], **_metrics(1.00)},
+        {"model_id": model_ids["general"], **_metrics(1.01)},
+        {"model_id": model_ids["actual"], **_metrics(1.02)},
+        {"model_id": model_ids["shuffle"], **_metrics(1.005)},
+    ]
+
+    reading = runner.attribution_reading(pd.DataFrame(rows), model_ids)
+
+    assert reading["clv_attribution_supported"] is True

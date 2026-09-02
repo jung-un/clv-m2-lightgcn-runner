@@ -40,6 +40,8 @@ DEFAULT_ITEM_KAPPA = 20.0
 DEFAULT_ITEM_MIN_SUPPORT_USERS = 5
 DEFAULT_MAX_TARGET_CATEGORIES = 20
 DEFAULT_MAX_CANDIDATE_ITEMS = 100
+RELATION_MODE_POSITIVE_EXCESS = "positive_excess_own_support"
+RELATION_MODE_COMMON_SUPPORT = "pooled_common_support_conditional_weights"
 
 
 @dataclass(frozen=True)
@@ -406,6 +408,319 @@ def _build_operator(
     }
 
 
+def _normalize_or_fallback(
+    values: np.ndarray,
+    fallback: np.ndarray,
+) -> tuple[np.ndarray, bool]:
+    total = float(values.sum())
+    if np.isfinite(total) and total > 0:
+        return values / total, False
+    fallback_total = float(fallback.sum())
+    if not np.isfinite(fallback_total) or fallback_total <= 0:
+        raise RuntimeError("common candidate support must have positive pooled mass")
+    return fallback / fallback_total, True
+
+
+def _common_support_rows(
+    users: np.ndarray,
+    train: pd.DataFrame,
+    recent: pd.DataFrame,
+    transition_reference: pd.DataFrame,
+    item_reference: pd.DataFrame,
+    q_actual: np.ndarray,
+    q_shuffle: np.ndarray,
+    item_category: np.ndarray,
+    n_items: int,
+    n_cat: int,
+    *,
+    category_min_support_users: int,
+    category_kappa: float,
+    item_min_support_users: int,
+    item_kappa: float,
+    max_target_categories: int,
+    max_candidate_items: int,
+) -> tuple[dict[str, tuple[list[int], list[int], list[float]]], dict]:
+    (
+        p0_category,
+        pl_category_actual,
+        ph_category_actual,
+        category_diagnostics_actual,
+    ) = _probabilities(
+        transition_reference,
+        q_actual,
+        n_cat,
+        min_support_users=category_min_support_users,
+        kappa=category_kappa,
+    )
+    (
+        p0_category_shuffle,
+        pl_category_shuffle,
+        ph_category_shuffle,
+        category_diagnostics_shuffle,
+    ) = _probabilities(
+        transition_reference,
+        q_shuffle,
+        n_cat,
+        min_support_users=category_min_support_users,
+        kappa=category_kappa,
+    )
+    (
+        p0_item,
+        pl_item_actual,
+        ph_item_actual,
+        item_diagnostics_actual,
+    ) = _item_probabilities(
+        item_reference,
+        q_actual,
+        item_category,
+        n_items,
+        n_cat,
+        min_support_users=item_min_support_users,
+        kappa=item_kappa,
+    )
+    (
+        p0_item_shuffle,
+        pl_item_shuffle,
+        ph_item_shuffle,
+        item_diagnostics_shuffle,
+    ) = _item_probabilities(
+        item_reference,
+        q_shuffle,
+        item_category,
+        n_items,
+        n_cat,
+        min_support_users=item_min_support_users,
+        kappa=item_kappa,
+    )
+    if not np.allclose(p0_category, p0_category_shuffle):
+        raise RuntimeError("pooled category probabilities must be arm invariant")
+    if not np.allclose(p0_item, p0_item_shuffle):
+        raise RuntimeError("pooled item probabilities must be arm invariant")
+
+    items_by_category = {
+        category: np.flatnonzero(
+            (item_category == category) & (p0_item > 0)
+        )
+        for category in range(n_cat)
+    }
+    recent_by_user = {
+        int(user): group[["c_idx", "recent_share"]].to_numpy(np.float64)
+        for user, group in recent.loc[recent["u_idx"].isin(users)].groupby(
+            "u_idx", sort=False
+        )
+    }
+    seen_by_user = {
+        int(user): set(group.to_numpy(np.int64).tolist())
+        for user, group in train.loc[train["u_idx"].isin(users)].groupby(
+            "u_idx", sort=False
+        )["i_idx"]
+    }
+    arm_rows = {
+        arm: ([], [], [])
+        for arm in (ARM_GENERAL, ARM_ACTUAL, ARM_SHUFFLE)
+    }
+    zero_rows = 0
+    fallback_counts = {ARM_ACTUAL: 0, ARM_SHUFFLE: 0}
+    for user in users:
+        profile = recent_by_user.get(int(user))
+        if profile is None:
+            zero_rows += 1
+            continue
+
+        pooled_category = np.zeros(n_cat, dtype=np.float64)
+        actual_category = np.zeros(n_cat, dtype=np.float64)
+        shuffle_category = np.zeros(n_cat, dtype=np.float64)
+        for category_value, share in profile:
+            category = int(category_value)
+            pooled_category += float(share) * p0_category[category]
+            actual_category += float(share) * (
+                (1.0 - q_actual[user]) * pl_category_actual[category]
+                + q_actual[user] * ph_category_actual[category]
+            )
+            shuffle_category += float(share) * (
+                (1.0 - q_shuffle[user]) * pl_category_shuffle[category]
+                + q_shuffle[user] * ph_category_shuffle[category]
+            )
+
+        target_categories = _top_indices(
+            pooled_category,
+            max_target_categories,
+        )
+        candidate_items: list[np.ndarray] = []
+        pooled_scores: list[np.ndarray] = []
+        for target in target_categories:
+            item_ids = items_by_category[int(target)]
+            if not len(item_ids):
+                continue
+            candidate_items.append(item_ids)
+            pooled_scores.append(
+                pooled_category[target] * p0_item[item_ids]
+            )
+        if not candidate_items:
+            zero_rows += 1
+            continue
+
+        item_ids = np.concatenate(candidate_items)
+        pooled = np.concatenate(pooled_scores)
+        seen = seen_by_user.get(int(user), set())
+        unseen = np.fromiter(
+            (int(item) not in seen for item in item_ids),
+            dtype=bool,
+            count=len(item_ids),
+        )
+        item_ids, pooled = item_ids[unseen], pooled[unseen]
+        selected_local = _top_indices(pooled, max_candidate_items)
+        if not len(selected_local):
+            zero_rows += 1
+            continue
+        selected_items = item_ids[selected_local]
+        pooled = pooled[selected_local]
+        selected_categories = item_category[selected_items]
+
+        actual_item = (
+            (1.0 - q_actual[user]) * pl_item_actual[selected_items]
+            + q_actual[user] * ph_item_actual[selected_items]
+        )
+        shuffle_item = (
+            (1.0 - q_shuffle[user]) * pl_item_shuffle[selected_items]
+            + q_shuffle[user] * ph_item_shuffle[selected_items]
+        )
+        raw_weights = {
+            ARM_GENERAL: pooled,
+            ARM_ACTUAL: actual_category[selected_categories] * actual_item,
+            ARM_SHUFFLE: (
+                shuffle_category[selected_categories] * shuffle_item
+            ),
+        }
+        normalized = {ARM_GENERAL: pooled / pooled.sum()}
+        for arm in (ARM_ACTUAL, ARM_SHUFFLE):
+            normalized[arm], used_fallback = _normalize_or_fallback(
+                raw_weights[arm], pooled
+            )
+            fallback_counts[arm] += int(used_fallback)
+
+        for arm, weights in normalized.items():
+            rows, cols, values = arm_rows[arm]
+            rows.extend([int(user)] * len(selected_items))
+            cols.extend(selected_items.tolist())
+            values.extend(weights.tolist())
+
+    return arm_rows, {
+        "users": int(len(users)),
+        "zero_relation_users": int(zero_rows),
+        "conditional_mass_fallback_users": fallback_counts,
+        "category_probability_actual": category_diagnostics_actual,
+        "category_probability_shuffle": category_diagnostics_shuffle,
+        "candidate_item_probability_actual": item_diagnostics_actual,
+        "candidate_item_probability_shuffle": item_diagnostics_shuffle,
+    }
+
+
+def _build_common_support_operators(
+    train: pd.DataFrame,
+    transition_evidence: pd.DataFrame,
+    item_evidence: pd.DataFrame,
+    recent: pd.DataFrame,
+    q_actual: np.ndarray,
+    q_shuffle: np.ndarray,
+    item_category: np.ndarray,
+    n_users: int,
+    n_items: int,
+    n_cat: int,
+    *,
+    category_min_support_users: int,
+    category_kappa: float,
+    item_min_support_users: int,
+    item_kappa: float,
+    cross_fit_folds: int,
+    max_target_categories: int,
+    max_candidate_items: int,
+) -> tuple[dict[str, torch.Tensor], dict[str, dict], dict]:
+    collected = {
+        arm: ([], [], [])
+        for arm in (ARM_GENERAL, ARM_ACTUAL, ARM_SHUFFLE)
+    }
+    folds = np.arange(n_users, dtype=np.int64) % cross_fit_folds
+    fold_diagnostics = []
+    for fold in range(cross_fit_folds):
+        consumers = np.flatnonzero(folds == fold)
+        transition_reference = transition_evidence.loc[
+            ~transition_evidence["u_idx"].isin(consumers)
+        ]
+        item_reference = item_evidence.loc[
+            ~item_evidence["u_idx"].isin(consumers)
+        ]
+        fold_rows, diagnostics = _common_support_rows(
+            consumers,
+            train,
+            recent,
+            transition_reference,
+            item_reference,
+            q_actual,
+            q_shuffle,
+            item_category,
+            n_items,
+            n_cat,
+            category_min_support_users=category_min_support_users,
+            category_kappa=category_kappa,
+            item_min_support_users=item_min_support_users,
+            item_kappa=item_kappa,
+            max_target_categories=max_target_categories,
+            max_candidate_items=max_candidate_items,
+        )
+        for arm in collected:
+            for target, values in zip(collected[arm], fold_rows[arm], strict=True):
+                target.extend(values)
+        fold_diagnostics.append({"fold": fold, **diagnostics})
+
+    operators = {}
+    arm_diagnostics = {}
+    reference_indices = None
+    for arm, (rows, cols, values) in collected.items():
+        row_array = np.asarray(rows, dtype=np.int64)
+        col_array = np.asarray(cols, dtype=np.int64)
+        value_array = np.asarray(values, dtype=np.float64)
+        with torch.sparse.check_sparse_tensor_invariants():
+            operator = torch.sparse_coo_tensor(
+                torch.from_numpy(np.stack([row_array, col_array])).long()
+                if len(row_array)
+                else torch.empty((2, 0), dtype=torch.long),
+                torch.from_numpy(value_array.astype(np.float32)),
+                size=(n_users, n_items),
+            ).coalesce()
+        if reference_indices is None:
+            reference_indices = operator.indices()
+        elif not torch.equal(reference_indices, operator.indices()):
+            raise RuntimeError("all common-support arms must share exact edges")
+        row_mass = np.bincount(
+            row_array, weights=value_array, minlength=n_users
+        )
+        active = row_mass > 0
+        operators[arm] = operator
+        arm_diagnostics[arm] = {
+            "n_edges": int(operator._nnz()),
+            "n_active_users": int(active.sum()),
+            "n_zero_relation_users": int((~active).sum()),
+            "active_user_share": float(active.mean()),
+            "mean_edges_per_active_user": float(
+                operator._nnz() / max(int(active.sum()), 1)
+            ),
+            "max_active_row_mass_error": float(
+                np.abs(row_mass[active] - 1.0).max(initial=0.0)
+            ),
+            "folds": fold_diagnostics,
+        }
+    return (
+        operators,
+        arm_diagnostics,
+        {
+            "exact_common_edge_support": True,
+            "common_edge_count": int(next(iter(operators.values()))._nnz()),
+            "folds": fold_diagnostics,
+        },
+    )
+
+
 def build_clv_conditioned_candidate_item_graph(
     train: pd.DataFrame,
     n_users: int,
@@ -547,11 +862,158 @@ def build_clv_conditioned_candidate_item_graph(
     )
 
 
+def build_clv_conditioned_common_support_candidate_item_graph(
+    train: pd.DataFrame,
+    n_users: int,
+    n_items: int,
+    n_cat: int,
+    *,
+    category_kappa: float = DEFAULT_KAPPA,
+    category_min_support_users: int = DEFAULT_MIN_SUPPORT_USERS,
+    item_kappa: float = DEFAULT_ITEM_KAPPA,
+    item_min_support_users: int = DEFAULT_ITEM_MIN_SUPPORT_USERS,
+    shuffle_seed: int = DEFAULT_SHUFFLE_SEED,
+    shuffle_degree_bins: int = DEFAULT_SHUFFLE_DEGREE_BINS,
+    cross_fit_folds: int = DEFAULT_CROSS_FIT_FOLDS,
+    max_target_categories: int = DEFAULT_MAX_TARGET_CATEGORIES,
+    max_candidate_items: int = DEFAULT_MAX_CANDIDATE_ITEMS,
+) -> CLVCandidateItemGraph:
+    """Build arm-invariant pooled candidates with arm-specific row weights."""
+    required = {"u_idx", "i_idx", "cat_idx", "b_raw", "t", "v"}
+    missing = required - set(train.columns)
+    if missing:
+        raise ValueError(f"candidate-item graph requires {sorted(missing)}")
+    if train.empty or min(n_users, n_items, n_cat) <= 0:
+        raise ValueError("non-empty train and positive graph sizes are required")
+    if category_kappa < 0 or item_kappa < 0:
+        raise ValueError("shrinkage constants must be non-negative")
+    if min(category_min_support_users, item_min_support_users) <= 0:
+        raise ValueError("minimum support must be positive")
+    if cross_fit_folds < 2 or cross_fit_folds > n_users:
+        raise ValueError("cross_fit_folds must be between 2 and n_users")
+    if min(max_target_categories, max_candidate_items) <= 0:
+        raise ValueError("candidate limits must be positive")
+
+    n_hat, v_hat, clv_proxy, valid = _historical_clv(train, n_users)
+    q_clv = _midrank_percentile(clv_proxy, valid)
+    unique_pairs = train[["u_idx", "i_idx"]].drop_duplicates()
+    user_degree = np.bincount(
+        unique_pairs["u_idx"].to_numpy(np.int64), minlength=n_users
+    ).astype(np.float64)
+    q_shuffle, shuffle_stratum = _degree_stratified_shuffle(
+        q_clv,
+        user_degree,
+        n_bins=shuffle_degree_bins,
+        seed=shuffle_seed,
+    )
+    transition, recent, transition_diagnostics = _transition_evidence(
+        train, n_users
+    )
+    item_evidence, item_evidence_diagnostics = _first_acquisition_item_evidence(
+        train, n_users
+    )
+    item_category = _item_category_mapping(train, n_items, n_cat)
+    (
+        operators,
+        arm_diagnostics,
+        common_support_diagnostics,
+    ) = _build_common_support_operators(
+        train,
+        transition,
+        item_evidence,
+        recent,
+        q_clv,
+        q_shuffle,
+        item_category,
+        n_users,
+        n_items,
+        n_cat,
+        category_min_support_users=category_min_support_users,
+        category_kappa=category_kappa,
+        item_min_support_users=item_min_support_users,
+        item_kappa=item_kappa,
+        cross_fit_folds=cross_fit_folds,
+        max_target_categories=max_target_categories,
+        max_candidate_items=max_candidate_items,
+    )
+    diagnostics = {
+        "definition": {
+            "historical_clv_proxy": "N_hat * V_hat",
+            "n_hat": "number of distinct train baskets",
+            "v_hat": "mean train basket value",
+            "category_direction": (
+                "CLV-conditioned next-category probability from the final train basket"
+            ),
+            "within_category_allocation": (
+                "CLV-conditioned first-acquisition item probability within target category"
+            ),
+            "common_candidate_support": (
+                "top pooled candidate-item probabilities, shared by every arm"
+            ),
+            "general_row_weight": "pooled probability normalized on common support",
+            "actual_row_weight": (
+                "actual-CLV conditional probability normalized on common support"
+            ),
+            "shuffle_row_weight": (
+                "degree-matched shuffled-CLV conditional probability normalized on common support"
+            ),
+            "positive_excess_clipping": False,
+            "candidate_items_exclude_user_train_pairs": True,
+            "self_history_exclusion": "five-fold user cross-fitting",
+            "item_price_used": False,
+        },
+        "settings": {
+            "relation_mode": RELATION_MODE_COMMON_SUPPORT,
+            "category_kappa": float(category_kappa),
+            "category_min_distinct_user_support": int(
+                category_min_support_users
+            ),
+            "item_kappa": float(item_kappa),
+            "item_min_distinct_user_support": int(item_min_support_users),
+            "shuffle_seed": int(shuffle_seed),
+            "shuffle_degree_bins": int(shuffle_degree_bins),
+            "cross_fit_folds": int(cross_fit_folds),
+            "max_target_categories_per_user": int(max_target_categories),
+            "max_candidate_items_per_user": int(max_candidate_items),
+        },
+        "transition_evidence": transition_diagnostics,
+        "item_evidence": item_evidence_diagnostics,
+        "common_support": common_support_diagnostics,
+        "arms": arm_diagnostics,
+        "historical_clv": {
+            "n_hat": _stats(n_hat[valid]),
+            "v_hat": _stats(v_hat[valid]),
+            "clv_proxy": _stats(clv_proxy[valid]),
+            "q_clv": _stats(q_clv[valid]),
+            "shuffle_preserves_values": bool(
+                np.allclose(np.sort(q_clv[valid]), np.sort(q_shuffle[valid]))
+            ),
+            "actual_shuffle_spearman": _safe_spearman(
+                q_clv[valid], q_shuffle[valid]
+            ),
+        },
+        "m1_catalog_items_preserved": int(n_items),
+    }
+    return CLVCandidateItemGraph(
+        n_hat=n_hat,
+        v_hat=v_hat,
+        clv_proxy=clv_proxy,
+        clv_percentile=q_clv,
+        clv_shuffle_percentile=q_shuffle,
+        clv_shuffle_stratum=shuffle_stratum,
+        user_item_operators=operators,
+        diagnostics=diagnostics,
+    )
+
+
 __all__ = [
     "ACTIVE_ARMS",
     "ARM_ACTUAL",
     "ARM_GENERAL",
     "ARM_SHUFFLE",
     "CLVCandidateItemGraph",
+    "RELATION_MODE_COMMON_SUPPORT",
+    "RELATION_MODE_POSITIVE_EXCESS",
     "build_clv_conditioned_candidate_item_graph",
+    "build_clv_conditioned_common_support_candidate_item_graph",
 ]

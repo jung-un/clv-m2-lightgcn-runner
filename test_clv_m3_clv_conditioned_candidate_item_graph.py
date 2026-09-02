@@ -1,10 +1,13 @@
 import numpy as np
 import pandas as pd
+import torch
 
 from clv_m3_clv_conditioned_candidate_item_graph import (
     ARM_ACTUAL,
     ARM_GENERAL,
     ARM_SHUFFLE,
+    RELATION_MODE_COMMON_SUPPORT,
+    build_clv_conditioned_common_support_candidate_item_graph,
     build_clv_conditioned_candidate_item_graph,
 )
 
@@ -38,6 +41,23 @@ def _train() -> pd.DataFrame:
 
 def _graph():
     return build_clv_conditioned_candidate_item_graph(
+        _train(),
+        n_users=8,
+        n_items=6,
+        n_cat=2,
+        category_kappa=0.0,
+        category_min_support_users=1,
+        item_kappa=0.0,
+        item_min_support_users=1,
+        shuffle_degree_bins=1,
+        cross_fit_folds=2,
+        max_target_categories=2,
+        max_candidate_items=3,
+    )
+
+
+def _common_support_graph():
+    return build_clv_conditioned_common_support_candidate_item_graph(
         _train(),
         n_users=8,
         n_items=6,
@@ -109,3 +129,36 @@ def test_minimum_item_support_removes_auxiliary_edges_not_catalog_items():
 
     assert graph.user_item_operators[ARM_ACTUAL]._nnz() == 0
     assert graph.diagnostics["m1_catalog_items_preserved"] == 6
+
+
+def test_common_support_is_exactly_shared_while_clv_changes_weights():
+    graph = _common_support_graph()
+    operators = graph.user_item_operators
+    general = operators[ARM_GENERAL]
+    actual = operators[ARM_ACTUAL]
+    shuffle = operators[ARM_SHUFFLE]
+
+    assert torch.equal(general.indices(), actual.indices())
+    assert torch.equal(general.indices(), shuffle.indices())
+    assert not torch.equal(general.values(), actual.values())
+    assert not torch.equal(actual.values(), shuffle.values())
+    for operator in operators.values():
+        np.testing.assert_allclose(
+            operator.to_dense().numpy().sum(axis=1),
+            1.0,
+        )
+    assert graph.diagnostics["settings"]["relation_mode"] == (
+        RELATION_MODE_COMMON_SUPPORT
+    )
+    assert graph.diagnostics["definition"]["positive_excess_clipping"] is False
+    assert graph.diagnostics["common_support"]["exact_common_edge_support"] is True
+
+
+def test_common_support_uses_clv_for_direction_not_candidate_availability():
+    graph = _common_support_graph()
+    general = graph.user_item_operators[ARM_GENERAL].to_dense().numpy()
+    actual = graph.user_item_operators[ARM_ACTUAL].to_dense().numpy()
+
+    np.testing.assert_array_equal(general > 0, actual > 0)
+    assert actual[0, 4] > actual[0, 5]
+    assert actual[4, 5] > actual[4, 4]

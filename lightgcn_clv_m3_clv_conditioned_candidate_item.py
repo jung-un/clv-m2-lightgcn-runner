@@ -22,6 +22,9 @@ from clv_m3_clv_conditioned_candidate_item_graph import (
     DEFAULT_ITEM_MIN_SUPPORT_USERS,
     DEFAULT_MAX_CANDIDATE_ITEMS,
     DEFAULT_MAX_TARGET_CATEGORIES,
+    RELATION_MODE_COMMON_SUPPORT,
+    RELATION_MODE_POSITIVE_EXCESS,
+    build_clv_conditioned_common_support_candidate_item_graph,
     build_clv_conditioned_candidate_item_graph,
 )
 from clv_m3_clv_conditioned_category_transition_graph import (
@@ -43,6 +46,9 @@ import lightgcn_clv_v3 as v3
 
 
 CODE_VERSION = "m3-clv-conditioned-candidate-item-historical-screen-v1"
+COMMON_SUPPORT_CODE_VERSION = (
+    "m3-clv-conditioned-candidate-item-common-support-historical-screen-v2"
+)
 M1_ID = "m1_baseline"
 GENERAL_ID = "m3_general_candidate_item_relation_control"
 ACTUAL_ID = "m3_clv_conditioned_candidate_item_relation"
@@ -51,6 +57,16 @@ ARM_MODEL_IDS = {
     ARM_GENERAL: GENERAL_ID,
     ARM_ACTUAL: ACTUAL_ID,
     ARM_SHUFFLE: SHUFFLE_ID,
+}
+COMMON_SUPPORT_GENERAL_ID = "m3_general_candidate_item_common_support_control"
+COMMON_SUPPORT_ACTUAL_ID = "m3_clv_conditioned_candidate_item_common_support"
+COMMON_SUPPORT_SHUFFLE_ID = (
+    "m3_clv_conditioned_candidate_item_common_support_shuffle"
+)
+COMMON_SUPPORT_ARM_MODEL_IDS = {
+    ARM_GENERAL: COMMON_SUPPORT_GENERAL_ID,
+    ARM_ACTUAL: COMMON_SUPPORT_ACTUAL_ID,
+    ARM_SHUFFLE: COMMON_SUPPORT_SHUFFLE_ID,
 }
 ACCURACY_METRICS = (
     "recall@10",
@@ -84,11 +100,16 @@ class CLVCandidateItemConfig:
     cross_fit_folds: int = DEFAULT_CROSS_FIT_FOLDS
     max_target_categories: int = DEFAULT_MAX_TARGET_CATEGORIES
     max_candidate_items: int = DEFAULT_MAX_CANDIDATE_ITEMS
+    relation_mode: str = RELATION_MODE_POSITIVE_EXCESS
     out_dir: str = ""
     baseline_result_dir: str = ""
 
 
 def configure_clv_candidate_item_run(**overrides) -> CLVCandidateItemConfig:
+    if overrides.get(
+        "relation_mode", RELATION_MODE_POSITIVE_EXCESS
+    ) != RELATION_MODE_POSITIVE_EXCESS:
+        raise ValueError("v1 candidate-item screen relation mode is fixed")
     defaults = {
         "out_dir": (
             f"{v3.default_out_dir('dunnhumby')}"
@@ -100,13 +121,59 @@ def configure_clv_candidate_item_run(**overrides) -> CLVCandidateItemConfig:
         ),
     }
     return validate_clv_candidate_item_config(
+        CLVCandidateItemConfig(
+            **(
+                defaults
+                | {"relation_mode": RELATION_MODE_POSITIVE_EXCESS}
+                | overrides
+            )
+        )
+    )
+
+
+def configure_clv_candidate_item_common_support_run(
+    **overrides,
+) -> CLVCandidateItemConfig:
+    if overrides.get(
+        "relation_mode", RELATION_MODE_COMMON_SUPPORT
+    ) != RELATION_MODE_COMMON_SUPPORT:
+        raise ValueError("v2 common-support screen relation mode is fixed")
+    defaults = {
+        "out_dir": (
+            f"{v3.default_out_dir('dunnhumby')}"
+            "_m3_clv_candidate_item_common_support_historical_screen_v2"
+        ),
+        "baseline_result_dir": (
+            f"{v3.default_out_dir('dunnhumby')}"
+            "_m2_repeatshare_historical_backtest_v1"
+        ),
+        "relation_mode": RELATION_MODE_COMMON_SUPPORT,
+    }
+    return validate_clv_candidate_item_config(
         CLVCandidateItemConfig(**(defaults | overrides))
     )
+
+
+def _code_version(cfg: CLVCandidateItemConfig) -> str:
+    if cfg.relation_mode == RELATION_MODE_POSITIVE_EXCESS:
+        return CODE_VERSION
+    if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT:
+        return COMMON_SUPPORT_CODE_VERSION
+    raise ValueError(f"unknown candidate relation mode: {cfg.relation_mode}")
+
+
+def _arm_model_ids(cfg: CLVCandidateItemConfig) -> dict[str, str]:
+    if cfg.relation_mode == RELATION_MODE_POSITIVE_EXCESS:
+        return ARM_MODEL_IDS
+    if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT:
+        return COMMON_SUPPORT_ARM_MODEL_IDS
+    raise ValueError(f"unknown candidate relation mode: {cfg.relation_mode}")
 
 
 def validate_clv_candidate_item_config(
     cfg: CLVCandidateItemConfig,
 ) -> CLVCandidateItemConfig:
+    _code_version(cfg)
     required = {
         "dataset": "dunnhumby",
         "seed": 42,
@@ -146,11 +213,13 @@ def validate_clv_candidate_item_config(
 
 def preflight_summary(cfg: CLVCandidateItemConfig) -> dict:
     cfg = validate_clv_candidate_item_config(cfg)
+    model_ids = _arm_model_ids(cfg)
+    common_support = cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT
     return {
-        "code_version": CODE_VERSION,
+        "code_version": _code_version(cfg),
         "dataset": cfg.dataset,
         "seed": cfg.seed,
-        "trained_models": [GENERAL_ID, ACTUAL_ID, SHUFFLE_ID],
+        "trained_models": [model_ids[arm] for arm in ACTIVE_ARMS],
         "reused_comparator": M1_ID,
         "historical_development_split": {
             "train_end_inclusive": 683,
@@ -179,10 +248,17 @@ def preflight_summary(cfg: CLVCandidateItemConfig) -> dict:
                 "CLV-conditioned first-acquisition item probability"
             ),
             "actual_candidate_edge": (
-                "positive absolute probability excess over the pooled "
+                "actual-CLV conditional probability normalized on the "
+                "shared pooled candidate support"
+                if common_support
+                else "positive absolute probability excess over the pooled "
                 "candidate-item distribution"
             ),
-            "general_relation_control": "pooled candidate-item probability",
+            "general_relation_control": (
+                "pooled probability normalized on the same candidate support"
+                if common_support
+                else "pooled candidate-item probability"
+            ),
             "shuffle_control": (
                 "CLV values permuted within binary user-degree deciles in both "
                 "relation estimation and user conditioning"
@@ -197,6 +273,12 @@ def preflight_summary(cfg: CLVCandidateItemConfig) -> dict:
             "item_minimum_distinct_user_support": cfg.item_min_support_users,
             "max_target_categories_per_user": cfg.max_target_categories,
             "max_candidate_items_per_user": cfg.max_candidate_items,
+            "candidate_support": (
+                "pooled top candidates fixed identically across all arms"
+                if common_support
+                else "selected separately inside each arm"
+            ),
+            "positive_excess_clipping": not common_support,
             "row_mass_normalized": True,
             "gamma": cfg.gamma,
             "item_price_input": False,
@@ -288,7 +370,7 @@ def _canonical(value) -> str:
 
 def _config_hash(cfg, input_hash: str, revision: str) -> str:
     payload = {
-        "code_version": CODE_VERSION,
+        "code_version": _code_version(cfg),
         "config": asdict(cfg),
         "input_hash": input_hash,
         "source_revision": revision,
@@ -312,7 +394,12 @@ def _prepare(cfg: CLVCandidateItemConfig) -> dict:
         raise RuntimeError("M3 candidate-item screen에 M4 표본 가중치가 섞였습니다")
     data["loss_w"] = None
 
-    graph = build_clv_conditioned_candidate_item_graph(
+    graph_builder = (
+        build_clv_conditioned_common_support_candidate_item_graph
+        if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT
+        else build_clv_conditioned_candidate_item_graph
+    )
+    graph = graph_builder(
         data["train"],
         data["n_users"],
         data["n_items"],
@@ -519,12 +606,21 @@ def _six_metric_balance(actual: pd.Series, reference: pd.Series) -> float:
     return float(np.exp(np.log(ratios).mean()))
 
 
-def attribution_reading(frame: pd.DataFrame) -> dict:
-    actual = _row(frame, ACTUAL_ID)
+def attribution_reading(
+    frame: pd.DataFrame,
+    model_ids: dict[str, str] | None = None,
+) -> dict:
+    model_ids = model_ids or {
+        "m1": M1_ID,
+        "general": GENERAL_ID,
+        "actual": ACTUAL_ID,
+        "shuffle": SHUFFLE_ID,
+    }
+    actual = _row(frame, model_ids["actual"])
     references = {
-        "m1": _row(frame, M1_ID),
-        "general_candidate_relation": _row(frame, GENERAL_ID),
-        "shuffle": _row(frame, SHUFFLE_ID),
+        "m1": _row(frame, model_ids["m1"]),
+        "general_candidate_relation": _row(frame, model_ids["general"]),
+        "shuffle": _row(frame, model_ids["shuffle"]),
     }
     balances = {
         name: _six_metric_balance(actual, reference)
@@ -569,10 +665,23 @@ def attribution_reading(frame: pd.DataFrame) -> dict:
     }
 
 
-def _comparison(frame: pd.DataFrame) -> pd.DataFrame:
-    actual = _row(frame, ACTUAL_ID)
+def _comparison(
+    frame: pd.DataFrame,
+    model_ids: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    model_ids = model_ids or {
+        "m1": M1_ID,
+        "general": GENERAL_ID,
+        "actual": ACTUAL_ID,
+        "shuffle": SHUFFLE_ID,
+    }
+    actual = _row(frame, model_ids["actual"])
     rows = []
-    for reference_id in (M1_ID, GENERAL_ID, SHUFFLE_ID):
+    for reference_id in (
+        model_ids["m1"],
+        model_ids["general"],
+        model_ids["shuffle"],
+    ):
         reference = _row(frame, reference_id)
         for metric in frame.columns:
             if "@" not in metric:
@@ -584,7 +693,7 @@ def _comparison(frame: pd.DataFrame) -> pd.DataFrame:
                 continue
             rows.append(
                 {
-                    "model_id": ACTUAL_ID,
+                    "model_id": model_ids["actual"],
                     "reference": reference_id,
                     "metric": metric,
                     "reference_value": float(right),
@@ -609,10 +718,17 @@ def run_clv_candidate_item_screen(
     preflight = preflight_summary(cfg)
     print(json.dumps(preflight, ensure_ascii=False, indent=2))
     prepared = _prepare(cfg)
+    arm_model_ids = _arm_model_ids(cfg)
+    model_ids = {
+        "m1": M1_ID,
+        "general": arm_model_ids[ARM_GENERAL],
+        "actual": arm_model_ids[ARM_ACTUAL],
+        "shuffle": arm_model_ids[ARM_SHUFFLE],
+    }
 
     arms = []
     for graph_arm in ACTIVE_ARMS:
-        model_id = ARM_MODEL_IDS[graph_arm]
+        model_id = arm_model_ids[graph_arm]
         print(
             f"\n===== {model_id} | seed {cfg.seed} | "
             f"fixed {cfg.epochs} epochs ====="
@@ -644,10 +760,15 @@ def run_clv_candidate_item_screen(
             }
         )
     frame = pd.DataFrame(rows)
-    comparison = _comparison(frame)
-    reading = attribution_reading(frame)
+    comparison = _comparison(frame, model_ids)
+    reading = attribution_reading(frame, model_ids)
 
-    stem = f"m3_clv_candidate_item_{prepared['config_hash']}"
+    stem_prefix = (
+        "m3_clv_candidate_item_common_support"
+        if cfg.relation_mode == RELATION_MODE_COMMON_SUPPORT
+        else "m3_clv_candidate_item"
+    )
+    stem = f"{stem_prefix}_{prepared['config_hash']}"
     paths = {
         "absolute_csv": prepared["out_dir"] / f"{stem}.csv",
         "comparison_csv": prepared["out_dir"] / f"{stem}_comparison.csv",
@@ -656,7 +777,7 @@ def run_clv_candidate_item_screen(
     fixed_train._atomic_csv(paths["absolute_csv"], frame)
     fixed_train._atomic_csv(paths["comparison_csv"], comparison)
     payload = {
-        "code_version": CODE_VERSION,
+        "code_version": _code_version(cfg),
         "source_revision": prepared["revision"],
         "config": asdict(cfg),
         "preflight": preflight,
@@ -680,6 +801,15 @@ def run_clv_candidate_item_screen(
     print(json.dumps(reading, ensure_ascii=False, indent=2))
     print("결과 파일:", frame.attrs["result_paths"])
     return frame
+
+
+def run_clv_candidate_item_common_support_screen(
+    cfg: CLVCandidateItemConfig | None = None,
+) -> pd.DataFrame:
+    cfg = cfg or configure_clv_candidate_item_common_support_run()
+    if cfg.relation_mode != RELATION_MODE_COMMON_SUPPORT:
+        raise ValueError("common-support screen requires its fixed relation mode")
+    return run_clv_candidate_item_screen(cfg)
 
 
 if __name__ == "__main__":
