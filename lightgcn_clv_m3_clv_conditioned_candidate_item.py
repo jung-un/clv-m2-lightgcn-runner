@@ -782,17 +782,25 @@ def _candidate_truth_hit_counts(
 ) -> dict[str, int]:
     if not ground_truth:
         return {arm: 0 for arm in ACTIVE_ARMS}
+    operators = (
+        {
+            arm: graph.candidate_blocks[arm]
+            for arm in ACTIVE_ARMS
+        }
+        if graph.candidate_blocks
+        else graph.user_item_operators
+    )
     truth_keys = np.concatenate(
         [
             np.asarray(items, dtype=np.int64)
-            + int(user) * graph.user_item_operators[ARM_GENERAL].shape[1]
+            + int(user) * operators[ARM_GENERAL].shape[1]
             for user, items in ground_truth.items()
         ]
     )
     truth_keys = np.unique(truth_keys)
     counts = {}
-    n_items = int(graph.user_item_operators[ARM_GENERAL].shape[1])
-    for arm, operator in graph.user_item_operators.items():
+    n_items = int(operators[ARM_GENERAL].shape[1])
+    for arm, operator in operators.items():
         users, items = operator.coalesce().indices().cpu().numpy()
         candidate_keys = users.astype(np.int64) * n_items + items.astype(
             np.int64

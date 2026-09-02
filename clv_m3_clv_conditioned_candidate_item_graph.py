@@ -57,6 +57,7 @@ class CLVCandidateItemGraph:
     clv_shuffle_stratum: np.ndarray
     user_item_operators: dict[str, torch.Tensor]
     diagnostics: dict
+    candidate_blocks: dict[str, torch.Tensor] | None = None
 
 
 def _item_category_mapping(
@@ -767,7 +768,11 @@ def _supplemental_rows(
     max_target_categories: int,
     base_candidate_items: int,
     supplemental_candidate_items: int,
-) -> tuple[dict[str, tuple[list[int], list[int], list[float]]], dict]:
+) -> tuple[
+    dict[str, tuple[list[int], list[int], list[float]]],
+    dict[str, tuple[list[int], list[int], list[float]]],
+    dict,
+]:
     (
         p0_category,
         pl_category_actual,
@@ -847,6 +852,13 @@ def _supplemental_rows(
     arm_rows = {
         arm: ([], [], [])
         for arm in (ARM_GENERAL, ARM_ACTUAL, ARM_SHUFFLE)
+    }
+    block_rows = {
+        "base": ([], [], []),
+        **{
+            arm: ([], [], [])
+            for arm in (ARM_GENERAL, ARM_ACTUAL, ARM_SHUFFLE)
+        },
     }
     base_mass = base_candidate_items / (
         base_candidate_items + supplemental_candidate_items
@@ -1023,6 +1035,11 @@ def _supplemental_rows(
         )
         identical_extra_rows += int(actual_set == shuffle_set)
 
+        base_rows, base_cols, base_values = block_rows["base"]
+        base_rows.extend([int(user)] * base_candidate_items)
+        base_cols.extend(base_items.tolist())
+        base_values.extend(base_weights.tolist())
+
         for arm, extra_items in extras.items():
             overlap = base_set & set(extra_items.tolist())
             base_extra_overlap += len(overlap)
@@ -1039,6 +1056,12 @@ def _supplemental_rows(
             values.extend(
                 [float(extra_weight)] * supplemental_candidate_items
             )
+            extra_rows, extra_cols, extra_values = block_rows[arm]
+            extra_rows.extend([int(user)] * supplemental_candidate_items)
+            extra_cols.extend(extra_items.tolist())
+            extra_values.extend(
+                [float(extra_weight)] * supplemental_candidate_items
+            )
             base_mass_errors.append(
                 abs(float(base_weights.sum()) - base_mass)
             )
@@ -1053,7 +1076,7 @@ def _supplemental_rows(
             f"affected_users={len(insufficient)}, sample={sample}"
         )
 
-    return arm_rows, {
+    return arm_rows, block_rows, {
         "users": int(len(users)),
         "base_candidate_items": int(base_candidate_items),
         "supplemental_candidate_items": int(supplemental_candidate_items),
@@ -1097,10 +1120,22 @@ def _build_supplemental_operators(
     max_target_categories: int,
     base_candidate_items: int,
     supplemental_candidate_items: int,
-) -> tuple[dict[str, torch.Tensor], dict[str, dict], dict]:
+) -> tuple[
+    dict[str, torch.Tensor],
+    dict[str, dict],
+    dict,
+    dict[str, torch.Tensor],
+]:
     collected = {
         arm: ([], [], [])
         for arm in (ARM_GENERAL, ARM_ACTUAL, ARM_SHUFFLE)
+    }
+    collected_blocks = {
+        "base": ([], [], []),
+        **{
+            arm: ([], [], [])
+            for arm in (ARM_GENERAL, ARM_ACTUAL, ARM_SHUFFLE)
+        },
     }
     folds = np.arange(n_users, dtype=np.int64) % cross_fit_folds
     fold_diagnostics = []
@@ -1112,7 +1147,7 @@ def _build_supplemental_operators(
         item_reference = item_evidence.loc[
             ~item_evidence["u_idx"].isin(consumers)
         ]
-        fold_rows, diagnostics = _supplemental_rows(
+        fold_rows, fold_blocks, diagnostics = _supplemental_rows(
             consumers,
             train,
             recent,
@@ -1134,6 +1169,11 @@ def _build_supplemental_operators(
         for arm in collected:
             for target, values in zip(
                 collected[arm], fold_rows[arm], strict=True
+            ):
+                target.extend(values)
+        for block in collected_blocks:
+            for target, values in zip(
+                collected_blocks[block], fold_blocks[block], strict=True
             ):
                 target.extend(values)
         fold_diagnostics.append({"fold": fold, **diagnostics})
@@ -1170,6 +1210,18 @@ def _build_supplemental_operators(
                 np.abs(row_mass - 1.0).max(initial=0.0)
             ),
         }
+
+    block_operators = {}
+    for block, (rows, cols, values) in collected_blocks.items():
+        indices = np.stack(
+            [np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64)]
+        )
+        with torch.sparse.check_sparse_tensor_invariants():
+            block_operators[block] = torch.sparse_coo_tensor(
+                torch.from_numpy(indices).long(),
+                torch.from_numpy(np.asarray(values, dtype=np.float32)),
+                size=(n_users, n_items),
+            ).coalesce()
 
     return operators, arm_diagnostics, {
         "base_candidate_items": int(base_candidate_items),
@@ -1209,7 +1261,7 @@ def _build_supplemental_operators(
             max(fold["max_extra_mass_error"] for fold in fold_diagnostics)
         ),
         "folds": fold_diagnostics,
-    }
+    }, block_operators
 
 
 def build_clv_conditioned_candidate_item_graph(
@@ -1553,7 +1605,7 @@ def build_clv_conditioned_supplemental_candidate_item_graph(
         _first_acquisition_item_evidence(train, n_users)
     )
     item_category = _item_category_mapping(train, n_items, n_cat)
-    operators, arm_diagnostics, support_diagnostics = (
+    operators, arm_diagnostics, support_diagnostics, candidate_blocks = (
         _build_supplemental_operators(
             train,
             transition,
@@ -1654,6 +1706,7 @@ def build_clv_conditioned_supplemental_candidate_item_graph(
         clv_shuffle_stratum=shuffle_stratum,
         user_item_operators=operators,
         diagnostics=diagnostics,
+        candidate_blocks=candidate_blocks,
     )
 
 
