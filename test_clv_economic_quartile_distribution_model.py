@@ -121,4 +121,3 @@ def test_invalid_clv_and_m3_m4_paths_are_rejected():
         )
     with pytest.raises(ValueError, match="외부"):
         model.bpr_loss(users, positives, negatives, None, 0.1, None)
-
