@@ -32,6 +32,23 @@ def test_intermediate_clv_is_exact_convex_mix_with_unit_row_mass():
     torch.testing.assert_close(weights.sum(1), torch.ones(1))
 
 
+def test_diagnostics_report_effective_gradient_mass_not_only_nominal_weight_mass():
+    positive = torch.tensor([1.0, 1.0])
+    negatives = torch.tensor([[0.0, 0.9], [0.0, 0.9]])
+
+    _, mean_diagnostics = multi_negative_bpr(
+        positive, negatives, torch.tensor([0.0, 0.0])
+    )
+    _, hard_diagnostics = multi_negative_bpr(
+        positive, negatives, torch.tensor([1.0, 1.0])
+    )
+
+    assert "effective_gradient_mass" in mean_diagnostics
+    assert float(hard_diagnostics["effective_gradient_mass"]) > float(
+        mean_diagnostics["effective_gradient_mass"]
+    )
+
+
 def test_k1_is_plain_bpr_for_every_clv_value():
     positive = torch.tensor([1.0, -0.5])
     negative = torch.tensor([[0.25], [0.5]])

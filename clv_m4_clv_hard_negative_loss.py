@@ -51,6 +51,9 @@ def multi_negative_bpr(
     diagnostics = {
         "row_weight_sum_error": (weights.sum(1) - 1.0).abs().max(),
         "hardest_weight_mean": hardest_weight.mean(),
+        "effective_gradient_mass": (
+            weights * torch.sigmoid(negative_scores - positive_scores[:, None])
+        ).sum(dim=1).mean(),
         "p_correct": (positive_scores[:, None] > negative_scores).float().mean(),
         "positive_hardest_gap": (
             positive_scores - negative_scores.gather(1, hardest[:, None]).squeeze(1)

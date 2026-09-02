@@ -360,7 +360,7 @@ def _train_arm(
         epoch_started = time.time()
         permutation = rng.permutation(n_train)
         loss_sum = bpr_sum = correct_sum = 0.0
-        hardest_weight_sum = gap_sum = weight_error = 0.0
+        hardest_weight_sum = gap_sum = gradient_mass_sum = weight_error = 0.0
         for batch in range(n_batches):
             index = permutation[
                 batch * cfg.batch_size : (batch + 1) * cfg.batch_size
@@ -409,6 +409,7 @@ def _train_arm(
             correct_sum += float(diagnostics["p_correct"])
             hardest_weight_sum += float(diagnostics["hardest_weight_mean"])
             gap_sum += float(diagnostics["positive_hardest_gap"])
+            gradient_mass_sum += float(diagnostics["effective_gradient_mass"])
             weight_error = max(
                 weight_error, float(diagnostics["row_weight_sum_error"])
             )
@@ -431,6 +432,7 @@ def _train_arm(
                 hardest_weight_sum / n_batches
             ),
             "positive_hardest_gap": float(gap_sum / n_batches),
+            "effective_gradient_mass": float(gradient_mass_sum / n_batches),
             "row_weight_sum_max_error": float(weight_error),
             "epoch_sec": float(epoch_sec),
         }
