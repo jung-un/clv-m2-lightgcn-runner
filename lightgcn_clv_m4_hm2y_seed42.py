@@ -21,7 +21,7 @@ import lightgcn_clv_m4_clv_hard_negative_multiseed as attribution
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m4-clv-conditioned-hard-negative-hm2y-seed42-v1"
+CODE_VERSION = "m4-clv-conditioned-hard-negative-hm2y-seed42-v1.1"
 K1_MODEL_ID = selected.K1_MODEL_ID
 MEAN_K5_MODEL_ID = selected.MEAN_K5_MODEL_ID
 M4_MODEL_ID = selected.M4_MODEL_ID
@@ -104,9 +104,11 @@ def preflight_summary(cfg: HMM4Seed42Config) -> dict:
         "period": "full_history_about_2_years",
         "seed": 42,
         "split": "hm2y_validation",
-        "trained_models": [MEAN_K5_MODEL_ID, M4_MODEL_ID, SHUFFLED_M4_MODEL_ID],
+        "trained_models": list(MODELS),
         "reported_models": list(MODELS),
-        "baseline_source": "matching M2 rho=0 H&M seed-42 arm",
+        "baseline_source": (
+            "reuse matching M2 rho=0 arm when available; otherwise train K=1 M1"
+        ),
         "m4": {
             "uniform_negative_count": 5,
             "control": "mean BPR over the same five uniform negatives",
@@ -142,13 +144,14 @@ def preflight_summary(cfg: HMM4Seed42Config) -> dict:
 
 
 def _arm_hash(prepared: dict, model_id: str, assignment: str) -> str:
+    negative_count = 1 if model_id == K1_MODEL_ID else 5
     return hashlib.sha256(
         common.canonical(
             {
                 "run": prepared["config_hash"],
                 "model_id": model_id,
                 "seed": 42,
-                "negative_count": 5,
+                "negative_count": negative_count,
                 "assignment": assignment,
             }
         ).encode()
@@ -186,6 +189,7 @@ def _train_arm(model, prepared, cfg, model_id, q_clv, store) -> dict:
     if restored is not None:
         print(f"  [{model_id}] epoch {start_epoch - 1}에서 자동 재개")
     data = prepared["data"]
+    negative_count = 1 if model_id == K1_MODEL_ID else cfg.negative_count
     tr_u, tr_i, pos_key = data["tr_u"], data["tr_i"], data["pos_key"]
     n_batches = math.ceil(len(tr_u) / cfg.batch_size)
     q_all = torch.as_tensor(q_clv, dtype=torch.float32, device=v3.DEVICE)
@@ -206,7 +210,7 @@ def _train_arm(model, prepared, cfg, model_id, q_clv, store) -> dict:
                 data["n_items"],
                 pos_key,
                 rng,
-                k=cfg.negative_count,
+                k=negative_count,
             )
             users = torch.as_tensor(users_np, dtype=torch.long, device=v3.DEVICE)
             positives = torch.as_tensor(
@@ -317,6 +321,7 @@ def _run_arm(prepared, cfg, *, model_id, q_clv, assignment_name):
     payload = {
         "model_id": model_id,
         "role": {
+            K1_MODEL_ID: "baseline",
             MEAN_K5_MODEL_ID: "multineg_control",
             M4_MODEL_ID: "model",
             SHUFFLED_M4_MODEL_ID: "assignment_control",
@@ -324,7 +329,7 @@ def _run_arm(prepared, cfg, *, model_id, q_clv, assignment_name):
         "seed": 42,
         "split": "hm2y_validation",
         "final_epoch": 100,
-        "negative_count": 5,
+        "negative_count": 1 if model_id == K1_MODEL_ID else 5,
         "clv_assignment": assignment_name,
         "metrics": common.evaluate(model, prepared),
         "training": training,
@@ -344,7 +349,7 @@ def _run_arm(prepared, cfg, *, model_id, q_clv, assignment_name):
     return payload
 
 
-def _load_m1_baseline(cfg: HMM4Seed42Config, prepared: dict) -> dict:
+def _load_m1_baseline(cfg: HMM4Seed42Config, prepared: dict) -> dict | None:
     candidates = sorted(
         Path(cfg.m2_result_dir).glob("m2_level_composition_price_hm2y_seed42_*.json"),
         key=lambda path: path.stat().st_mtime,
@@ -372,10 +377,7 @@ def _load_m1_baseline(cfg: HMM4Seed42Config, prepared: dict) -> dict:
                 "source_result": str(path),
             },
         }
-    raise FileNotFoundError(
-        "같은 H&M 입력의 M2 rho=0 결과가 없습니다. "
-        "M2 H&M seed-42 노트북을 먼저 완료한 뒤 M4를 실행하세요."
-    )
+    return None
 
 
 def _absolute_rows(arms: list[dict]) -> pd.DataFrame:
@@ -447,6 +449,18 @@ def run_hm2y_seed42(cfg: HMM4Seed42Config | None = None) -> pd.DataFrame:
     print(json.dumps(preflight, ensure_ascii=False, indent=2))
     prepared = common.prepare_hm2y(cfg, code_version=CODE_VERSION)
     baseline = _load_m1_baseline(cfg, prepared)
+    zeros = np.zeros_like(prepared["q_c"], dtype=np.float32)
+    if baseline is None:
+        print("M2 rho=0 결과가 없어 동일한 K=1 M1을 이 실행에서 학습합니다.")
+        baseline = _run_arm(
+            prepared,
+            cfg,
+            model_id=K1_MODEL_ID,
+            q_clv=zeros,
+            assignment_name="nonconditioned_k1",
+        )
+    else:
+        print("동일 H&M 입력의 M2 rho=0 결과를 K=1 M1 기준으로 재사용합니다.")
     shuffle_meta = common.degree_matched_sources(
         prepared["clv_valid"],
         prepared["binary_user_degree"],
@@ -454,7 +468,6 @@ def run_hm2y_seed42(cfg: HMM4Seed42Config | None = None) -> pd.DataFrame:
         seed=cfg.shuffle_seed,
     )
     shuffled_q = prepared["q_c"][shuffle_meta["source_user"]]
-    zeros = np.zeros_like(prepared["q_c"], dtype=np.float32)
     arms = [
         baseline,
         _run_arm(
@@ -482,6 +495,7 @@ def run_hm2y_seed42(cfg: HMM4Seed42Config | None = None) -> pd.DataFrame:
     absolute = _absolute_rows(arms)
     decision, paired = seed42_decision(absolute)
     out = prepared["out_dir"]
+    out.mkdir(parents=True, exist_ok=True)
     stem = f"m4_clv_hard_negative_hm2y_seed42_{prepared['config_hash']}"
     paths = {
         "absolute_csv": out / f"{stem}.csv",

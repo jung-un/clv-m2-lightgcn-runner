@@ -8,7 +8,7 @@ import pytest
 import lightgcn_clv_m4_hm2y_seed42 as hm4
 
 
-def test_hm4_seed42_protocol_uses_one_seed_and_three_trained_arms():
+def test_hm4_seed42_protocol_can_train_its_own_m1_baseline():
     cfg = hm4.configure_hm2y_seed42_run()
     summary = hm4.preflight_summary(cfg)
 
@@ -20,11 +20,14 @@ def test_hm4_seed42_protocol_uses_one_seed_and_three_trained_arms():
     assert cfg.eval_test is False
     assert cfg.eval_holdout is False
     assert summary["trained_models"] == [
+        "m1_64",
         "m1_multineg_mean_k5",
         "m4_clv_hard_k5",
         "m4_clv_hard_k5_degree_shuffled",
     ]
-    assert summary["baseline_source"] == "matching M2 rho=0 H&M seed-42 arm"
+    assert summary["baseline_source"] == (
+        "reuse matching M2 rho=0 arm when available; otherwise train K=1 M1"
+    )
     assert summary["split"] == "hm2y_validation"
 
 
@@ -61,6 +64,55 @@ def test_hm4_seed42_decision_requires_clv_assignment_and_m4_effect():
     failing.loc[failing.model_id == hm4.M4_MODEL_ID, "고CLV_recall@10"] = 0.01
     failed, _ = hm4.seed42_decision(failing)
     assert failed["positive_screen"] is False
+
+
+def test_missing_m2_baseline_trains_k1_instead_of_stopping(monkeypatch, tmp_path):
+    cfg = hm4.configure_hm2y_seed42_run(
+        out_dir=str(tmp_path / "m4"),
+        m2_result_dir=str(tmp_path / "missing_m2"),
+    )
+    metrics = {metric: 0.05 for metric in hm4.ACCURACY_METRICS}
+    metrics.update({metric: 0.05 for metric in hm4.PRIMARY_METRICS})
+    prepared = {
+        "out_dir": tmp_path / "m4",
+        "config_hash": "abc",
+        "manifest": [],
+        "q_c": pd.Series([0.2, 0.8], dtype="float32").to_numpy(),
+        "clv_valid": pd.Series([True, True]).to_numpy(),
+        "binary_user_degree": pd.Series([1, 2]).to_numpy(),
+    }
+    monkeypatch.setattr(
+        hm4.common,
+        "prepare_hm2y",
+        lambda _cfg, code_version: prepared,
+    )
+    monkeypatch.setattr(
+        hm4.common,
+        "degree_matched_sources",
+        lambda *_args, **_kwargs: {
+            "source_user": pd.Series([1, 0]).to_numpy(),
+            "stratum": pd.Series([0, 0]).to_numpy(),
+            "changed_valid_user_share": 1.0,
+        },
+    )
+    calls = []
+
+    def fake_run_arm(_prepared, _cfg, *, model_id, q_clv, assignment_name):
+        calls.append((model_id, len(q_clv), assignment_name))
+        return {
+            "model_id": model_id,
+            "role": "baseline" if model_id == hm4.K1_MODEL_ID else "model",
+            "negative_count": 1 if model_id == hm4.K1_MODEL_ID else 5,
+            "metrics": dict(metrics),
+            "training": {},
+        }
+
+    monkeypatch.setattr(hm4, "_run_arm", fake_run_arm)
+
+    result = hm4.run_hm2y_seed42(cfg)
+
+    assert calls[0] == (hm4.K1_MODEL_ID, 2, "nonconditioned_k1")
+    assert set(result.model_id) == set(hm4.MODELS)
 
 
 def test_hm4_colab_runs_once_and_never_opens_protected_splits():
