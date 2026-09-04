@@ -16,6 +16,71 @@ from ngcf_clv_level_composition_price_model import (
 )
 
 
+class _WeightedNeighborSum(torch.autograd.Function):
+    """Edge-linear aggregation without a differentiable sparse matrix."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        features: torch.Tensor,
+        receiver: torch.Tensor,
+        source: torch.Tensor,
+        weights: torch.Tensor,
+        n_nodes: int,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(features, receiver, source, weights)
+        ctx.n_nodes = int(n_nodes)
+        ctx.chunk_size = int(chunk_size)
+        output = features.new_zeros((ctx.n_nodes, features.shape[1]))
+        for start in range(0, len(weights), ctx.chunk_size):
+            end = min(start + ctx.chunk_size, len(weights))
+            messages = features[source[start:end]] * weights[start:end, None]
+            output.index_add_(0, receiver[start:end], messages)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        features, receiver, source, weights = ctx.saved_tensors
+        grad_features = torch.zeros_like(features) if ctx.needs_input_grad[0] else None
+        grad_weights = torch.zeros_like(weights) if ctx.needs_input_grad[3] else None
+        for start in range(0, len(weights), ctx.chunk_size):
+            end = min(start + ctx.chunk_size, len(weights))
+            chunk_receiver = receiver[start:end]
+            chunk_source = source[start:end]
+            receiver_gradient = grad_output[chunk_receiver]
+            if grad_features is not None:
+                grad_features.index_add_(
+                    0,
+                    chunk_source,
+                    receiver_gradient * weights[start:end, None],
+                )
+            if grad_weights is not None:
+                grad_weights[start:end] = (
+                    receiver_gradient * features[chunk_source]
+                ).sum(dim=1)
+        return grad_features, None, None, grad_weights, None, None
+
+
+def _weighted_neighbor_sum(
+    features: torch.Tensor,
+    receiver: torch.Tensor,
+    source: torch.Tensor,
+    weights: torch.Tensor,
+    n_nodes: int,
+    chunk_size: int = 262_144,
+) -> torch.Tensor:
+    if features.ndim != 2:
+        raise ValueError("features는 [node, dimension]이어야 합니다")
+    if receiver.shape != source.shape or receiver.shape != weights.shape:
+        raise ValueError("receiver/source/weights shape이 같아야 합니다")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size는 양수여야 합니다")
+    return _WeightedNeighborSum.apply(
+        features, receiver, source, weights, int(n_nodes), int(chunk_size)
+    )
+
+
 class SparseSingleHeadGATLayer(nn.Module):
     """One memory-conscious GAT layer over a pre-existing sparse graph."""
 
@@ -65,13 +130,9 @@ class SparseSingleHeadGATLayer(nn.Module):
         receiver, source, weights, transformed = self.attention_weights(
             features, receiver, source, n_nodes
         )
-        attention = torch.sparse_coo_tensor(
-            torch.stack([receiver, source]),
-            weights,
-            (n_nodes, n_nodes),
-            device=features.device,
-        ).coalesce()
-        aggregated = torch.sparse.mm(attention, transformed)
+        aggregated = _weighted_neighbor_sum(
+            transformed, receiver, source, weights, n_nodes
+        )
         return F.elu(aggregated), weights
 
 
@@ -224,6 +285,7 @@ class GATCLVLevelCompositionPrice(NGCFCLVLevelCompositionPrice):
             "final_embedding_dim": self.output_dim,
             "n_layers": self.n_layers,
             "attention_heads": 1,
+            "edge_linear_attention_aggregation": True,
             "layer_aggregation": "mean(layer0,layer1,layer2)",
             "binary_graph": True,
             "one_dot_score": True,

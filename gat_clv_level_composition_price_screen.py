@@ -22,7 +22,7 @@ import lightgcn_clv_moe as moe
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m2-gat-clv-level-composition-price-historical-screen-v1"
+CODE_VERSION = "m2-gat-clv-level-composition-price-historical-screen-v1.1"
 GAT_M1_64 = "gat_m1_64"
 GAT_M1_67 = "gat_m1_67"
 GAT_M2 = "gat_m2_clv_level_composition_price"
@@ -132,6 +132,9 @@ def preflight_summary(cfg: GATCLVScreenConfig) -> dict:
             ),
             "layer_outputs": "mean(layer0, layer1, layer2)",
             "attention_heads": 1,
+            "attention_aggregation": (
+                "custom edge-linear weighted sum; no differentiable sparse COO"
+            ),
             "rho": cfg.rho,
             "rho_interpretation": "layer-0 input budget, not final-score bound",
             "item_price_budget": cfg.item_price_budget,

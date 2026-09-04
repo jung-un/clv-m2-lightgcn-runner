@@ -3,7 +3,10 @@ import pandas as pd
 import pytest
 import torch
 
-from gat_clv_level_composition_price_model import GATCLVLevelCompositionPrice
+from gat_clv_level_composition_price_model import (
+    GATCLVLevelCompositionPrice,
+    _weighted_neighbor_sum,
+)
 import gat_clv_level_composition_price_screen as runner
 
 
@@ -104,6 +107,31 @@ def test_each_receiver_attention_row_sums_to_one_and_can_be_nonuniform():
     user0_weights = weights[receiver == 0]
     assert len(user0_weights) == 2
     assert float((user0_weights.max() - user0_weights.min()).detach()) > 0.5
+
+
+def test_edge_linear_neighbor_sum_has_exact_forward_and_backward_values():
+    features = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], requires_grad=True
+    )
+    receiver = torch.tensor([0, 0, 1, 2])
+    source = torch.tensor([1, 2, 0, 1])
+    weights = torch.tensor([0.25, 0.75, 1.0, 1.0], requires_grad=True)
+
+    output = _weighted_neighbor_sum(
+        features, receiver, source, weights, n_nodes=3, chunk_size=2
+    )
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[4.5, 5.5], [1.0, 2.0], [3.0, 4.0]]),
+    )
+
+    probe = torch.tensor([[1.0, -1.0], [2.0, 0.5], [-1.0, 3.0]])
+    (output * probe).sum().backward()
+    torch.testing.assert_close(
+        features.grad,
+        torch.tensor([[2.0, 0.5], [-0.75, 2.75], [0.75, -0.75]]),
+    )
+    torch.testing.assert_close(weights.grad, torch.tensor([-1.0, -1.0, 3.0, 9.0]))
 
 
 def test_two_gat_layers_are_mean_aggregated_with_layer0():
