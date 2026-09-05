@@ -117,6 +117,8 @@ def test_colab_starts_one_seed_test_only_run_once():
 
     assert source.count("result_df = run_m5_economic_positive_test(cfg)") == 1
     assert "configure_m5_economic_positive_test_run" in source
+    assert "215255f012907ff440388bfb190ac36d02873623" in source
+    assert "TO_BE_PINNED" not in source
     assert "cfg.seeds == (42,)" in source
     assert "summary['validation_constructed'] is False" in source
     assert "summary['holdout_evaluation'] is False" in source
