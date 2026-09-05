@@ -35,15 +35,24 @@ def multi_negative_bpr(
     positive_scores: torch.Tensor,
     negative_scores: torch.Tensor,
     q_clv: torch.Tensor,
+    *,
+    selection_negative_scores: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Average BPR at q=0 and highest-scored-negative BPR at q=1."""
+    """Mix mean BPR with BPR for a separately selected hard negative."""
 
     if positive_scores.ndim != 1:
         raise ValueError("positive_scores는 [batch] shape이어야 합니다")
     if negative_scores.shape[0] != positive_scores.shape[0]:
         raise ValueError("positive/negative batch shape이 다릅니다")
+    selection_scores = (
+        negative_scores
+        if selection_negative_scores is None
+        else selection_negative_scores
+    )
+    if selection_scores.shape != negative_scores.shape:
+        raise ValueError("선택 점수와 손실 점수 shape이 다릅니다")
     weights, hardest = clv_conditioned_negative_weights(
-        negative_scores, q_clv
+        selection_scores, q_clv
     )
     row_losses = F.softplus(negative_scores - positive_scores[:, None])
     per_row = (weights * row_losses).sum(dim=1)
@@ -57,6 +66,10 @@ def multi_negative_bpr(
         "p_correct": (positive_scores[:, None] > negative_scores).float().mean(),
         "positive_hardest_gap": (
             positive_scores - negative_scores.gather(1, hardest[:, None]).squeeze(1)
+        ).mean(),
+        "hardest_index": hardest,
+        "selected_full_negative_score_mean": negative_scores.gather(
+            1, hardest[:, None]
         ).mean(),
     }
     return per_row.mean(), diagnostics

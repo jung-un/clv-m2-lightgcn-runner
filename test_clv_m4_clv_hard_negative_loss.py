@@ -49,6 +49,24 @@ def test_diagnostics_report_effective_gradient_mass_not_only_nominal_weight_mass
     )
 
 
+def test_selection_scores_choose_hardest_but_full_scores_define_bpr_loss():
+    positive = torch.tensor([0.0])
+    full_negative_scores = torch.tensor([[3.0, 1.0]])
+    id_selection_scores = torch.tensor([[0.0, 4.0]])
+
+    loss, diagnostics = multi_negative_bpr(
+        positive,
+        full_negative_scores,
+        torch.tensor([1.0]),
+        selection_negative_scores=id_selection_scores,
+    )
+
+    expected = float(torch.nn.functional.softplus(torch.tensor(1.0)))
+    assert float(loss) == pytest.approx(expected)
+    assert int(diagnostics["hardest_index"][0]) == 1
+    assert float(diagnostics["selected_full_negative_score_mean"]) == pytest.approx(1.0)
+
+
 def test_k1_is_plain_bpr_for_every_clv_value():
     positive = torch.tensor([1.0, -0.5])
     negative = torch.tensor([[0.25], [0.5]])

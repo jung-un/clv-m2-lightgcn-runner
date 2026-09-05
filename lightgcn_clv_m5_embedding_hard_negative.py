@@ -1,4 +1,4 @@
-"""Minimal M5 screen: the fixed M2 representation under the fixed M4 loss."""
+"""M5-v2 screen with ID-block hard-negative selection and full-score BPR."""
 
 from __future__ import annotations
 
@@ -30,19 +30,27 @@ import lightgcn_clv_moe as moe
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m5-m2-m4-joint-historical-screen-v1"
+CODE_VERSION = "m5-id-selected-hard-negative-historical-screen-v2"
+PREVIOUS_CODE_VERSION = "m5-m2-m4-joint-historical-screen-v1"
 M1_K5_MODEL_ID = "m1_multineg_mean_k5"
 M2_K5_MODEL_ID = "m2_clv_embedding_multineg_mean_k5"
 M4_MODEL_ID = "m4_clv_hard_k5"
-M5_MODEL_ID = "m5_clv_embedding_hard_k5"
-M5_SHUFFLED_MODEL_ID = "m5_degree_matched_clv_shuffle"
+PREVIOUS_M5_MODEL_ID = "m5_clv_embedding_hard_k5"
+PREVIOUS_M5_SHUFFLED_MODEL_ID = "m5_degree_matched_clv_shuffle"
+M5_MODEL_ID = "m5_id_selected_clv_embedding_hard_k5"
+M5_SHUFFLED_MODEL_ID = "m5_id_selected_degree_matched_clv_shuffle"
 TRAINED_MODEL_IDS = (
-    M1_K5_MODEL_ID,
-    M2_K5_MODEL_ID,
-    M4_MODEL_ID,
     M5_MODEL_ID,
     M5_SHUFFLED_MODEL_ID,
 )
+PREVIOUS_MODEL_IDS = (
+    M1_K5_MODEL_ID,
+    M2_K5_MODEL_ID,
+    M4_MODEL_ID,
+    PREVIOUS_M5_MODEL_ID,
+    PREVIOUS_M5_SHUFFLED_MODEL_ID,
+)
+REPORTED_MODEL_IDS = PREVIOUS_MODEL_IDS + TRAINED_MODEL_IDS
 ACCURACY_METRICS = (
     "recall@10",
     "ndcg@10",
@@ -79,17 +87,22 @@ class M5Config:
     shuffle_seed: int = 42
     out_dir: str = ""
     baseline_result_dir: str = ""
+    previous_m5_result_dir: str = ""
 
 
 def configure_m5_run(**overrides) -> M5Config:
     defaults = {
         "out_dir": (
             f"{v3.default_out_dir('dunnhumby')}"
-            "_m5_m2_m4_joint_historical_screen_v1"
+            "_m5_id_selected_hard_negative_historical_screen_v2"
         ),
         "baseline_result_dir": (
             f"{v3.default_out_dir('dunnhumby')}"
             "_m2_repeatshare_historical_backtest_v1"
+        ),
+        "previous_m5_result_dir": (
+            f"{v3.default_out_dir('dunnhumby')}"
+            "_m5_m2_m4_joint_historical_screen_v1"
         ),
     }
     return validate_m5_config(M5Config(**(defaults | overrides)))
@@ -117,8 +130,11 @@ def validate_m5_config(cfg: M5Config) -> M5Config:
             raise ValueError(f"빠른 M5 screen은 {key}={expected!r}이어야 합니다")
     if cfg.batch_size <= 0 or cfg.lr <= 0 or cfg.pref_reg < 0:
         raise ValueError("빠른 M5 screen 학습 설정이 잘못됐습니다")
-    if not cfg.out_dir or not cfg.baseline_result_dir:
-        raise ValueError("빠른 M5 screen은 out_dir와 baseline_result_dir가 필요합니다")
+    if not cfg.out_dir or not cfg.baseline_result_dir or not cfg.previous_m5_result_dir:
+        raise ValueError(
+            "빠른 M5 screen은 out_dir, baseline_result_dir, "
+            "previous_m5_result_dir가 필요합니다"
+        )
     return cfg
 
 
@@ -129,6 +145,7 @@ def preflight_summary(cfg: M5Config) -> dict:
         "dataset": cfg.dataset,
         "seed": cfg.seed,
         "trained_models": list(TRAINED_MODEL_IDS),
+        "reported_models": list(REPORTED_MODEL_IDS),
         "research_axis": "M5 partial combination: M2 representation plus M4 loss",
         "historical_development_split": {
             "train_end_inclusive": 683,
@@ -145,8 +162,15 @@ def preflight_summary(cfg: M5Config) -> dict:
         },
         "m4": {
             "uniform_negative_count": cfg.negative_count,
-            "loss": "(1-q_C)*mean_BPR + q_C*BPR(highest-scored negative)",
+            "loss": "(1-q_C)*mean full-score BPR + q_C*selected full-score BPR",
+            "hard_negative_selection": "ID-only propagated score",
+            "bpr_loss_score": "full M5 score",
             "per_positive_loss_mass": 1.0,
+        },
+        "previous_controls": {
+            "result_dir": cfg.previous_m5_result_dir,
+            "models": list(PREVIOUS_MODEL_IDS),
+            "reused_without_retraining": True,
         },
         "attribution_control": {
             "method": "jointly permute (q_N,q_V,q_C,valid) within user-degree deciles",
@@ -167,8 +191,11 @@ def preflight_summary(cfg: M5Config) -> dict:
         },
         "reading_rule": {
             "accuracy": "M5 accuracy geometric mean >= M4 and every metric >= 99% of M4",
-            "economic": "M5 weighted hit@10 > M4 and joint CLV shuffle",
-            "high_clv": "M5 high-CLV NDCG@10 > M4 and joint CLV shuffle",
+            "economic": "M5-v2 weighted hit@10 > M4, M5-v1, and v2 CLV shuffle",
+            "high_clv": (
+                "M5-v2 high-CLV weighted hit@10 > M1 and v2 CLV shuffle; "
+                "high-CLV NDCG@10 > M4 and v2 CLV shuffle"
+            ),
             "interaction": "(M5-M4)-(M2-M1) weighted hit@10 > 0",
             "attribution": "M5 six-metric geometric mean > joint CLV shuffle",
             "exposure": "coverage/distinct >=95% and top10 share <=105% of M4",
@@ -176,6 +203,7 @@ def preflight_summary(cfg: M5Config) -> dict:
         },
         "out_dir": cfg.out_dir,
         "baseline_result_dir": cfg.baseline_result_dir,
+        "previous_m5_result_dir": cfg.previous_m5_result_dir,
     }
 
 
@@ -229,6 +257,50 @@ def _prepare(cfg: M5Config) -> dict:
     return prepared
 
 
+def _load_previous_arms(cfg: M5Config) -> tuple[dict[str, dict], Path]:
+    """Load exact v1 controls so v2 trains only its two changed arms."""
+
+    root = Path(cfg.previous_m5_result_dir)
+    candidates = sorted(root.glob("m5_m2_m4_joint_*.json"))
+    if not candidates:
+        raise FileNotFoundError(
+            "이전 M5 v1 결과 JSON이 없습니다: " f"{root}"
+        )
+    match_keys = (
+        "dataset",
+        "seed",
+        "time_cutoff",
+        "evaluation_days",
+        "epochs",
+        "id_dim",
+        "clv_dim",
+        "rho",
+        "item_price_budget",
+        "n_layers",
+        "negative_count",
+        "input_days",
+        "shuffle_degree_bins",
+        "shuffle_seed",
+    )
+    mismatch_found = False
+    for path in reversed(candidates):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("code_version") != PREVIOUS_CODE_VERSION:
+            continue
+        previous_config = payload.get("config", {})
+        if any(previous_config.get(key) != getattr(cfg, key) for key in match_keys):
+            mismatch_found = True
+            continue
+        arms = payload.get("arms", {})
+        missing = [model_id for model_id in PREVIOUS_MODEL_IDS if model_id not in arms]
+        if missing:
+            raise ValueError(f"이전 M5 v1 결과에 arm이 누락됐습니다: {missing}")
+        return {model_id: arms[model_id] for model_id in PREVIOUS_MODEL_IDS}, path
+    if mismatch_found:
+        raise ValueError("이전 M5 v1과 v2의 동일한 설정을 확인할 수 없습니다")
+    raise ValueError(f"{PREVIOUS_CODE_VERSION} 결과를 찾지 못했습니다")
+
+
 def _build_model(
     prepared: dict,
     cfg: M5Config,
@@ -262,44 +334,22 @@ def arm_specifications(prepared: dict, cfg: M5Config) -> list[dict]:
     shuffled = prepared["degree_matched_shuffle"]
     return [
         {
-            "model_id": M1_K5_MODEL_ID,
-            "role": "factorial_m1",
-            "rho": 0.0,
-            "assignment": observed,
-            "assignment_name": "observed",
-            "hard_negative": False,
-        },
-        {
-            "model_id": M2_K5_MODEL_ID,
-            "role": "factorial_m2",
-            "rho": cfg.rho,
-            "assignment": observed,
-            "assignment_name": "observed",
-            "hard_negative": False,
-        },
-        {
-            "model_id": M4_MODEL_ID,
-            "role": "factorial_m4",
-            "rho": 0.0,
-            "assignment": observed,
-            "assignment_name": "observed",
-            "hard_negative": True,
-        },
-        {
             "model_id": M5_MODEL_ID,
-            "role": "factorial_m5",
+            "role": "id_selected_m5_v2",
             "rho": cfg.rho,
             "assignment": observed,
             "assignment_name": "observed",
             "hard_negative": True,
+            "hard_negative_selection": "id",
         },
         {
             "model_id": M5_SHUFFLED_MODEL_ID,
-            "role": "joint_attribution_control",
+            "role": "id_selected_joint_attribution_control",
             "rho": cfg.rho,
             "assignment": shuffled,
             "assignment_name": "degree_matched_shuffle",
             "hard_negative": True,
+            "hard_negative_selection": "id",
         },
     ]
 
@@ -318,9 +368,34 @@ def _arm_hash(prepared: dict, cfg: M5Config, spec: dict) -> str:
         "rho": spec["rho"],
         "assignment": spec["assignment_name"],
         "hard_negative": spec["hard_negative"],
+        "hard_negative_selection": spec["hard_negative_selection"],
         "negative_count": cfg.negative_count,
     }
     return hashlib.sha256(_canonical(payload).encode()).hexdigest()[:12]
+
+
+def _negative_score_views(
+    user_z: torch.Tensor,
+    item_z: torch.Tensor,
+    users: torch.Tensor,
+    negatives: torch.Tensor,
+    *,
+    id_dim: int,
+    selection: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return full loss scores and the scores used only to choose hardness."""
+
+    selected_users = user_z[users, None, :]
+    selected_items = item_z[negatives]
+    full_scores = (selected_users * selected_items).sum(2)
+    if selection == "full":
+        return full_scores, full_scores
+    if selection != "id":
+        raise ValueError("hard-negative selection은 id 또는 full이어야 합니다")
+    id_scores = (
+        selected_users[:, :, :id_dim] * selected_items[:, :, :id_dim]
+    ).sum(2)
+    return full_scores, id_scores
 
 
 def _train_arm(
@@ -370,6 +445,7 @@ def _train_arm(
             "hardest_negative_weight_mean": 0.0,
             "positive_hardest_gap": 0.0,
             "effective_gradient_mass": 0.0,
+            "id_full_hardest_disagreement_rate": 0.0,
         }
         weight_error = 0.0
         last_gradients: dict[str, float] = {}
@@ -395,11 +471,19 @@ def _train_arm(
             )
             user_z, item_z = model.propagated_embeddings()
             positive_scores = (user_z[users] * item_z[positives]).sum(1)
-            negative_scores = (
-                user_z[users, None, :] * item_z[negatives]
-            ).sum(2)
+            negative_scores, selection_scores = _negative_score_views(
+                user_z,
+                item_z,
+                users,
+                negatives,
+                id_dim=cfg.id_dim,
+                selection=spec["hard_negative_selection"],
+            )
             bpr, diagnostics = multi_negative_bpr(
-                positive_scores, negative_scores, q_all[users]
+                positive_scores,
+                negative_scores,
+                q_all[users],
+                selection_negative_scores=selection_scores,
             )
             reg = sampled_l2_multineg(
                 model.E_u.weight[users],
@@ -423,6 +507,14 @@ def _train_arm(
             )
             totals["effective_gradient_mass"] += float(
                 diagnostics["effective_gradient_mass"]
+            )
+            totals["id_full_hardest_disagreement_rate"] += float(
+                (
+                    selection_scores.detach().argmax(1)
+                    != negative_scores.detach().argmax(1)
+                )
+                .float()
+                .mean()
             )
             weight_error = max(
                 weight_error, float(diagnostics["row_weight_sum_error"])
@@ -534,6 +626,7 @@ def _run_arm(prepared: dict, cfg: M5Config, spec: dict) -> dict:
         "rho": spec["rho"],
         "negative_count": cfg.negative_count,
         "hard_negative": spec["hard_negative"],
+        "hard_negative_selection": spec["hard_negative_selection"],
         "clv_assignment": spec["assignment_name"],
         "metrics": test10._public_metrics(metrics_raw),
         "diagnostics": model.representation_diagnostics(),
@@ -581,7 +674,9 @@ def interaction_rows(metric_rows: dict[str, dict]) -> pd.DataFrame:
 
 
 def screening_reading(metric_rows: dict[str, dict]) -> dict:
+    m1_metrics = metric_rows[M1_K5_MODEL_ID]
     m4_metrics = metric_rows[M4_MODEL_ID]
+    previous_m5 = metric_rows[PREVIOUS_M5_MODEL_ID]
     m5_metrics = metric_rows[M5_MODEL_ID]
     shuffled = metric_rows[M5_SHUFFLED_MODEL_ID]
     accuracy_ratios = {
@@ -593,12 +688,22 @@ def screening_reading(metric_rows: dict[str, dict]) -> dict:
     interaction = interaction_rows(metric_rows).set_index("metric")
     weighted_metric = "price_purchase_amount_weighted_hit@10"
     weighted_vs_m4 = float(m5_metrics[weighted_metric] - m4_metrics[weighted_metric])
+    weighted_vs_previous_m5 = float(
+        m5_metrics[weighted_metric] - previous_m5[weighted_metric]
+    )
     weighted_vs_shuffle = float(m5_metrics[weighted_metric] - shuffled[weighted_metric])
     high_ndcg_vs_m4 = float(
         m5_metrics["고CLV_ndcg@10"] - m4_metrics["고CLV_ndcg@10"]
     )
     high_ndcg_vs_shuffle = float(
         m5_metrics["고CLV_ndcg@10"] - shuffled["고CLV_ndcg@10"]
+    )
+    high_weighted_metric = "고CLV_price_purchase_amount_weighted_hit@10"
+    high_weighted_vs_m1 = float(
+        m5_metrics[high_weighted_metric] - m1_metrics[high_weighted_metric]
+    )
+    high_weighted_vs_shuffle = float(
+        m5_metrics[high_weighted_metric] - shuffled[high_weighted_metric]
     )
     exposure = {
         "coverage@10_ratio_vs_m4": float(
@@ -615,8 +720,17 @@ def screening_reading(metric_rows: dict[str, dict]) -> dict:
         accuracy_geomean >= 1.0
         and all(value >= 0.99 for value in accuracy_ratios.values())
     )
-    economic_pass = bool(weighted_vs_m4 > 0.0 and weighted_vs_shuffle > 0.0)
-    high_clv_pass = bool(high_ndcg_vs_m4 > 0.0 and high_ndcg_vs_shuffle > 0.0)
+    economic_pass = bool(
+        weighted_vs_m4 > 0.0
+        and weighted_vs_previous_m5 > 0.0
+        and weighted_vs_shuffle > 0.0
+    )
+    high_clv_pass = bool(
+        high_weighted_vs_m1 > 0.0
+        and high_weighted_vs_shuffle > 0.0
+        and high_ndcg_vs_m4 > 0.0
+        and high_ndcg_vs_shuffle > 0.0
+    )
     interaction_pass = bool(
         interaction.loc[weighted_metric, "interaction_effect"] > 0.0
     )
@@ -645,7 +759,10 @@ def screening_reading(metric_rows: dict[str, dict]) -> dict:
         "accuracy_geomean_ratio_vs_m4": accuracy_geomean,
         "accuracy_geomean_ratio_vs_joint_shuffle": attribution_geomean,
         "weighted_hit@10_delta_vs_m4": weighted_vs_m4,
+        "weighted_hit@10_delta_vs_m5_v1": weighted_vs_previous_m5,
         "weighted_hit@10_delta_vs_joint_shuffle": weighted_vs_shuffle,
+        "high_clv_weighted_hit@10_delta_vs_m1": high_weighted_vs_m1,
+        "high_clv_weighted_hit@10_delta_vs_joint_shuffle": high_weighted_vs_shuffle,
         "high_clv_ndcg@10_delta_vs_m4": high_ndcg_vs_m4,
         "high_clv_ndcg@10_delta_vs_joint_shuffle": high_ndcg_vs_shuffle,
         "weighted_hit@10_interaction_effect": float(
@@ -662,13 +779,15 @@ def run_m5_screen(cfg: M5Config | None = None) -> pd.DataFrame:
     summary = preflight_summary(cfg)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     prepared = _prepare(cfg)
-    arms: dict[str, dict] = {}
+    previous_arms, previous_result_path = _load_previous_arms(cfg)
+    print(f"\n[재사용] 이전 M5 v1 대조군: {previous_result_path}")
+    arms: dict[str, dict] = dict(previous_arms)
     for spec in arm_specifications(prepared, cfg):
         print(f"\n===== {spec['model_id']} | seed {cfg.seed} | fixed {cfg.epochs} epochs =====")
         arms[spec["model_id"]] = _run_arm(prepared, cfg, spec)
 
     rows = []
-    for model_id in TRAINED_MODEL_IDS:
+    for model_id in REPORTED_MODEL_IDS:
         arm = arms[model_id]
         rows.append(
             {
@@ -680,6 +799,10 @@ def run_m5_screen(cfg: M5Config | None = None) -> pd.DataFrame:
                 "rho": arm["rho"],
                 "negative_count": arm["negative_count"],
                 "hard_negative": arm["hard_negative"],
+                "hard_negative_selection": arm.get(
+                    "hard_negative_selection",
+                    "full" if arm["hard_negative"] else "none",
+                ),
                 "clv_assignment": arm["clv_assignment"],
                 **arm["diagnostics"],
                 **arm["training"].get("final_diagnostics", {}),
@@ -687,10 +810,17 @@ def run_m5_screen(cfg: M5Config | None = None) -> pd.DataFrame:
             }
         )
     frame = pd.DataFrame(rows)
-    metric_rows = {model_id: arms[model_id]["metrics"] for model_id in TRAINED_MODEL_IDS}
+    metric_rows = {
+        model_id: arms[model_id]["metrics"] for model_id in REPORTED_MODEL_IDS
+    }
     comparison = report_helpers._metric_comparison(
         metric_rows,
-        references=(M1_K5_MODEL_ID, M4_MODEL_ID, M5_SHUFFLED_MODEL_ID),
+        references=(
+            M1_K5_MODEL_ID,
+            M4_MODEL_ID,
+            PREVIOUS_M5_MODEL_ID,
+            M5_SHUFFLED_MODEL_ID,
+        ),
     )
     interactions = interaction_rows(metric_rows)
     reading = screening_reading(metric_rows)
@@ -713,6 +843,7 @@ def run_m5_screen(cfg: M5Config | None = None) -> pd.DataFrame:
             "config": asdict(cfg),
             "preflight": summary,
             "input_manifest": prepared["manifest"],
+            "previous_m5_result": str(previous_result_path),
             "absolute_rows": frame.to_dict("records"),
             "comparison_rows": comparison.to_dict("records"),
             "interaction_rows": interactions.to_dict("records"),
@@ -740,7 +871,10 @@ def run_m5_screen(cfg: M5Config | None = None) -> pd.DataFrame:
     frame.attrs["screening_reading"] = reading
     frame.attrs["result_paths"] = {key: str(value) for key, value in paths.items()}
 
-    print("\n1) 절대지표: M1(K=5), M2, M4, M5, M5 CLV 순열")
+    print(
+        "\n1) 절대지표: 이전 M1·M2·M4·M5, "
+        "ID 점수 선택 M5-v2, M5-v2 CLV 순열"
+    )
     print(frame.to_string(index=False))
     print("\n2) 대조군별 비교")
     print(comparison.to_string(index=False))
