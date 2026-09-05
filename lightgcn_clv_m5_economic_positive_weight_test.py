@@ -54,6 +54,7 @@ class M5EconomicPositiveTestConfig:
     pref_reg: float = 1e-3
     input_days: int = 365
     shuffle_degree_bins: int = 10
+    reused_seed42_json: str = ""
     out_dir: str = ""
 
 
@@ -95,6 +96,12 @@ def validate_test_config(
         raise ValueError(
             "M5 test-only seeds는 seed-42 파일럿 또는 고정 seed 42~51이어야 합니다"
         )
+    if cfg.seeds == FULL_SEEDS and not cfg.reused_seed42_json:
+        raise ValueError(
+            "M5 10-seed 실행은 이미 평가한 seed 42 결과 JSON을 재사용해야 합니다"
+        )
+    if cfg.seeds == PILOT_SEEDS and cfg.reused_seed42_json:
+        raise ValueError("seed-42 파일럿에는 재사용 결과 JSON을 지정하지 않습니다")
     if cfg.batch_size <= 0 or cfg.lr <= 0 or cfg.pref_reg < 0:
         raise ValueError("M5 test-only 학습 설정이 잘못됐습니다")
     if not cfg.out_dir:
@@ -114,6 +121,12 @@ def preflight_summary(cfg: M5EconomicPositiveTestConfig) -> dict:
             else "frozen ten-seed final run"
         ),
         "planned_full_seeds": list(FULL_SEEDS),
+        "seed42_handling": (
+            "train and evaluate once"
+            if cfg.seeds == PILOT_SEEDS
+            else "reuse the completed seed-42 test result; train seeds 43--51 only"
+        ),
+        "reused_seed42_json": cfg.reused_seed42_json or None,
         "models": list(MODEL_IDS),
         "training_data": "DAY 1--697 (former train + validation)",
         "test_data": "DAY 698--704",
@@ -357,6 +370,79 @@ def _prepare_seed_assignments(prepared: dict, seed: int, degree_bins: int) -> No
     }
 
 
+_REUSE_CONFIG_FIELDS = (
+    "dataset",
+    "epochs",
+    "id_dim",
+    "economic_dim",
+    "economic_bins",
+    "shrinkage_strength",
+    "rho",
+    "positive_weight_lambda",
+    "n_layers",
+    "negative_count",
+    "batch_size",
+    "lr",
+    "pref_reg",
+    "input_days",
+    "shuffle_degree_bins",
+)
+
+
+def _load_reused_seed42_arms(
+    prepared: dict,
+    cfg: M5EconomicPositiveTestConfig,
+) -> list[dict]:
+    """Load the already evaluated seed-42 arms without reopening test."""
+
+    if cfg.seeds == PILOT_SEEDS:
+        return []
+    source = Path(cfg.reused_seed42_json)
+    if not source.is_file():
+        raise FileNotFoundError(
+            f"재사용할 seed 42 test 결과 JSON이 없습니다: {source}"
+        )
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    if payload.get("code_version") != CODE_VERSION:
+        raise RuntimeError(
+            "seed 42 결과의 code_version이 현재 고정 실험과 다릅니다: "
+            f"{payload.get('code_version')!r}"
+        )
+    prior_cfg = payload.get("config", {})
+    if tuple(prior_cfg.get("seeds", ())) != PILOT_SEEDS:
+        raise RuntimeError("재사용 결과는 seed 42 단일 실행이어야 합니다")
+    for field in _REUSE_CONFIG_FIELDS:
+        if prior_cfg.get(field) != getattr(cfg, field):
+            raise RuntimeError(
+                f"seed 42 재사용 설정 불일치: {field}="
+                f"{prior_cfg.get(field)!r} != {getattr(cfg, field)!r}"
+            )
+    prior_manifest = payload.get("input_manifest")
+    if not prior_manifest or moe.manifest_hash(prior_manifest) != prepared["input_hash"]:
+        raise RuntimeError("seed 42 재사용 결과의 입력 데이터 manifest가 다릅니다")
+
+    arms = payload.get("arms", [])
+    expected = {(42, model_id) for model_id in MODEL_IDS}
+    actual = {(arm.get("seed"), arm.get("model_id")) for arm in arms}
+    if actual != expected or len(arms) != len(expected):
+        raise RuntimeError("seed 42 재사용 결과에 A~F 여섯 arm이 정확히 없습니다")
+    reused = []
+    for arm in arms:
+        if (
+            arm.get("split") != "test"
+            or arm.get("test_evaluation_count") != 1
+            or arm.get("final_epoch") != cfg.epochs
+        ):
+            raise RuntimeError("seed 42 재사용 arm이 고정 test 결과가 아닙니다")
+        copied = dict(arm)
+        copied["result_origin"] = "reused_completed_seed42_test"
+        copied["reused_from"] = str(source)
+        copied["reused_source_revision"] = payload.get("source_revision")
+        reused.append(copied)
+    print(f"[재사용] seed 42 A~F 여섯 arm: {source} (test 재평가 없음)")
+    return reused
+
+
 def _run_arm(
     prepared: dict,
     cfg: M5EconomicPositiveTestConfig,
@@ -426,6 +512,7 @@ def _run_arm(
         "validation_selection": False,
         "test_evaluation_count": 1,
         "test_evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "result_origin": "newly_trained_fixed_test",
         "rho": spec["rho"],
         "positive_weight_lambda": (
             cfg.positive_weight_lambda if spec["weighted"] else 0.0
@@ -490,6 +577,7 @@ def _persist(
                 "rho": arm["rho"],
                 "positive_weight_lambda": arm["positive_weight_lambda"],
                 "clv_assignment": arm["clv_assignment"],
+                "result_origin": arm.get("result_origin", "unknown"),
                 **arm["diagnostics"],
                 **arm["training"].get("final_diagnostics", {}),
                 **arm["metrics"],
@@ -606,6 +694,11 @@ def _persist(
                 "selection": "none; test is not used for model, epoch, or hyperparameter selection",
                 "single_seed": "seed 42 is descriptive and does not establish stability or significance",
                 "final_reporting": "use the frozen seeds 42--51 mean after the protocol check",
+                "seed42_reuse": (
+                    "the completed seed-42 test result was reused without retraining or reevaluation"
+                    if cfg.seeds == FULL_SEEDS
+                    else "not applicable to the seed-42 protocol run"
+                ),
             },
             "arms": arms,
             "result_paths": {key: str(path) for key, path in paths.items()},
@@ -626,8 +719,10 @@ def run_m5_economic_positive_test(
     cfg = validate_test_config(cfg or configure_m5_economic_positive_test_run())
     print(json.dumps(preflight_summary(cfg), ensure_ascii=False, indent=2))
     prepared = _prepare(cfg)
-    arms = []
+    arms = _load_reused_seed42_arms(prepared, cfg)
     for seed in cfg.seeds:
+        if seed == 42 and arms:
+            continue
         _prepare_seed_assignments(prepared, seed, cfg.shuffle_degree_bins)
         run_cfg = _screen_config(cfg, seed)
         for spec in screen.arm_specifications(prepared, run_cfg):

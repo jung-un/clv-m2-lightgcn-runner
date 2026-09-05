@@ -48,6 +48,83 @@ def test_test_protocol_keeps_the_frozen_m5_architecture_and_six_arms(tmp_path):
     )
 
 
+def test_full_run_requires_reusing_completed_seed42_result(tmp_path):
+    with pytest.raises(ValueError, match="seed 42 결과 JSON"):
+        _config(tmp_path, seeds=final_test.FULL_SEEDS)
+
+    cfg = _config(
+        tmp_path,
+        seeds=final_test.FULL_SEEDS,
+        reused_seed42_json="/content/drive/completed-seed42.json",
+    )
+    summary = final_test.preflight_summary(cfg)
+
+    assert cfg.seeds == tuple(range(42, 52))
+    assert summary["current_scope"] == "frozen ten-seed final run"
+    assert summary["seed42_handling"] == (
+        "reuse the completed seed-42 test result; train seeds 43--51 only"
+    )
+
+
+def test_reused_seed42_loader_accepts_only_matching_complete_test_arms(tmp_path):
+    source = tmp_path / "seed42.json"
+    cfg = _config(
+        tmp_path,
+        seeds=final_test.FULL_SEEDS,
+        reused_seed42_json=str(source),
+    )
+    manifest = {
+        "transactions": {
+            "path": "transactions.csv",
+            "bytes": 1,
+            "sha256": "transaction-hash",
+        },
+        "item_metadata": {
+            "path": "products.csv",
+            "bytes": 1,
+            "sha256": "metadata-hash",
+        },
+    }
+    arms = [
+        {
+            "seed": 42,
+            "model_id": model_id,
+            "split": "test",
+            "test_evaluation_count": 1,
+            "final_epoch": 100,
+        }
+        for model_id in final_test.MODEL_IDS
+    ]
+    source.write_text(
+        json.dumps(
+            {
+                "code_version": final_test.CODE_VERSION,
+                "source_revision": "pilot-revision",
+                "config": {
+                    **{
+                        field: getattr(cfg, field)
+                        for field in final_test._REUSE_CONFIG_FIELDS
+                    },
+                    "seeds": [42],
+                },
+                "input_manifest": manifest,
+                "arms": arms,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = final_test._load_reused_seed42_arms(
+        {"input_hash": final_test.moe.manifest_hash(manifest)}, cfg
+    )
+
+    assert len(loaded) == 6
+    assert {arm["model_id"] for arm in loaded} == set(final_test.MODEL_IDS)
+    assert all(
+        arm["result_origin"] == "reused_completed_seed42_test" for arm in loaded
+    )
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
