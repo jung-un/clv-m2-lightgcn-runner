@@ -285,3 +285,26 @@ def test_multiseed_colab_reuses_seed42_and_runs_frozen_full_seeds_once():
     assert "summary['holdout_evaluation'] is False" in source
     assert "28cf7b2ab8ad0f9e05a1ff8f0af02da378da845d" in source
     assert "TO_BE_PINNED" not in source
+
+
+def test_hm_colab_runs_same_m5_structure_on_seed42_test_once():
+    notebook = json.loads(
+        Path(
+            "clv_m5_economic_positive_weight_hm2y_test_seed42_colab.ipynb"
+        ).read_text(encoding="utf-8")
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert source.count("result_df = run_m5_economic_positive_test(cfg)") == 1
+    assert "dataset='hm'" in source
+    assert "seeds=(42,)" in source
+    assert "batch_size=131_072" in source
+    assert "full_history_about_2_years" in source
+    assert "through 2020-09-08 (former train + validation)" in source
+    assert "2020-09-09--15" in source
+    assert "summary['validation_constructed'] is False" in source
+    assert "summary['holdout_evaluation'] is False" in source
+    assert "d0df4819560c35d30189e913a223fe432c30108c" in source
+    assert "TO_BE_PINNED" not in source
