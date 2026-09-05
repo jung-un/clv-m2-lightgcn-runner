@@ -159,14 +159,14 @@ def test_split_guard_rejects_validation_or_wrong_final_boundaries():
             },
         },
     }
-    final_test.validate_final_test_data(valid)
+    final_test.validate_final_test_data(valid, "dunnhumby")
 
     contaminated = {
         **valid,
         "splits": {"val": (object(), object()), "test": (object(), object())},
     }
     with pytest.raises(RuntimeError, match="test split"):
-        final_test.validate_final_test_data(contaminated)
+        final_test.validate_final_test_data(contaminated, "dunnhumby")
 
     wrong_boundary = {
         **valid,
@@ -179,7 +179,71 @@ def test_split_guard_rejects_validation_or_wrong_final_boundaries():
         },
     }
     with pytest.raises(RuntimeError, match="DAY 698--704"):
-        final_test.validate_final_test_data(wrong_boundary)
+        final_test.validate_final_test_data(wrong_boundary, "dunnhumby")
+
+
+def test_hm_seed42_uses_full_two_year_test_only_protocol(tmp_path):
+    cfg = _config(
+        tmp_path,
+        dataset="hm",
+        batch_size=131_072,
+    )
+    summary = final_test.preflight_summary(cfg)
+    base = final_test._base_config(cfg)
+
+    assert cfg.seeds == (42,)
+    assert summary["period"] == "full_history_about_2_years"
+    assert summary["training_data"] == (
+        "through 2020-09-08 (former train + validation)"
+    )
+    assert summary["test_data"] == "2020-09-09--15"
+    assert summary["post_test_rows"] == "2020-09-16--22 ignored"
+    assert summary["planned_full_seeds"] is None
+    assert base["WINDOW_DAYS"] is None
+    assert base["TRAIN_ON_VAL"] is True
+    assert base["EVAL_TEST"] is True
+    assert base["EVAL_HOLDOUT"] is False
+
+
+def test_hm_rejects_multiseed_scope(tmp_path):
+    with pytest.raises(ValueError, match="H&M seed 42"):
+        _config(
+            tmp_path,
+            dataset="hm",
+            seeds=final_test.FULL_SEEDS,
+            reused_seed42_json="not-allowed.json",
+        )
+
+
+def test_hm_split_guard_accepts_only_fixed_test_dates():
+    valid = {
+        "splits": {"test": (object(), object())},
+        "data_stats": {
+            "split_boundaries": {
+                "train": {"end_inclusive": "2020-09-08T00:00:00"},
+                "test": {
+                    "start_exclusive": "2020-09-08T00:00:00",
+                    "end_inclusive": "2020-09-15T00:00:00",
+                },
+                "holdout": {
+                    "start_exclusive": "2020-09-15T00:00:00",
+                    "end_inclusive": "2020-09-22T00:00:00",
+                },
+            },
+            "split_evaluation_status": {
+                "val": "merged_into_train",
+                "test": "constructed",
+                "holdout": "not_constructed",
+            },
+        },
+    }
+    final_test.validate_final_test_data(valid, "hm")
+
+    valid["data_stats"]["split_boundaries"]["test"]["end_inclusive"] = (
+        "2020-09-14T00:00:00"
+    )
+    with pytest.raises(RuntimeError, match="H&M 고정 test"):
+        final_test.validate_final_test_data(valid, "hm")
 
 
 def test_colab_starts_one_seed_test_only_run_once():

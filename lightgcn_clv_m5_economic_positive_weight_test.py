@@ -1,8 +1,8 @@
-"""Test-only M5 runner with a seed-42 pilot and frozen 10-seed extension.
+"""Test-only M5 runner with seed-42 pilots and a Dunnhumby 10-seed extension.
 
-The former training and validation intervals are merged through DAY 697.
-Every arm is trained for exactly 100 epochs and evaluated once on the fixed
-DAY 698--704 test interval.  DAY 705--711 is ignored and never evaluated.
+The former training and validation intervals are merged before the fixed test.
+Every arm is trained for exactly 100 epochs and evaluated once.  The post-test
+interval is ignored and never evaluated.
 """
 
 from __future__ import annotations
@@ -76,7 +76,6 @@ def validate_test_config(
     cfg: M5EconomicPositiveTestConfig,
 ) -> M5EconomicPositiveTestConfig:
     required = {
-        "dataset": "dunnhumby",
         "epochs": 100,
         "id_dim": 64,
         "economic_dim": 4,
@@ -92,11 +91,18 @@ def validate_test_config(
     for key, expected in required.items():
         if getattr(cfg, key) != expected:
             raise ValueError(f"M5 test-only 설정은 {key}={expected!r}이어야 합니다")
-    if cfg.seeds not in {PILOT_SEEDS, FULL_SEEDS}:
+    if cfg.dataset not in {"dunnhumby", "hm"}:
+        raise ValueError("M5 test-only dataset은 dunnhumby 또는 hm이어야 합니다")
+    allowed_seeds = (
+        {PILOT_SEEDS, FULL_SEEDS}
+        if cfg.dataset == "dunnhumby"
+        else {PILOT_SEEDS}
+    )
+    if cfg.seeds not in allowed_seeds:
         raise ValueError(
-            "M5 test-only seeds는 seed-42 파일럿 또는 고정 seed 42~51이어야 합니다"
+            "M5 test-only seeds는 H&M seed 42 또는 Dunnhumby seed 42/42~51이어야 합니다"
         )
-    if cfg.seeds == FULL_SEEDS and not cfg.reused_seed42_json:
+    if cfg.dataset == "dunnhumby" and cfg.seeds == FULL_SEEDS and not cfg.reused_seed42_json:
         raise ValueError(
             "M5 10-seed 실행은 이미 평가한 seed 42 결과 JSON을 재사용해야 합니다"
         )
@@ -111,6 +117,7 @@ def validate_test_config(
 
 def preflight_summary(cfg: M5EconomicPositiveTestConfig) -> dict:
     cfg = validate_test_config(cfg)
+    is_hm = cfg.dataset == "hm"
     return {
         "code_version": CODE_VERSION,
         "dataset": cfg.dataset,
@@ -120,7 +127,7 @@ def preflight_summary(cfg: M5EconomicPositiveTestConfig) -> dict:
             if cfg.seeds == PILOT_SEEDS
             else "frozen ten-seed final run"
         ),
-        "planned_full_seeds": list(FULL_SEEDS),
+        "planned_full_seeds": list(FULL_SEEDS) if not is_hm else None,
         "seed42_handling": (
             "train and evaluate once"
             if cfg.seeds == PILOT_SEEDS
@@ -128,12 +135,19 @@ def preflight_summary(cfg: M5EconomicPositiveTestConfig) -> dict:
         ),
         "reused_seed42_json": cfg.reused_seed42_json or None,
         "models": list(MODEL_IDS),
-        "training_data": "DAY 1--697 (former train + validation)",
-        "test_data": "DAY 698--704",
+        "period": "full_history_about_2_years" if is_hm else "full_history",
+        "training_data": (
+            "through 2020-09-08 (former train + validation)"
+            if is_hm
+            else "DAY 1--697 (former train + validation)"
+        ),
+        "test_data": "2020-09-09--15" if is_hm else "DAY 698--704",
         "validation_constructed": False,
         "validation_selection": False,
         "early_stopping": False,
-        "post_test_rows": "DAY 705--711 ignored",
+        "post_test_rows": (
+            "2020-09-16--22 ignored" if is_hm else "DAY 705--711 ignored"
+        ),
         "holdout_evaluation": False,
         "test_evaluation": (
             "one final-checkpoint evaluation per seed/model; completed results are cached"
@@ -164,8 +178,16 @@ def preflight_summary(cfg: M5EconomicPositiveTestConfig) -> dict:
             ),
         },
         "reporting": (
-            "the current seed-42 result is descriptive; the final report uses "
+            "the H&M seed-42 result is a one-seed cross-dataset check"
+            if is_hm
+            else "the current seed-42 result is descriptive; the final report uses "
             "means and same-seed differences over seeds 42--51"
+        ),
+        "statistical_note": (
+            "H&M two-year seed 42 test only; no significance, stability, or "
+            "generalization claim"
+            if is_hm
+            else "Dunnhumby fixed test seeds; no automatic population-significance claim"
         ),
         "out_dir": cfg.out_dir,
     }
@@ -228,7 +250,7 @@ def _as_float(value) -> float:
     return float(value) if value is not None else math.nan
 
 
-def validate_final_test_data(data: dict) -> None:
+def validate_final_test_data(data: dict, dataset: str) -> None:
     if set(data.get("splits", {})) != {"test"}:
         raise RuntimeError(
             f"M5 test-only runner에는 test split만 있어야 합니다: "
@@ -237,17 +259,46 @@ def validate_final_test_data(data: dict) -> None:
     stats = data.get("data_stats", {})
     boundaries = stats.get("split_boundaries", {})
     status = stats.get("split_evaluation_status", {})
-    train_end = _as_float(boundaries.get("train", {}).get("end_inclusive"))
-    test_start = _as_float(boundaries.get("test", {}).get("start_exclusive"))
-    test_end = _as_float(boundaries.get("test", {}).get("end_inclusive"))
-    post_start = _as_float(boundaries.get("holdout", {}).get("start_exclusive"))
-    post_end = _as_float(boundaries.get("holdout", {}).get("end_inclusive"))
-    if (train_end, test_start, test_end) != (697.0, 697.0, 704.0):
-        raise RuntimeError(
-            "고정 test는 DAY 1--697 학습 후 DAY 698--704여야 합니다"
+    if dataset == "dunnhumby":
+        train_end = _as_float(boundaries.get("train", {}).get("end_inclusive"))
+        test_start = _as_float(boundaries.get("test", {}).get("start_exclusive"))
+        test_end = _as_float(boundaries.get("test", {}).get("end_inclusive"))
+        post_start = _as_float(boundaries.get("holdout", {}).get("start_exclusive"))
+        post_end = _as_float(boundaries.get("holdout", {}).get("end_inclusive"))
+        if (train_end, test_start, test_end) != (697.0, 697.0, 704.0):
+            raise RuntimeError(
+                "고정 test는 DAY 1--697 학습 후 DAY 698--704여야 합니다"
+            )
+        if (post_start, post_end) != (704.0, 711.0):
+            raise RuntimeError("DAY 705--711 보호 구간 경계가 달라졌습니다")
+    elif dataset == "hm":
+        parsed = tuple(
+            pd.Timestamp(boundaries[split][field]).normalize()
+            for split, field in (
+                ("train", "end_inclusive"),
+                ("test", "start_exclusive"),
+                ("test", "end_inclusive"),
+                ("holdout", "start_exclusive"),
+                ("holdout", "end_inclusive"),
+            )
         )
-    if (post_start, post_end) != (704.0, 711.0):
-        raise RuntimeError("DAY 705--711 보호 구간 경계가 달라졌습니다")
+        expected = tuple(
+            pd.Timestamp(value)
+            for value in (
+                "2020-09-08",
+                "2020-09-08",
+                "2020-09-15",
+                "2020-09-15",
+                "2020-09-22",
+            )
+        )
+        if parsed != expected:
+            raise RuntimeError(
+                "H&M 고정 test는 2020-09-08까지 학습 후 "
+                "2020-09-09--15여야 합니다"
+            )
+    else:
+        raise ValueError(f"지원하지 않는 test dataset: {dataset}")
     expected_status = {
         "val": "merged_into_train",
         "test": "constructed",
@@ -279,7 +330,7 @@ def _prepare(cfg: M5EconomicPositiveTestConfig) -> dict:
     revision = moe.source_revision()
     base_cfg = _base_config(cfg)
     data = v3.prepare_data(base_cfg, v3.DCFG)
-    validate_final_test_data(data)
+    validate_final_test_data(data, cfg.dataset)
     if data.get("loss_w") is not None:
         raise RuntimeError("M5 자체 구현 외의 표본 가중치가 섞였습니다")
     data["loss_w"] = None
@@ -334,7 +385,7 @@ def _screen_config(
     return screen.M5EconomicPositiveConfig(
         dataset=cfg.dataset,
         seed=seed,
-        time_cutoff=711,
+        time_cutoff=711 if cfg.dataset == "dunnhumby" else None,
         evaluation_days=7,
         epochs=cfg.epochs,
         id_dim=cfg.id_dim,
@@ -693,7 +744,11 @@ def _persist(
             "interpretation": {
                 "selection": "none; test is not used for model, epoch, or hyperparameter selection",
                 "single_seed": "seed 42 is descriptive and does not establish stability or significance",
-                "final_reporting": "use the frozen seeds 42--51 mean after the protocol check",
+                "final_reporting": (
+                    "report H&M seed 42 as a descriptive cross-dataset check only"
+                    if cfg.dataset == "hm"
+                    else "use the frozen seeds 42--51 mean after the protocol check"
+                ),
                 "seed42_reuse": (
                     "the completed seed-42 test result was reused without retraining or reevaluation"
                     if cfg.seeds == FULL_SEEDS
