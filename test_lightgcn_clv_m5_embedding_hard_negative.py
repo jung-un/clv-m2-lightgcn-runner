@@ -238,3 +238,19 @@ def test_colab_runs_one_seed42_screen_without_protected_evaluation():
     assert "EVAL_TEST=True" not in source
     assert "EVAL_HOLDOUT=True" not in source
     assert "PIN_AFTER_LOCAL_COMMIT" not in source
+
+
+def test_v2_colab_runs_id_selected_screen_without_protected_evaluation():
+    notebook_path = Path(
+        "clv_m5_id_selected_hard_negative_dunnhumby_colab.ipynb"
+    )
+    assert notebook_path.exists()
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+    assert source.count("result_df = run_m5_screen(cfg)") == 1
+    assert "7050200f1914b415e05ce5283b564c26962650ed" in source
+    assert "previous_m5_result_dir" in source
+    assert "EVAL_TEST=True" not in source
+    assert "EVAL_HOLDOUT=True" not in source
