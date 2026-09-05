@@ -300,3 +300,18 @@ def test_v2_colab_leaves_old_checkout_before_removing_it():
     leave_checkout = setup_source.index("os.chdir('/content')")
     remove_checkout = setup_source.index("shutil.rmtree(repo)")
     assert leave_checkout < remove_checkout
+
+
+def test_v2_colab_drops_stale_project_modules_after_reclone():
+    notebook = json.loads(
+        Path(
+            "clv_m5_id_selected_hard_negative_dunnhumby_colab.ipynb"
+        ).read_text(encoding="utf-8")
+    )
+    setup_source = "".join(notebook["cells"][1].get("source", []))
+
+    assert "for module_name in tuple(sys.modules)" in setup_source
+    assert "del sys.modules[module_name]" in setup_source
+    assert setup_source.index("del sys.modules[module_name]") < setup_source.index(
+        "%cd /content/clv-m2-lightgcn-runner"
+    )
