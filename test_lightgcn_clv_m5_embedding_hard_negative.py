@@ -272,3 +272,18 @@ def test_v2_colab_runs_id_selected_screen_without_protected_evaluation():
     assert "previous_m5_result_dir" in source
     assert "EVAL_TEST=True" not in source
     assert "EVAL_HOLDOUT=True" not in source
+
+
+def test_v2_colab_retries_clone_and_surfaces_git_error():
+    notebook = json.loads(
+        Path(
+            "clv_m5_id_selected_hard_negative_dunnhumby_colab.ipynb"
+        ).read_text(encoding="utf-8")
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "for clone_attempt in range(1, 4)" in source
+    assert "capture_output=True" in source
+    assert "clone_result.stderr" in source
