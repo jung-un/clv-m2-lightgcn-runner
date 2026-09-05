@@ -1,0 +1,122 @@
+import json
+from pathlib import Path
+
+import pytest
+
+import lightgcn_clv_m5_economic_positive_weight_test as final_test
+
+
+def _config(tmp_path, **overrides):
+    return final_test.configure_m5_economic_positive_test_run(
+        out_dir=str(tmp_path / "results_m5_test"),
+        **overrides,
+    )
+
+
+def test_default_run_is_one_seed_test_only_without_validation_or_holdout(tmp_path):
+    cfg = _config(tmp_path)
+    summary = final_test.preflight_summary(cfg)
+    base = final_test._base_config(cfg)
+
+    assert cfg.seeds == (42,)
+    assert summary["planned_full_seeds"] == list(range(42, 52))
+    assert summary["training_data"] == "DAY 1--697 (former train + validation)"
+    assert summary["test_data"] == "DAY 698--704"
+    assert summary["validation_constructed"] is False
+    assert summary["validation_selection"] is False
+    assert summary["early_stopping"] is False
+    assert summary["post_test_rows"] == "DAY 705--711 ignored"
+    assert summary["holdout_evaluation"] is False
+    assert base["TRAIN_ON_VAL"] is True
+    assert base["EVAL_TEST"] is True
+    assert base["EVAL_HOLDOUT"] is False
+    assert base["HOLDOUT_DAYS"] == 7
+    assert base["TIME_CUTOFF"] is None
+
+
+def test_test_protocol_keeps_the_frozen_m5_architecture_and_six_arms(tmp_path):
+    summary = final_test.preflight_summary(_config(tmp_path))
+
+    assert summary["models"] == list(final_test.MODEL_IDS)
+    assert summary["m2"]["rho"] == pytest.approx(0.15)
+    assert summary["m2"]["economic_bins"] == 4
+    assert summary["m2"]["shrinkage_strength"] == pytest.approx(10.0)
+    assert summary["m4_prime"]["lambda"] == pytest.approx(0.5)
+    assert summary["m4_prime"]["negative_count"] == 5
+    assert summary["test_evaluation"] == (
+        "one final-checkpoint evaluation per seed/model; completed results are cached"
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("epochs", 99),
+        ("rho", 0.05),
+        ("positive_weight_lambda", 0.2),
+        ("economic_bins", 3),
+        ("shrinkage_strength", 0.0),
+        ("negative_count", 1),
+        ("n_layers", 1),
+        ("seeds", (43,)),
+    ],
+)
+def test_seed42_protocol_rejects_model_or_seed_changes(tmp_path, name, value):
+    with pytest.raises(ValueError, match="M5 test-only"):
+        _config(tmp_path, **{name: value})
+
+
+def test_split_guard_rejects_validation_or_wrong_final_boundaries():
+    valid = {
+        "splits": {"test": (object(), object())},
+        "data_stats": {
+            "split_boundaries": {
+                "train": {"end_inclusive": 697.0},
+                "test": {"start_exclusive": 697.0, "end_inclusive": 704.0},
+                "holdout": {"start_exclusive": 704.0, "end_inclusive": 711.0},
+            },
+            "split_evaluation_status": {
+                "val": "merged_into_train",
+                "test": "constructed",
+                "holdout": "not_constructed",
+            },
+        },
+    }
+    final_test.validate_final_test_data(valid)
+
+    contaminated = {
+        **valid,
+        "splits": {"val": (object(), object()), "test": (object(), object())},
+    }
+    with pytest.raises(RuntimeError, match="test split"):
+        final_test.validate_final_test_data(contaminated)
+
+    wrong_boundary = {
+        **valid,
+        "data_stats": {
+            **valid["data_stats"],
+            "split_boundaries": {
+                **valid["data_stats"]["split_boundaries"],
+                "test": {"start_exclusive": 704.0, "end_inclusive": 711.0},
+            },
+        },
+    }
+    with pytest.raises(RuntimeError, match="DAY 698--704"):
+        final_test.validate_final_test_data(wrong_boundary)
+
+
+def test_colab_starts_one_seed_test_only_run_once():
+    notebook = json.loads(
+        Path(
+            "clv_m5_economic_positive_weight_dunnhumby_test_seed42_colab.ipynb"
+        ).read_text(encoding="utf-8")
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert source.count("result_df = run_m5_economic_positive_test(cfg)") == 1
+    assert "configure_m5_economic_positive_test_run" in source
+    assert "cfg.seeds == (42,)" in source
+    assert "summary['validation_constructed'] is False" in source
+    assert "summary['holdout_evaluation'] is False" in source
