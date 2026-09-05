@@ -199,3 +199,25 @@ def test_colab_starts_one_seed_test_only_run_once():
     assert "cfg.seeds == (42,)" in source
     assert "summary['validation_constructed'] is False" in source
     assert "summary['holdout_evaluation'] is False" in source
+
+
+def test_multiseed_colab_reuses_seed42_and_runs_frozen_full_seeds_once():
+    notebook = json.loads(
+        Path(
+            "clv_m5_economic_positive_weight_dunnhumby_test_multiseed_colab.ipynb"
+        ).read_text(encoding="utf-8")
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert source.count("result_df = run_m5_economic_positive_test(cfg)") == 1
+    assert "seeds=FULL_SEEDS" in source
+    assert "reused_seed42_json=PILOT_RESULT" in source
+    assert "m5_economic_positive_weight_test_b22a507c8ab5.json" in source
+    assert "cfg.seeds == tuple(range(42, 52))" in source
+    assert "train seeds 43--51 only" in source
+    assert "summary['validation_constructed'] is False" in source
+    assert "summary['holdout_evaluation'] is False" in source
+    assert "28cf7b2ab8ad0f9e05a1ff8f0af02da378da845d" in source
+    assert "TO_BE_PINNED" not in source
