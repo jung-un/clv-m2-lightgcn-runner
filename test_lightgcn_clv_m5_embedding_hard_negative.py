@@ -268,7 +268,7 @@ def test_v2_colab_runs_id_selected_screen_without_protected_evaluation():
         "".join(cell.get("source", [])) for cell in notebook["cells"]
     )
     assert source.count("result_df = run_m5_screen(cfg)") == 1
-    assert "7050200f1914b415e05ce5283b564c26962650ed" in source
+    assert "4737718851babe7ef9d03d9593f882207d0548b6" in source
     assert "previous_m5_result_dir" in source
     assert "EVAL_TEST=True" not in source
     assert "EVAL_HOLDOUT=True" not in source
