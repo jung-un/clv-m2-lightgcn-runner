@@ -158,7 +158,7 @@ def _metrics(increment=0.0):
         "price_purchase_amount_weighted_hit@10": 0.380 + increment,
         "고CLV_recall@10": 0.010 + increment,
         "고CLV_ndcg@10": 0.011 + increment,
-        "고CLV_price_purchase_amount_weighted_hit@10": 0.100 + increment,
+        "고CLV_revenue@10": 0.100 + increment,
         "coverage@10": 0.005,
         "n_distinct@10": 450.0,
         "top10_share@10": 0.32,
@@ -174,6 +174,26 @@ def _passing_metric_rows():
         m5.M5_MODEL_ID: _metrics(0.0020),
         m5.M5_SHUFFLED_MODEL_ID: _metrics(0.0015),
     }
+
+
+def test_screen_accepts_actual_public_segment_metric_schema():
+    rows = _passing_metric_rows()
+
+    decision = m5.screening_reading(rows)
+
+    assert decision["high_clv_weighted_hit@10_delta_vs_m1"] == pytest.approx(
+        0.002
+    )
+
+
+def test_reporting_fix_reuses_completed_v2_training_cache():
+    cfg = m5.configure_m5_run(
+        out_dir="/tmp/m5",
+        baseline_result_dir="/tmp/baseline",
+        previous_m5_result_dir="/tmp/previous",
+    )
+
+    assert m5._training_config_hash(cfg, "input-hash") == "692f69689233"
 
 
 def test_screen_requires_synergy_m4_gain_and_joint_clv_attribution():
@@ -207,11 +227,9 @@ def test_v2_screen_requires_economic_gain_over_v1_and_high_clv_gain_over_m1():
     assert failed["positive_screen"] is False
 
     no_high_clv_gain = _passing_metric_rows()
-    no_high_clv_gain[m5.M5_MODEL_ID][
-        "고CLV_price_purchase_amount_weighted_hit@10"
-    ] = no_high_clv_gain[m5.M1_K5_MODEL_ID][
-        "고CLV_price_purchase_amount_weighted_hit@10"
-    ]
+    no_high_clv_gain[m5.M5_MODEL_ID]["고CLV_revenue@10"] = no_high_clv_gain[
+        m5.M1_K5_MODEL_ID
+    ]["고CLV_revenue@10"]
     failed = m5.screening_reading(no_high_clv_gain)
     assert failed["high_clv_pass"] is False
     assert failed["positive_screen"] is False

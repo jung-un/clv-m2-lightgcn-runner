@@ -30,7 +30,9 @@ import lightgcn_clv_moe as moe
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m5-id-selected-hard-negative-historical-screen-v2"
+CODE_VERSION = "m5-id-selected-hard-negative-historical-screen-v2.1"
+TRAINING_CACHE_CODE_VERSION = "m5-id-selected-hard-negative-historical-screen-v2"
+TRAINING_CACHE_SOURCE_REVISION = "7050200f1914b415e05ce5283b564c26962650ed"
 PREVIOUS_CODE_VERSION = "m5-m2-m4-joint-historical-screen-v1"
 M1_K5_MODEL_ID = "m1_multineg_mean_k5"
 M2_K5_MODEL_ID = "m2_clv_embedding_multineg_mean_k5"
@@ -64,6 +66,9 @@ INTERACTION_METRICS = ACCURACY_METRICS + (
     "고CLV_recall@10",
     "고CLV_ndcg@10",
 )
+# Segment metrics keep the evaluator's legacy internal name.  Only pooled
+# ``revenue`` is converted to the public weighted-hit label.
+HIGH_CLV_WEIGHTED_METRIC = "고CLV_revenue@10"
 
 
 @dataclass(frozen=True)
@@ -211,14 +216,31 @@ def _canonical(value) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
 
 
-def _config_hash(cfg: M5Config, input_hash: str, revision: str) -> str:
+def _config_hash(
+    cfg: M5Config,
+    input_hash: str,
+    revision: str,
+    *,
+    code_version: str = CODE_VERSION,
+) -> str:
     payload = {
-        "code_version": CODE_VERSION,
+        "code_version": code_version,
         "config": asdict(cfg),
         "input_hash": input_hash,
         "source_revision": revision,
     }
     return hashlib.sha256(_canonical(payload).encode()).hexdigest()[:12]
+
+
+def _training_config_hash(cfg: M5Config, input_hash: str) -> str:
+    """Keep the completed v2 arm cache for this reporting-only correction."""
+
+    return _config_hash(
+        cfg,
+        input_hash,
+        TRAINING_CACHE_SOURCE_REVISION,
+        code_version=TRAINING_CACHE_CODE_VERSION,
+    )
 
 
 def _m2_config(cfg: M5Config) -> m2.ConstrainedEconomicConfig:
@@ -251,9 +273,7 @@ def _prepare(cfg: M5Config) -> dict:
     prepared["degree_matched_shuffle"] = m2._degree_matched_clv_shuffle(
         prepared, cfg
     )
-    prepared["config_hash"] = _config_hash(
-        cfg, prepared["input_hash"], prepared["revision"]
-    )
+    prepared["config_hash"] = _training_config_hash(cfg, prepared["input_hash"])
     return prepared
 
 
@@ -698,7 +718,7 @@ def screening_reading(metric_rows: dict[str, dict]) -> dict:
     high_ndcg_vs_shuffle = float(
         m5_metrics["고CLV_ndcg@10"] - shuffled["고CLV_ndcg@10"]
     )
-    high_weighted_metric = "고CLV_price_purchase_amount_weighted_hit@10"
+    high_weighted_metric = HIGH_CLV_WEIGHTED_METRIC
     high_weighted_vs_m1 = float(
         m5_metrics[high_weighted_metric] - m1_metrics[high_weighted_metric]
     )
