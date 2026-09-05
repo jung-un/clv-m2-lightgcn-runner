@@ -179,3 +179,27 @@ def test_screen_requires_baseline_and_attribution_but_not_interaction():
     assert reading["positive_screen"] is True
     assert reading["primary_interaction_effect_descriptive"] < 0.0
     assert reading["interaction_required"] is False
+
+
+def test_test_runner_selects_new_screen_without_leaking_global_patch(
+    tmp_path, monkeypatch
+):
+    legacy_screen = test_runner.base.screen
+    captured = {}
+
+    def fake_run(cfg):
+        captured["screen"] = test_runner.base.screen
+        captured["code_version"] = test_runner.base.CODE_VERSION
+        return pd.DataFrame([{"ok": True}])
+
+    monkeypatch.setattr(test_runner.base, "run_m5_economic_positive_test", fake_run)
+    cfg = test_runner.configure_m5_nv_economic_positive_test_run(
+        out_dir=str(tmp_path / "results")
+    )
+
+    result = test_runner.run_m5_nv_economic_positive_test(cfg)
+
+    assert bool(result.iloc[0]["ok"])
+    assert captured["screen"] is runner
+    assert captured["code_version"] == test_runner.CODE_VERSION
+    assert test_runner.base.screen is legacy_screen
