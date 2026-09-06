@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+import clv_m5_economic_positive_weight_model as weight_model
 from clv_m5_nv_economic_positive_weight_model import M5NVEconomicLightGCN
 import lightgcn_clv_m5_nv_economic_positive_weight as runner
 import lightgcn_clv_m5_nv_economic_positive_weight_test as test_runner
@@ -119,6 +120,45 @@ def test_inputs_expose_n_and_v_but_not_category_price():
     )
     assert built["economic_input_diagnostics"]["category_relative_amount_used"] is False
     assert np.isfinite(built["user_mean_economic_position"]).all()
+    assert built["user_bin_fit"].shape == (3, 4)
+    population = built["population_spend_profile"]
+    shrunken_profile = population[None, :] + built["user_economic_input"][:, 1:]
+    expected_fit = np.clip(shrunken_profile / population[None, :], 0.0, 2.0)
+    np.testing.assert_allclose(built["user_bin_fit"], expected_fit, atol=1e-6)
+
+
+def test_personalized_positive_weight_rewards_amount_and_user_bin_fit():
+    personalized = getattr(
+        weight_model, "personalized_positive_row_weights", None
+    )
+    assert personalized is not None
+    actual = personalized(
+        torch.tensor([0.0, 1.0, 1.0]),
+        torch.tensor([0.2, 0.4, 0.8]),
+        torch.tensor([2.0, 0.5, 1.0]),
+        train_mean_raw_weight=1.0,
+        lambda_=0.5,
+    )
+    torch.testing.assert_close(actual, torch.tensor([1.0, 1.1, 1.4]))
+
+
+def test_personalized_weight_normalizer_matches_training_rows():
+    prepared = {
+        "data": {
+            "tr_u": np.array([0, 1]),
+            "tr_i": np.array([0, 1]),
+        },
+        "item_amount_percentile": np.array([0.2, 0.8]),
+        "item_bin": np.array([0, 1]),
+    }
+    assignment = {
+        "q_c": np.array([1.0, 0.5]),
+        "user_bin_fit": np.array([[2.0, 0.0], [0.0, 0.5]]),
+    }
+    normalizer = runner.legacy._train_weight_normalizer(
+        prepared, assignment, 0.5
+    )
+    assert normalizer == 1.15
 
 
 def test_joint_shuffle_moves_q_n_with_the_complete_user_tuple():
@@ -137,6 +177,10 @@ def test_joint_shuffle_moves_q_n_with_the_complete_user_tuple():
             shuffled["user_economic_input"][target],
             prepared["user_economic_input"][source],
         )
+        np.testing.assert_array_equal(
+            shuffled["user_bin_fit"][target],
+            prepared["user_bin_fit"][source],
+        )
 
 
 def test_preflight_describes_explicit_nv_and_test_only_protocol(tmp_path):
@@ -148,6 +192,7 @@ def test_preflight_describes_explicit_nv_and_test_only_protocol(tmp_path):
     assert summary["holdout_evaluation"] is False
     assert summary["m2"]["q_n"] == "post-projection strength gate only"
     assert summary["m2"]["q_c_used_in_m2"] is False
+    assert "clipped_user_bin_fit" in summary["m4_prime"]["formula"]
     assert summary["decision"]["interaction_required"] is False
 
 

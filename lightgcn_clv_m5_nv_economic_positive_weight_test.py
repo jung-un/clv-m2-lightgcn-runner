@@ -18,7 +18,7 @@ import lightgcn_clv_residual as residual
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m5-explicit-nv-economic-positive-weighting-test-only-v1"
+CODE_VERSION = "m5-explicit-nv-personalized-economic-positive-weighting-test-only-v2"
 M5NVEconomicPositiveTestConfig = base.M5EconomicPositiveTestConfig
 PILOT_SEEDS = base.PILOT_SEEDS
 _LEGACY_PREFLIGHT = base.preflight_summary
@@ -32,7 +32,7 @@ def configure_m5_nv_economic_positive_test_run(
         "seeds": PILOT_SEEDS,
         "out_dir": (
             f"{v3.default_out_dir('dunnhumby')}"
-            "_m5_explicit_nv_economic_positive_weighting_test_seed42_v1"
+            "_m5_explicit_nv_personalized_economic_positive_weighting_test_seed42_v2"
         ),
     }
     cfg = M5NVEconomicPositiveTestConfig(**(defaults | overrides))
@@ -71,8 +71,14 @@ def preflight_summary(cfg: M5NVEconomicPositiveTestConfig) -> dict:
     }
     summary["m4_prime"].update(
         {
-            "q_c_role": "positive-row learning priority only",
-            "formula": "1 + lambda*q_C*(2*item_amount_percentile-1)",
+            "q_c_role": "personalized positive-row learning priority only",
+            "formula": (
+                "1 + lambda*q_C*item_amount_percentile*"
+                "clipped_user_bin_fit"
+            ),
+            "user_bin_fit": (
+                "clip(shrunken_user_spend_share / population_spend_share, 0, 2)"
+            ),
         }
     )
     summary["decision"] = {
@@ -156,6 +162,7 @@ def _prepare_seed_assignments(prepared: dict, seed: int, degree_bins: int) -> No
         "user_activity_gate": prepared["user_activity_gate"],
         "user_economic_input": prepared["user_economic_input"],
         "user_economic_valid": prepared["user_economic_valid"],
+        "user_bin_fit": prepared["user_bin_fit"],
     }
 
 

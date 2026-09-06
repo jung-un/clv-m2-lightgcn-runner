@@ -12,10 +12,10 @@ import lightgcn_clv_v3 as v3
 
 M1_MODEL_ID = "m1_multineg_mean_k5_nv_factorial"
 M2_MODEL_ID = "m2_explicit_nv_economic_embedding_multineg_mean_k5"
-M4P_MODEL_ID = "m4_clv_positive_amount_weight_k5_nv_factorial"
-M5_MODEL_ID = "m5_explicit_nv_economic_embedding_positive_amount_weight_k5"
-M5_SHUFFLED_MODEL_ID = "m5_explicit_nv_degree_matched_joint_shuffle"
-M5_DEGREE_GATE_MODEL_ID = "m5_explicit_nv_degree_loss_gate"
+M4P_MODEL_ID = "m4_clv_personalized_economic_positive_weight_k5_nv_factorial"
+M5_MODEL_ID = "m5_explicit_nv_personalized_economic_positive_weight_k5"
+M5_SHUFFLED_MODEL_ID = "m5_explicit_nv_personalized_degree_matched_joint_shuffle"
+M5_DEGREE_GATE_MODEL_ID = "m5_explicit_nv_personalized_degree_loss_gate"
 MODEL_IDS = (
     M1_MODEL_ID,
     M2_MODEL_ID,
@@ -28,9 +28,9 @@ ACCURACY_METRICS = legacy.ACCURACY_METRICS
 PRIMARY_METRIC = legacy.PRIMARY_METRIC
 M5EconomicPositiveConfig = legacy.M5EconomicPositiveConfig
 
-# The M4 loss, optimizer, negative sampler, checkpointing, and diagnostics stay
-# byte-for-byte on the already exercised path.  Only the M2 inputs/model below
-# are changed in this experiment.
+# The optimizer, uniform negative sampler, checkpointing, and diagnostics stay
+# on the exercised path. This variant supplies a user-bin fit multiplier to the
+# positive-row weight while retaining the same single weighted BPR objective.
 _arm_hash = legacy._arm_hash
 _arm_paths = legacy._arm_paths
 _train_arm = legacy._train_arm
@@ -137,6 +137,14 @@ def build_nv_economic_inputs(
 
     # The shrunken profile equals population + reliability*(raw-population).
     shrunken_profile = population[None, :] + centered_profile
+    user_bin_fit = np.divide(
+        shrunken_profile,
+        population[None, :],
+        out=np.zeros_like(shrunken_profile),
+        where=population[None, :] > 0.0,
+    )
+    user_bin_fit = np.clip(user_bin_fit, 0.0, 2.0)
+    user_bin_fit[~user_valid] = 0.0
     bin_centers = (np.arange(n_bins, dtype=np.float64) + 0.5) / n_bins
     mean_economic_position = shrunken_profile @ bin_centers
     mean_economic_position[~user_valid] = 0.0
@@ -161,6 +169,11 @@ def build_nv_economic_inputs(
             "implied_mean_economic_position_std": float(
                 mean_economic_position[user_valid].std()
             ),
+            "user_bin_fit_mean": float(user_bin_fit[user_valid].mean()),
+            "user_bin_fit_std": float(user_bin_fit[user_valid].std()),
+            "user_bin_fit_cap_share": float(
+                np.mean(user_bin_fit[user_valid] >= 2.0)
+            ),
         }
     )
     built.update(
@@ -171,6 +184,7 @@ def build_nv_economic_inputs(
             "user_economic_input": user_input.astype(np.float32),
             "item_economic_input": item_input.astype(np.float32),
             "population_spend_profile": population.astype(np.float32),
+            "user_bin_fit": user_bin_fit.astype(np.float32),
             "user_mean_economic_position": mean_economic_position.astype(np.float32),
             "economic_input_diagnostics": diagnostics,
         }
@@ -193,6 +207,7 @@ def joint_degree_matched_shuffle(
             "user_activity_gate": np.asarray(prepared["user_activity_gate"])[
                 source
             ].copy(),
+            "user_bin_fit": np.asarray(prepared["user_bin_fit"])[source].copy(),
         }
     )
     return shuffled

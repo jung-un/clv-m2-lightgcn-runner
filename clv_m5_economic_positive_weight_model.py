@@ -37,6 +37,49 @@ def positive_row_weights(
     return raw / float(train_mean_raw_weight)
 
 
+def personalized_positive_row_weights(
+    q_c: torch.Tensor,
+    item_amount_percentile: torch.Tensor,
+    user_bin_fit: torch.Tensor,
+    *,
+    train_mean_raw_weight: float,
+    lambda_: float = 0.5,
+) -> torch.Tensor:
+    """Weight valuable positives only when their economic bin fits the user."""
+
+    if not (
+        q_c.ndim == 1
+        and item_amount_percentile.shape == q_c.shape
+        and user_bin_fit.shape == q_c.shape
+    ):
+        raise ValueError("q_c·amount percentile·경제구간 적합도 shape이 같아야 합니다")
+    if not all(
+        torch.isfinite(value).all()
+        for value in (q_c, item_amount_percentile, user_bin_fit)
+    ):
+        raise ValueError("양성 가중치 입력은 유한해야 합니다")
+    if torch.any((q_c < 0.0) | (q_c > 1.0)):
+        raise ValueError("q_c 범위는 [0,1]이어야 합니다")
+    if torch.any(
+        (item_amount_percentile < 0.0) | (item_amount_percentile > 1.0)
+    ):
+        raise ValueError("amount percentile 범위는 [0,1]이어야 합니다")
+    if torch.any((user_bin_fit < 0.0) | (user_bin_fit > 2.0)):
+        raise ValueError("경제구간 적합도 범위는 [0,2]여야 합니다")
+    if not 0.0 <= float(lambda_) <= 1.0:
+        raise ValueError("lambda는 [0,1]이어야 합니다")
+    if not math.isfinite(float(train_mean_raw_weight)) or train_mean_raw_weight <= 0:
+        raise ValueError("normalizer는 양의 유한값이어야 합니다")
+    raw = (
+        1.0
+        + float(lambda_)
+        * q_c
+        * item_amount_percentile
+        * user_bin_fit
+    )
+    return raw / float(train_mean_raw_weight)
+
+
 def weighted_multi_negative_bpr(
     positive_scores: torch.Tensor,
     negative_scores: torch.Tensor,

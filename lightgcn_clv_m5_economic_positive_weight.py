@@ -16,6 +16,7 @@ import torch
 
 from clv_m5_economic_positive_weight_model import (
     M5EconomicLightGCN,
+    personalized_positive_row_weights,
     positive_row_weights,
     weighted_multi_negative_bpr,
 )
@@ -473,9 +474,14 @@ def _train_weight_normalizer(
 ) -> float:
     users = prepared["data"]["tr_u"]
     items = prepared["data"]["tr_i"]
-    raw = 1.0 + lambda_ * np.asarray(assignment["q_c"])[users] * (
-        2.0 * prepared["item_amount_percentile"][items] - 1.0
-    )
+    q_c = np.asarray(assignment["q_c"])[users]
+    amount = np.asarray(prepared["item_amount_percentile"])[items]
+    if "user_bin_fit" in assignment:
+        bins = np.asarray(prepared["item_bin"])[items]
+        fit = np.asarray(assignment["user_bin_fit"])[users, bins]
+        raw = 1.0 + lambda_ * q_c * amount * fit
+    else:
+        raw = 1.0 + lambda_ * q_c * (2.0 * amount - 1.0)
     mean = float(np.mean(raw))
     if not np.isfinite(mean) or mean <= 0:
         raise RuntimeError("양성 가중치 전역 정규화값이 잘못됐습니다")
@@ -534,6 +540,16 @@ def _train_arm(
     amount_all = torch.as_tensor(
         prepared["item_amount_percentile"], device=v3.DEVICE
     )
+    fit_all = (
+        torch.as_tensor(spec["assignment"]["user_bin_fit"], device=v3.DEVICE)
+        if "user_bin_fit" in spec["assignment"]
+        else None
+    )
+    item_bin_all = (
+        torch.as_tensor(prepared["item_bin"], dtype=torch.long, device=v3.DEVICE)
+        if fit_all is not None
+        else None
+    )
     normalizer = _train_weight_normalizer(
         prepared, spec["assignment"], cfg.positive_weight_lambda
     )
@@ -582,12 +598,21 @@ def _train_arm(
                 user_z[users, None, :] * item_z[negatives]
             ).sum(dim=2)
             if spec["weighted"]:
-                row_weights = positive_row_weights(
-                    q_all[users],
-                    amount_all[positives],
-                    train_mean_raw_weight=normalizer,
-                    lambda_=cfg.positive_weight_lambda,
-                )
+                if fit_all is None:
+                    row_weights = positive_row_weights(
+                        q_all[users],
+                        amount_all[positives],
+                        train_mean_raw_weight=normalizer,
+                        lambda_=cfg.positive_weight_lambda,
+                    )
+                else:
+                    row_weights = personalized_positive_row_weights(
+                        q_all[users],
+                        amount_all[positives],
+                        fit_all[users, item_bin_all[positives]],
+                        train_mean_raw_weight=normalizer,
+                        lambda_=cfg.positive_weight_lambda,
+                    )
             else:
                 row_weights = torch.ones_like(positive_scores)
             bpr, diagnostics = weighted_multi_negative_bpr(
