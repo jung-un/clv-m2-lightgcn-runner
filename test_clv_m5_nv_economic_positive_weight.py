@@ -285,6 +285,29 @@ def test_hm_colab_runs_explicit_nv_personalized_m5_once():
     assert "TO_BE_PINNED" not in source
 
 
+def test_dunnhumby_multiseed_colab_reuses_seed42_and_runs_remaining_seeds():
+    notebook = json.loads(
+        Path(
+            "clv_m5_explicit_nv_personalized_economic_positive_weight_"
+            "dunnhumby_test_multiseed_colab.ipynb"
+        ).read_text(encoding="utf-8")
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert source.count("result_df = run_m5_nv_economic_positive_test(cfg)") == 1
+    assert "seeds=FULL_SEEDS" in source
+    assert "reused_seed42_json=PILOT_RESULT" in source
+    assert "m5_economic_positive_weight_test_dbef3f3aa752.json" in source
+    assert "cfg.seeds == tuple(range(42, 52))" in source
+    assert "train seeds 43--51 only" in source
+    assert "summary['validation_constructed'] is False" in source
+    assert "summary['holdout_evaluation'] is False" in source
+    assert "857302557f91c20aa8b4e9caa0b112c04f9dabfe" in source
+    assert "TO_BE_PINNED" not in source
+
+
 def test_screen_requires_baseline_and_attribution_but_not_interaction():
     metrics = {
         name: {
