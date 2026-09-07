@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -227,6 +230,32 @@ def test_hm_explicit_nv_runner_rejects_changed_batch_size(tmp_path):
             batch_size=65_536,
             out_dir=str(tmp_path / "hm-results"),
         )
+
+
+def test_hm_colab_runs_explicit_nv_personalized_m5_once():
+    notebook = json.loads(
+        Path(
+            "clv_m5_explicit_nv_personalized_economic_positive_weight_"
+            "hm2y_test_seed42_colab.ipynb"
+        ).read_text(encoding="utf-8")
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert source.count("result_df = run_m5_nv_economic_positive_test(cfg)") == 1
+    assert "configure_m5_nv_economic_positive_test_run" in source
+    assert "dataset='hm'" in source
+    assert "seeds=(42,)" in source
+    assert "batch_size=131_072" in source
+    assert "through 2020-09-08 (former train + validation)" in source
+    assert "2020-09-09--15" in source
+    assert "summary['validation_constructed'] is False" in source
+    assert "summary['holdout_evaluation'] is False" in source
+    assert "summary['m2']['q_n']" in source
+    assert "clipped_user_bin_fit" in source
+    assert "57a5e260d9bf10ee67aa9c873c58fec577297b5c" in source
+    assert "TO_BE_PINNED" not in source
 
 
 def test_screen_requires_baseline_and_attribution_but_not_interaction():
