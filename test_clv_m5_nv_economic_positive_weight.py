@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 import clv_m5_economic_positive_weight_model as weight_model
@@ -194,6 +195,38 @@ def test_preflight_describes_explicit_nv_and_test_only_protocol(tmp_path):
     assert summary["m2"]["q_c_used_in_m2"] is False
     assert "clipped_user_bin_fit" in summary["m4_prime"]["formula"]
     assert summary["decision"]["interaction_required"] is False
+
+
+def test_hm_preflight_keeps_explicit_nv_personalized_test_protocol(tmp_path):
+    cfg = test_runner.configure_m5_nv_economic_positive_test_run(
+        dataset="hm",
+        seeds=(42,),
+        out_dir=str(tmp_path / "hm-results"),
+    )
+    summary = test_runner.preflight_summary(cfg)
+
+    assert cfg.batch_size == 131_072
+    assert summary["dataset"] == "hm"
+    assert summary["period"] == "full_history_about_2_years"
+    assert summary["training_data"] == (
+        "through 2020-09-08 (former train + validation)"
+    )
+    assert summary["test_data"] == "2020-09-09--15"
+    assert summary["validation_constructed"] is False
+    assert summary["holdout_evaluation"] is False
+    assert summary["m2"]["q_n"] == "post-projection strength gate only"
+    assert summary["m2"]["q_c_used_in_m2"] is False
+    assert "clipped_user_bin_fit" in summary["m4_prime"]["formula"]
+
+
+def test_hm_explicit_nv_runner_rejects_changed_batch_size(tmp_path):
+    with pytest.raises(ValueError, match="batch_size=131072"):
+        test_runner.configure_m5_nv_economic_positive_test_run(
+            dataset="hm",
+            seeds=(42,),
+            batch_size=65_536,
+            out_dir=str(tmp_path / "hm-results"),
+        )
 
 
 def test_screen_requires_baseline_and_attribution_but_not_interaction():

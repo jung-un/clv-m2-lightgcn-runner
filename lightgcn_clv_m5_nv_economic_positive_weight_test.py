@@ -18,7 +18,7 @@ import lightgcn_clv_residual as residual
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m5-explicit-nv-personalized-economic-positive-weighting-test-only-v2"
+CODE_VERSION = "m5-explicit-nv-personalized-economic-positive-weighting-test-only-v2.1"
 M5NVEconomicPositiveTestConfig = base.M5EconomicPositiveTestConfig
 PILOT_SEEDS = base.PILOT_SEEDS
 _LEGACY_PREFLIGHT = base.preflight_summary
@@ -27,18 +27,24 @@ _LEGACY_PREFLIGHT = base.preflight_summary
 def configure_m5_nv_economic_positive_test_run(
     **overrides,
 ) -> M5NVEconomicPositiveTestConfig:
+    dataset = overrides.get("dataset", "dunnhumby")
+    is_hm = dataset == "hm"
     defaults = {
-        "dataset": "dunnhumby",
+        "dataset": dataset,
         "seeds": PILOT_SEEDS,
+        "batch_size": 131_072 if is_hm else 8_192,
         "out_dir": (
-            f"{v3.default_out_dir('dunnhumby')}"
-            "_m5_explicit_nv_personalized_economic_positive_weighting_test_seed42_v2"
+            f"{v3.default_out_dir(dataset)}"
+            "_m5_explicit_nv_personalized_economic_positive_weighting_"
+            f"{'hm2y_' if is_hm else ''}test_seed42_v2"
         ),
     }
     cfg = M5NVEconomicPositiveTestConfig(**(defaults | overrides))
     cfg = base.validate_test_config(cfg)
-    if cfg.dataset != "dunnhumby" or cfg.seeds != PILOT_SEEDS:
-        raise ValueError("이 새 N/V 모형은 Dunnhumby seed 42 기술 실험만 허용합니다")
+    if cfg.seeds != PILOT_SEEDS:
+        raise ValueError("이 새 N/V 모형은 seed 42 단일 기술 실험만 허용합니다")
+    if cfg.dataset == "hm" and cfg.batch_size != 131_072:
+        raise ValueError("H&M 2년 seed 42 실행은 batch_size=131072로 고정합니다")
     if cfg.reused_seed42_json:
         raise ValueError("새 N/V 모형은 이전 seed 42 결과를 재사용할 수 없습니다")
     return cfg
@@ -53,7 +59,9 @@ def preflight_summary(cfg: M5NVEconomicPositiveTestConfig) -> dict:
             "models": list(screen.MODEL_IDS),
             "research_axis": "M5 partial combination: explicit-N/V M2 plus M4 loss",
             "protocol_status": (
-                "exploratory only because this Dunnhumby test interval was already exposed"
+                "H&M two-year seed-42 test-only cross-dataset check"
+                if cfg.dataset == "hm"
+                else "exploratory only because this Dunnhumby test interval was already exposed"
             ),
         }
     )
