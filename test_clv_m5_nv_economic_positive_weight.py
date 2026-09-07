@@ -232,6 +232,33 @@ def test_hm_explicit_nv_runner_rejects_changed_batch_size(tmp_path):
         )
 
 
+def test_dunnhumby_multiseed_reuses_completed_seed42_result(tmp_path):
+    seed42 = tmp_path / "m5_economic_positive_weight_test_dbef3f3aa752.json"
+    cfg = test_runner.configure_m5_nv_economic_positive_test_run(
+        dataset="dunnhumby",
+        seeds=test_runner.FULL_SEEDS,
+        reused_seed42_json=str(seed42),
+        out_dir=str(tmp_path / "multiseed-results"),
+    )
+    summary = test_runner.preflight_summary(cfg)
+
+    assert cfg.seeds == tuple(range(42, 52))
+    assert summary["current_scope"] == "frozen ten-seed final run"
+    assert summary["seed42_handling"] == (
+        "reuse the completed seed-42 test result; train seeds 43--51 only"
+    )
+    assert summary["reused_seed42_json"] == str(seed42)
+
+
+def test_dunnhumby_multiseed_requires_seed42_result(tmp_path):
+    with pytest.raises(ValueError, match="seed 42 결과 JSON"):
+        test_runner.configure_m5_nv_economic_positive_test_run(
+            dataset="dunnhumby",
+            seeds=test_runner.FULL_SEEDS,
+            out_dir=str(tmp_path / "multiseed-results"),
+        )
+
+
 def test_hm_colab_runs_explicit_nv_personalized_m5_once():
     notebook = json.loads(
         Path(

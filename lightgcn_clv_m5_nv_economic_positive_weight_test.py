@@ -18,9 +18,10 @@ import lightgcn_clv_residual as residual
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m5-explicit-nv-personalized-economic-positive-weighting-test-only-v2.1"
+CODE_VERSION = "m5-explicit-nv-personalized-economic-positive-weighting-test-only-v2"
 M5NVEconomicPositiveTestConfig = base.M5EconomicPositiveTestConfig
 PILOT_SEEDS = base.PILOT_SEEDS
+FULL_SEEDS = base.FULL_SEEDS
 _LEGACY_PREFLIGHT = base.preflight_summary
 
 
@@ -41,12 +42,11 @@ def configure_m5_nv_economic_positive_test_run(
     }
     cfg = M5NVEconomicPositiveTestConfig(**(defaults | overrides))
     cfg = base.validate_test_config(cfg)
-    if cfg.seeds != PILOT_SEEDS:
-        raise ValueError("이 새 N/V 모형은 seed 42 단일 기술 실험만 허용합니다")
-    if cfg.dataset == "hm" and cfg.batch_size != 131_072:
-        raise ValueError("H&M 2년 seed 42 실행은 batch_size=131072로 고정합니다")
-    if cfg.reused_seed42_json:
-        raise ValueError("새 N/V 모형은 이전 seed 42 결과를 재사용할 수 없습니다")
+    if cfg.dataset == "hm":
+        if cfg.seeds != PILOT_SEEDS:
+            raise ValueError("H&M의 새 N/V 모형은 seed 42만 허용합니다")
+        if cfg.batch_size != 131_072:
+            raise ValueError("H&M 2년 seed 42 실행은 batch_size=131072로 고정합니다")
     return cfg
 
 
