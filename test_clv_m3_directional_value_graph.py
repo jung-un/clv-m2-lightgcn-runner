@@ -7,6 +7,7 @@ from clv_m3_directional_value_graph import (
     ARM_SHUFFLE,
     build_directional_value_graph,
     build_mass_preserving_coefficients,
+    match_first_hop_gates,
 )
 
 
@@ -120,3 +121,39 @@ def test_all_three_active_arms_are_matched_to_the_same_first_hop_strength():
             atol=1e-6,
         )
 
+
+def test_external_gates_use_supplied_base_and_match_the_same_strength():
+    edge = (
+        _train()[["u_idx", "i_idx"]]
+        .drop_duplicates()
+        .sort_values(["u_idx", "i_idx"], kind="stable")
+    )
+    users = edge["u_idx"].to_numpy(np.int64)
+    items = edge["i_idx"].to_numpy(np.int64)
+    supplied_base = np.linspace(0.2, 0.7, len(edge))
+    gates = {
+        "actual": np.array([0.2, 0.8, 0.0]),
+        "shuffle": np.array([0.8, 0.2, 0.0]),
+        "relation_only": np.array([1.0, 1.0, 0.0]),
+    }
+    matched = match_first_hop_gates(
+        _train(),
+        users,
+        items,
+        supplied_base,
+        gates,
+        n_users=3,
+        target_strength=0.02,
+    )
+
+    np.testing.assert_allclose(matched.base_coefficients, supplied_base)
+    base_mass = np.bincount(users, weights=supplied_base, minlength=3)
+    for name, adjusted in matched.user_from_item_coefficients.items():
+        adjusted_mass = np.bincount(users, weights=adjusted, minlength=3)
+        np.testing.assert_allclose(adjusted_mass, base_mass, atol=1e-7)
+        assert matched.diagnostics["arms"][name]["target_reached"]
+        assert np.isclose(
+            matched.diagnostics["arms"][name]["first_hop_strength"],
+            0.02,
+            atol=1e-6,
+        )

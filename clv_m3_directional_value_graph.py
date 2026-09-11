@@ -49,6 +49,20 @@ class DirectionalValueGraph:
     diagnostics: dict
 
 
+@dataclass(frozen=True)
+class MatchedFirstHopGates:
+    """One train-only relation matched across externally supplied user gates."""
+
+    edge_users: np.ndarray
+    edge_items: np.ndarray
+    base_coefficients: np.ndarray
+    edge_contribution: np.ndarray
+    within_user_relation: np.ndarray
+    user_gates: dict[str, np.ndarray]
+    user_from_item_coefficients: dict[str, np.ndarray]
+    diagnostics: dict
+
+
 def _stats(values: np.ndarray) -> dict[str, float]:
     values = np.asarray(values, dtype=np.float64)
     if values.size == 0:
@@ -308,6 +322,124 @@ def _match_beta(
     return beta, coefficients, strength, True
 
 
+def match_first_hop_gates(
+    train: pd.DataFrame,
+    edge_users: np.ndarray,
+    edge_items: np.ndarray,
+    base_coefficients: np.ndarray,
+    user_gates: dict[str, np.ndarray],
+    *,
+    n_users: int,
+    target_strength: float = DEFAULT_TARGET_STRENGTH,
+    beta_cap: float = DEFAULT_BETA_CAP,
+) -> MatchedFirstHopGates:
+    """Match the same directional relation across precomputed user gates.
+
+    Unlike :func:`build_directional_value_graph`, this helper does not
+    reconstruct historical CLV or the binary LightGCN coefficients.  It uses
+    the gate arrays supplied by the caller and redistributes the exact
+    user-from-item coefficients extracted from the model being tested.
+    """
+    required = {"u_idx", "i_idx", "b_raw", "v"}
+    missing = required - set(train.columns)
+    if missing:
+        raise ValueError(f"directional M3 graph requires columns {sorted(missing)}")
+    edge_users = np.asarray(edge_users, dtype=np.int64)
+    edge_items = np.asarray(edge_items, dtype=np.int64)
+    base = np.asarray(base_coefficients, dtype=np.float64)
+    if not (edge_users.ndim == edge_items.ndim == base.ndim == 1):
+        raise ValueError("edge arrays must be one-dimensional")
+    if not (edge_users.shape == edge_items.shape == base.shape):
+        raise ValueError("edge arrays and base coefficients must be aligned")
+    if not len(base) or n_users <= 0:
+        raise ValueError("non-empty edge arrays and positive n_users are required")
+    if edge_users.min() < 0 or edge_users.max() >= n_users:
+        raise ValueError("edge user index is outside n_users")
+    if np.any(base <= 0) or not np.isfinite(base).all():
+        raise ValueError("base coefficients must be finite and positive")
+    if target_strength <= 0 or not np.isfinite(target_strength):
+        raise ValueError("target_strength must be finite and positive")
+    if beta_cap <= 0 or not np.isfinite(beta_cap):
+        raise ValueError("beta_cap must be finite and positive")
+    if not user_gates:
+        raise ValueError("at least one user gate is required")
+
+    normalized_gates: dict[str, np.ndarray] = {}
+    for name, values in user_gates.items():
+        gate = np.asarray(values, dtype=np.float64)
+        if gate.shape != (n_users,):
+            raise ValueError(f"user gate {name!r} must have shape [n_users]")
+        if not np.isfinite(gate).all() or np.any((gate < 0.0) | (gate > 1.0)):
+            raise ValueError(f"user gate {name!r} must be finite and in [0,1]")
+        normalized_gates[name] = gate.copy()
+
+    contribution, nonpositive_basket_line_share = _basket_value_contribution(
+        train, edge_users, edge_items
+    )
+    relation = _within_user_centered_rank(contribution, edge_users, n_users)
+    base_mass = np.bincount(edge_users, weights=base, minlength=n_users)
+    active_users = base_mass > 0
+    coefficients: dict[str, np.ndarray] = {}
+    arm_diagnostics: dict[str, dict] = {}
+    for name, gate in normalized_gates.items():
+        beta, adjusted, strength, reached = _match_beta(
+            base,
+            edge_users,
+            relation,
+            gate,
+            target_strength=target_strength,
+            beta_cap=beta_cap,
+            n_users=n_users,
+        )
+        adjusted_mass = np.bincount(
+            edge_users, weights=adjusted, minlength=n_users
+        )
+        mass_error = np.abs(adjusted_mass[active_users] - base_mass[active_users])
+        ratio = adjusted / base
+        coefficients[name] = adjusted.astype(np.float32)
+        arm_diagnostics[name] = {
+            "beta": float(beta),
+            "target_reached": bool(reached),
+            "first_hop_strength": float(strength),
+            "max_user_mass_abs_error": float(mass_error.max(initial=0.0)),
+            "changed_edge_share": float(np.mean(~np.isclose(ratio, 1.0))),
+            "active_user_count": int(np.count_nonzero(gate > 0.0)),
+            "coefficient_ratio": _stats(ratio),
+        }
+
+    return MatchedFirstHopGates(
+        edge_users=edge_users.copy(),
+        edge_items=edge_items.copy(),
+        base_coefficients=base.astype(np.float32),
+        edge_contribution=contribution.astype(np.float32),
+        within_user_relation=relation.astype(np.float32),
+        user_gates={
+            name: values.astype(np.float32)
+            for name, values in normalized_gates.items()
+        },
+        user_from_item_coefficients=coefficients,
+        diagnostics={
+            "definition": {
+                "edge_relationship": (
+                    "mean item share of user basket value, midranked within user"
+                ),
+                "active_multiplier": "exp(beta * supplied_gate(user) * relation)",
+                "mass_constraint": (
+                    "sum_i adjusted[user,item] == sum_i supplied_base[user,item]"
+                ),
+                "changed_path": "user receives item messages at layer 1 only",
+            },
+            "n_edges": int(len(base)),
+            "target_first_hop_strength": float(target_strength),
+            "beta_cap": float(beta_cap),
+            "nonpositive_basket_line_share": nonpositive_basket_line_share,
+            "edge_contribution": _stats(contribution),
+            "within_user_relation": _stats(relation),
+            "arms": arm_diagnostics,
+        },
+    )
+
+
 def build_directional_value_graph(
     train: pd.DataFrame,
     n_users: int,
@@ -485,4 +617,3 @@ def build_directional_operators(
     base_item_from_user = base_user_from_item.transpose(0, 1).coalesce()
     active_user_from_item = sparse(graph.user_from_item_coefficients[arm])
     return base_user_from_item, base_item_from_user, active_user_from_item
-
