@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 
 import lightgcn_clv_m5_semantic_nv_m3_screen as runner
@@ -104,3 +107,18 @@ def test_operational_failure_is_not_evaluable():
     }
     reading = runner.outcome_reading(rows, operational=False)
     assert reading["outcome"] == "not_evaluable"
+
+
+def test_colab_pins_source_and_runs_only_the_four_development_arms():
+    path = Path("clv_m5_semantic_nv_m3_screen_dunnhumby_colab.ipynb")
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "f4bc5b8166ec28b19c13008ad7a8c63b826876f8" in source
+    assert "run_semantic_nv_m3_screen(cfg)" in source
+    assert "M3_OFF_MODEL_ID, ACTUAL_MODEL_ID, SHUFFLE_MODEL_ID, RELATION_MODEL_ID" in source
+    assert "historical_development_days_684_690" in source
+    assert "test_constructed" in source
+    assert "holdout_constructed" in source
