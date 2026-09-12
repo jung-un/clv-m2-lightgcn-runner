@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -183,3 +186,24 @@ def test_mechanism_reading_requires_both_strict_two_metric_comparisons():
     assert reading["actual_beats_degree_matched_nv_shuffle"] is True
     assert reading["actual_beats_qv_only_constant_gate"] is False
     assert reading["classification"] == "value_assignment_without_n_increment"
+
+
+def test_colab_trains_only_two_controls_once_without_test_or_holdout():
+    notebook = json.loads(
+        Path(
+            "clv_m5_n_conditioned_value_basis_controls_dunnhumby_colab.ipynb"
+        ).read_text(encoding="utf-8")
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert source.count("result_df = run_value_basis_controls(cfg)") == 1
+    assert "REUSED_MODEL_IDS" in source
+    assert "TRAINED_MODEL_IDS" in source
+    assert "08e0022881c822dc106e9c232c41c294025db27f" in source
+    assert "TO_BE_PINNED" not in source
+    assert "summary['fixed']['final_test_constructed'] is False" in source
+    assert "summary['fixed']['holdout_constructed'] is False" in source
+    assert "degree-matched N/V 순열" in source
+    assert "V-only 상수 게이트" in source
