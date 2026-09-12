@@ -63,6 +63,7 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
         pref_reg: float = 1e-3,
         gate_delta: float = 0.25,
         basis_bandwidth: float = 0.25,
+        constant_gate: float | None = None,
     ):
         super().__init__()
         if min(n_users, n_items, id_dim) <= 0:
@@ -71,6 +72,10 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
             raise ValueError("rho는 [0,1]이어야 합니다")
         if n_layers < 0 or pref_reg < 0 or not 0.0 <= gate_delta < 1.0:
             raise ValueError("n_layers, pref_reg 또는 gate_delta가 잘못됐습니다")
+        if constant_gate is not None and not (
+            1.0 - gate_delta <= float(constant_gate) <= 1.0 + gate_delta
+        ):
+            raise ValueError("constant_gate는 기존 gate 허용범위 안이어야 합니다")
         if adj.layout != torch.sparse_coo:
             raise ValueError("adj는 sparse COO tensor여야 합니다")
         if tuple(adj.shape) != (n_users + n_items, n_users + n_items):
@@ -113,13 +118,24 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
         self.pref_reg = float(pref_reg)
         self.gate_delta = float(gate_delta)
         self.basis_bandwidth = float(basis_bandwidth)
+        self.constant_gate = (
+            None if constant_gate is None else float(constant_gate)
+        )
 
         self.E_u = nn.Embedding(n_users, id_dim)
         self.E_i = nn.Embedding(n_items, id_dim)
         nn.init.normal_(self.E_u.weight, std=0.1)
         nn.init.normal_(self.E_i.weight, std=0.1)
-        self.gate_offset_parameter = nn.Parameter(torch.zeros(()))
-        self.gate_slope_parameter = nn.Parameter(torch.zeros(()))
+        if self.constant_gate is None:
+            self.gate_offset_parameter = nn.Parameter(torch.zeros(()))
+            self.gate_slope_parameter = nn.Parameter(torch.zeros(()))
+        else:
+            self.register_buffer(
+                "gate_offset_parameter", torch.zeros(()), persistent=False
+            )
+            self.register_buffer(
+                "gate_slope_parameter", torch.zeros(()), persistent=False
+            )
 
         self.register_buffer(
             "user_q_n_centered", torch.from_numpy(2.0 * q_n - 1.0), persistent=False
@@ -142,6 +158,8 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
         return self.id_dim + self.economic_dim
 
     def n_gate(self) -> torch.Tensor:
+        if self.constant_gate is not None:
+            return self.constant_gate * self.user_clv_valid
         raw = self.gate_offset_parameter + (
             self.gate_slope_parameter * self.user_q_n_centered
         )
@@ -242,11 +260,15 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
             "economic_dim": self.economic_dim,
             "total_dim": self.total_dim,
             "n_layers": self.n_layers,
-            "explicit_q_n_in_m2": True,
+            "explicit_q_n_in_m2": self.constant_gate is None,
             "explicit_q_v_in_m2": True,
             "q_c_in_m2": False,
             "item_n_or_item_clv_input": False,
-            "n_role": "bounded strength of the user value-position basis",
+            "n_role": (
+                "bounded strength of the user value-position basis"
+                if self.constant_gate is None
+                else "constant-gate q_V-only ablation"
+            ),
             "v_role": "user transaction-value position versus item price position",
             "basis": "fixed normalized Gaussian RBF at 0.0, 0.5, 1.0",
             "basis_bandwidth": self.basis_bandwidth,
@@ -254,6 +276,12 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
             "economic_graph_propagation": True,
             "joint_end_to_end_training": True,
             "external_reranking": False,
+            "n_gate_mode": (
+                "learned_q_n_conditioned"
+                if self.constant_gate is None
+                else "fixed_constant"
+            ),
+            "constant_gate": self.constant_gate,
             "n_gate_offset": float(self.gate_offset_parameter),
             "n_gate_slope": float(self.gate_slope_parameter),
             "n_gate_mean": float(valid_gate.mean()) if len(valid_gate) else 0.0,
