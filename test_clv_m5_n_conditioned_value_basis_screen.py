@@ -123,56 +123,123 @@ def test_same_bpr_path_updates_id_and_n_gate_parameters():
     assert model.gate_slope_parameter.grad.abs() > 0
 
 
-def test_screen_trains_same_run_m1_m4_scalar_new_and_shuffle(tmp_path):
+def test_screen_trains_only_new_m2_and_new_m5(tmp_path):
     import lightgcn_clv_m5_n_conditioned_value_basis_screen as runner
 
     cfg = runner.configure_n_conditioned_value_basis_screen(
         out_dir=str(tmp_path / "results"),
         baseline_result_dir=str(tmp_path / "baseline"),
+        m1_reference_json=str(tmp_path / "m1.json"),
+        m4_reference_json=str(tmp_path / "m4.json"),
     )
     prepared = {
         "m2_actual": {"name": "actual"},
-        "m2_shuffle": {"name": "shuffle"},
     }
     specs = runner.arm_specifications(prepared, cfg)
     summary = runner.preflight_summary(cfg)
 
-    assert [spec["model_id"] for spec in specs] == list(runner.MODEL_IDS)
-    assert [spec["weighted"] for spec in specs] == [False, True, True, True, True]
-    assert [spec["architecture"] for spec in specs] == [
-        "basis",
-        "basis",
-        "scalar",
-        "basis",
-        "basis",
+    assert [spec["model_id"] for spec in specs] == list(runner.TRAINED_MODEL_IDS)
+    assert [spec["weighted"] for spec in specs] == [False, True]
+    assert [spec["rho"] for spec in specs] == [0.05, 0.05]
+    assert all(spec["architecture"] == "basis" for spec in specs)
+    assert all(spec["m2_assignment"] is prepared["m2_actual"] for spec in specs)
+    assert [spec["assignment_name"] for spec in specs] == [
+        "unweighted",
+        "observed_m4",
     ]
-    assert [spec["rho"] for spec in specs] == [0.0, 0.0, 0.05, 0.05, 0.05]
-    assert specs[-1]["m2_assignment"] is prepared["m2_shuffle"]
-    assert all(spec["assignment_name"] == "observed_m4" for spec in specs[1:])
+    assert summary["trained_models"] == list(runner.TRAINED_MODEL_IDS)
+    assert summary["reused_models"] == list(runner.REFERENCE_MODEL_IDS)
     assert summary["fixed"]["new_item_task"] is True
     assert summary["fixed"]["min_item_interactions"] == 1
     assert summary["m2"]["item_n_or_item_clv_input"] is False
     assert summary["m2"]["economic_graph_propagation"] is True
 
 
-def test_representation_shuffle_moves_qn_qv_together_only_inside_degree_bins():
+def _reference_payload(cfg, manifest, *, code_version, model_id, role, weighted):
+    metrics = _metrics(recall=1.0, ndcg=1.0, hit=1.0, vndcg=1.0)
+    row = {
+        "model_id": model_id,
+        "role": role,
+        "seed": 42,
+        "split": "historical_development_days_684_690",
+        "final_epoch": 100,
+        "rho": 0.0,
+        "id_dim": 64,
+        "n_layers": 2,
+        **metrics,
+    }
+    arm = {
+        **row,
+        "negative_count": 5,
+        "hard_negative": False,
+        "clv_assignment": "observed_m4" if weighted else "observed",
+        "positive_weight_lambda": 0.5 if weighted else 0.0,
+        "metrics": metrics,
+    }
+    return {
+        "code_version": code_version,
+        "source_revision": "fixture-revision",
+        "config": {
+            key: getattr(cfg, key)
+            for key in (
+                "dataset",
+                "seed",
+                "time_cutoff",
+                "evaluation_days",
+                "epochs",
+                "id_dim",
+                "n_layers",
+                "negative_count",
+                "batch_size",
+                "lr",
+                "pref_reg",
+                "input_days",
+            )
+        },
+        "input_manifest": manifest,
+        "absolute_rows": [row],
+        "arms": {model_id: arm},
+    }
+
+
+def test_reused_m1_and_m4_are_loaded_from_the_two_fixed_result_files(tmp_path):
     import lightgcn_clv_m5_n_conditioned_value_basis_screen as runner
 
-    prepared = {
-        "degree_bin": np.array([0, 0, 1, 1]),
-        "q_n": np.array([0.1, 0.3, 0.7, 0.9]),
-        "q_v": np.array([0.2, 0.4, 0.6, 0.8]),
-        "clv_valid": np.array([True, True, True, False]),
-    }
-    shuffled = runner.representation_degree_matched_shuffle(
-        prepared, seed=42, degree_bins=2
+    manifest = {"transactions": {"sha256": "same", "bytes": 123}}
+    cfg = runner.configure_n_conditioned_value_basis_screen(
+        out_dir=str(tmp_path / "results"),
+        baseline_result_dir=str(tmp_path / "baseline"),
+        m1_reference_json=str(tmp_path / "m1.json"),
+        m4_reference_json=str(tmp_path / "m4.json"),
     )
+    m1 = _reference_payload(
+        cfg,
+        manifest,
+        code_version="m5-m2-m4-joint-historical-screen-v1",
+        model_id=runner.M1_MODEL_ID,
+        role="factorial_m1",
+        weighted=False,
+    )
+    m4 = _reference_payload(
+        cfg,
+        manifest,
+        code_version="m5-minimal-nv-personalized-positive-development-screen-v1",
+        model_id=runner.M4_MODEL_ID,
+        role="matched_m4_only_control",
+        weighted=True,
+    )
+    Path(cfg.m1_reference_json).write_text(json.dumps(m1), encoding="utf-8")
+    Path(cfg.m4_reference_json).write_text(json.dumps(m4), encoding="utf-8")
+    references, provenance = runner.load_reused_references(cfg)
 
-    for target, source in enumerate(shuffled["source_user"]):
-        assert prepared["degree_bin"][target] == prepared["degree_bin"][source]
-        assert shuffled["q_n"][target] == prepared["q_n"][source]
-        assert shuffled["q_v"][target] == prepared["q_v"][source]
-        assert shuffled["clv_valid"][target] == prepared["clv_valid"][source]
+    assert set(references) == set(runner.REFERENCE_MODEL_IDS)
+    assert all(item["reused_without_retraining"] for item in provenance.values())
+    assert references[runner.M4_MODEL_ID]["metrics"]["recall@10"] == 1.0
+
+    m4["absolute_rows"][0]["model_id"] = "wrong_model"
+    Path(cfg.m4_reference_json).write_text(json.dumps(m4), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="절대지표 행"):
+        runner.load_reused_references(cfg)
 
 
 @pytest.mark.parametrize(
@@ -192,6 +259,8 @@ def test_screen_rejects_unplanned_overrides(tmp_path, override):
         runner.configure_n_conditioned_value_basis_screen(
             out_dir=str(tmp_path / "results"),
             baseline_result_dir=str(tmp_path / "baseline"),
+            m1_reference_json=str(tmp_path / "m1.json"),
+            m4_reference_json=str(tmp_path / "m4.json"),
             **override,
         )
 
@@ -209,31 +278,41 @@ def _metrics(*, recall, ndcg, hit, vndcg):
     }
 
 
-def test_reading_requires_accuracy_economics_assignment_and_intervention():
+def test_reading_treats_m5_over_m4_as_main_directional_check():
     import lightgcn_clv_m5_n_conditioned_value_basis_screen as runner
 
     rows = {
         runner.M1_MODEL_ID: _metrics(recall=1.00, ndcg=1.00, hit=1.00, vndcg=1.00),
         runner.M4_MODEL_ID: _metrics(recall=1.01, ndcg=1.01, hit=1.01, vndcg=1.01),
-        runner.SCALAR_M5_MODEL_ID: _metrics(
-            recall=1.01, ndcg=1.01, hit=1.01, vndcg=1.01
+        runner.BASIS_M2_MODEL_ID: _metrics(
+            recall=0.99, ndcg=0.99, hit=1.01, vndcg=1.01
         ),
         runner.BASIS_M5_MODEL_ID: _metrics(
             recall=1.02, ndcg=1.02, hit=1.03, vndcg=1.03
         ),
-        runner.BASIS_SHUFFLE_MODEL_ID: _metrics(
-            recall=1.01, ndcg=1.01, hit=1.02, vndcg=1.02
-        ),
     }
-    reading = runner.screening_reading(rows, economic_score_ratio=0.011)
-    assert reading["positive_screen"] is True
-    assert reading["top10_accuracy_beats_m1"] is True
-    assert reading["top10_economics_beats_m1_and_m4"] is True
-    assert reading["actual_beats_nv_shuffle"] is True
+    reading = runner.screening_reading(
+        rows,
+        economic_score_ratios={
+            runner.BASIS_M2_MODEL_ID: 0.011,
+            runner.BASIS_M5_MODEL_ID: 0.012,
+        },
+    )
+    assert reading["directional_screen_pass"] is True
+    assert reading["m5_top10_economics_beats_reused_m4"] is True
+    assert reading["m5_top10_accuracy_beats_reused_m4"] is True
+    assert reading["m2_top10_accuracy_beats_reused_m1"] is False
     assert reading["intervention_operational"] is True
+    assert reading["clv_assignment_tested"] is False
 
-    reading = runner.screening_reading(rows, economic_score_ratio=0.009)
-    assert reading["positive_screen"] is False
+    reading = runner.screening_reading(
+        rows,
+        economic_score_ratios={
+            runner.BASIS_M2_MODEL_ID: 0.011,
+            runner.BASIS_M5_MODEL_ID: 0.009,
+        },
+    )
+    assert reading["directional_screen_pass"] is False
     assert reading["intervention_operational"] is False
 
 
@@ -250,6 +329,9 @@ def test_colab_runs_screen_once_without_constructing_test_or_holdout():
     assert source.count(
         "result_df = run_n_conditioned_value_basis_screen(cfg)"
     ) == 1
+    assert "TRAINED_MODEL_IDS" in source
+    assert "REFERENCE_MODEL_IDS" in source
+    assert "list(MODEL_IDS)" not in source
     assert "historical_development_days_684_690" in source
     assert "summary['fixed']['final_test_constructed'] is False" in source
     assert "summary['fixed']['holdout_constructed'] is False" in source

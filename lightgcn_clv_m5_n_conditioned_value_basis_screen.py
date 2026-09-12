@@ -1,4 +1,9 @@
-"""Seed-42 screen for q_N-gated three-basis q_V economic representation."""
+"""Two-arm screen for q_N-gated three-basis q_V representation.
+
+The unchanged M1 and personalized-positive M4 controls are loaded from the two
+completed runs whose matching conditions are recorded in RESEARCH_STATUS.md.
+Only the changed M2 and M5 arms are trained here.
+"""
 
 from __future__ import annotations
 
@@ -12,30 +17,29 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from clv_m5_minimal_nv_model import M5MinimalNVEconomicLightGCN
 from clv_m5_n_conditioned_value_basis_model import (
     M5NConditionedValueBasisLightGCN,
 )
 import lightgcn_clv_gradient_isolated_economic_interaction as report_helpers
 import lightgcn_clv_m5_economic_positive_weight as legacy
-import lightgcn_clv_m5_minimal_nv_m4_screen as minimal
 import lightgcn_clv_m5_nv_economic_positive_weight as nv
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m5-n-conditioned-value-basis-development-screen-v1"
-M1_MODEL_ID = "m1_multineg_mean_k5_value_basis_factorial"
-M4_MODEL_ID = "m4_personalized_positive_weight_k5_value_basis_factorial"
-SCALAR_M5_MODEL_ID = "m5_minimal_scalar_nv_personalized_positive_weight_k5"
+CODE_VERSION = "m5-n-conditioned-value-basis-reuse-controls-development-screen-v2"
+M1_MODEL_ID = "m1_multineg_mean_k5"
+M4_MODEL_ID = "m4_personalized_positive_weight_k5_minimal_nv_control"
+BASIS_M2_MODEL_ID = "m2_n_conditioned_value_basis_multineg_mean_k5"
 BASIS_M5_MODEL_ID = "m5_n_conditioned_value_basis_personalized_positive_weight_k5"
-BASIS_SHUFFLE_MODEL_ID = "m5_n_conditioned_value_basis_degree_nv_shuffle"
-MODEL_IDS = (
+REFERENCE_MODEL_IDS = (
     M1_MODEL_ID,
     M4_MODEL_ID,
-    SCALAR_M5_MODEL_ID,
-    BASIS_M5_MODEL_ID,
-    BASIS_SHUFFLE_MODEL_ID,
 )
+TRAINED_MODEL_IDS = (
+    BASIS_M2_MODEL_ID,
+    BASIS_M5_MODEL_ID,
+)
+MODEL_IDS = REFERENCE_MODEL_IDS + TRAINED_MODEL_IDS
 ECONOMIC_METRICS = (
     "price_purchase_amount_weighted_hit@10",
     "vndcg@10",
@@ -77,19 +81,29 @@ class M5NConditionedValueBasisConfig:
     shuffle_seed: int = 42
     out_dir: str = ""
     baseline_result_dir: str = ""
+    m1_reference_json: str = ""
+    m4_reference_json: str = ""
 
 
 def configure_n_conditioned_value_basis_screen(
     **overrides,
 ) -> M5NConditionedValueBasisConfig:
+    data_root = v3.default_out_dir("dunnhumby")
     defaults = {
         "out_dir": (
-            f"{v3.default_out_dir('dunnhumby')}"
-            "_m5_n_conditioned_value_basis_development_screen_v1"
+            f"{data_root}"
+            "_m5_n_conditioned_value_basis_reuse_controls_development_screen_v2"
         ),
         "baseline_result_dir": (
-            f"{v3.default_out_dir('dunnhumby')}"
-            "_m2_repeatshare_historical_backtest_v1"
+            f"{data_root}_m2_repeatshare_historical_backtest_v1"
+        ),
+        "m1_reference_json": (
+            f"{data_root}_m5_m2_m4_joint_historical_screen_v1/"
+            "m5_m2_m4_joint_7cd818302fb1.json"
+        ),
+        "m4_reference_json": (
+            f"{data_root}_m5_minimal_nv_personalized_positive_development_screen_v1/"
+            "m5_minimal_nv_m4_d01883236772.json"
         ),
     }
     return validate_config(
@@ -128,8 +142,17 @@ def validate_config(
             )
     if cfg.batch_size <= 0 or cfg.lr <= 0 or cfg.pref_reg < 0:
         raise ValueError("학습 설정이 잘못됐습니다")
-    if not cfg.out_dir or not cfg.baseline_result_dir:
-        raise ValueError("out_dir와 baseline_result_dir가 필요합니다")
+    if not all(
+        (
+            cfg.out_dir,
+            cfg.baseline_result_dir,
+            cfg.m1_reference_json,
+            cfg.m4_reference_json,
+        )
+    ):
+        raise ValueError(
+            "out_dir, baseline_result_dir, M1·M4 reference JSON이 필요합니다"
+        )
     return cfg
 
 
@@ -140,10 +163,12 @@ def preflight_summary(cfg: M5NConditionedValueBasisConfig) -> dict:
         "dataset": cfg.dataset,
         "seed": cfg.seed,
         "split": "historical_development_days_684_690",
-        "trained_models": list(MODEL_IDS),
+        "trained_models": list(TRAINED_MODEL_IDS),
+        "reused_models": list(REFERENCE_MODEL_IDS),
         "research_question": (
             "Does q_N-controlled use of a fixed q_V--item-price basis add "
-            "new-item accuracy and economic hits beyond the same-run M1 and M4?"
+            "new-item accuracy and economic hits beyond compatible completed "
+            "M1 and M4 references?"
         ),
         "c3_change_basis": (
             "The rejected item repeat-propensity N coordinate is removed. "
@@ -180,19 +205,19 @@ def preflight_summary(cfg: M5NConditionedValueBasisConfig) -> dict:
             "q_c": "percentile(n_u*v_u), not q_N*q_V",
             "uniform_negative_count": cfg.negative_count,
             "hard_negative": False,
-            "actual_assignment_in_all_weighted_arms": True,
+            "actual_assignment_in_new_m5": True,
         },
-        "controls": {
-            M1_MODEL_ID: "rho=0 and unweighted K=5 mean BPR",
-            M4_MODEL_ID: "rho=0 with observed personalized M4 weighting",
-            SCALAR_M5_MODEL_ID: (
-                "previous one-dimensional N and V coordinates with observed M4"
-            ),
-            BASIS_M5_MODEL_ID: "observed q_N and q_V in the proposed M2 plus M4",
-            BASIS_SHUFFLE_MODEL_ID: (
-                "only q_N and q_V jointly permuted within degree deciles; "
-                "M4 remains observed"
-            ),
+        "execution": {
+            "trained_now": {
+                BASIS_M2_MODEL_ID: "new M2 with K=5 mean BPR",
+                BASIS_M5_MODEL_ID: "the same new M2 plus observed M4",
+            },
+            "reused_completed_results": {
+                M1_MODEL_ID: cfg.m1_reference_json,
+                M4_MODEL_ID: cfg.m4_reference_json,
+            },
+            "condition_match_source": "RESEARCH_STATUS.md manual verification",
+            "different_run_disclosure": True,
         },
         "fixed": {
             "new_item_task": True,
@@ -209,14 +234,15 @@ def preflight_summary(cfg: M5NConditionedValueBasisConfig) -> dict:
             "m3_edge_weight": False,
         },
         "reading_rule": {
-            "top10_accuracy": "proposed actual Recall@10 and NDCG@10 > M1",
-            "top10_economics": (
-                "proposed actual weighted hit@10 and weighted NDCG@10 > M1 and M4"
+            "main_directional_check": (
+                "new M5 > reused compatible M4 on both top-10 economic metrics"
             ),
-            "assignment": (
-                "proposed actual > q_N/q_V shuffle on all four top-10 metrics"
-            ),
+            "top10_accuracy": "reported for M2-vs-M1 and M5-vs-M4; not a gate",
+            "m2_standalone": "reported against reused M1; not required for M5 pass",
             "intervention": "economic-score std / ID-score std >= 0.01",
+            "clv_attribution": (
+                "not tested because no shuffle arm is trained in this fast run"
+            ),
             "reported_not_gated": (
                 "all @20/@50 accuracy, economic, exposure, and CLV-segment metrics"
             ),
@@ -224,36 +250,11 @@ def preflight_summary(cfg: M5NConditionedValueBasisConfig) -> dict:
                 "one historical development seed; no significance or generalization claim"
             ),
         },
+        "reference_sources": {
+            M1_MODEL_ID: cfg.m1_reference_json,
+            M4_MODEL_ID: cfg.m4_reference_json,
+        },
         "out_dir": cfg.out_dir,
-    }
-
-
-def representation_degree_matched_shuffle(
-    prepared: dict, *, seed: int = 42, degree_bins: int = 10
-) -> dict[str, np.ndarray]:
-    """Jointly permute only raw q_N/q_V and validity inside degree bins."""
-
-    bins = np.asarray(prepared["degree_bin"])
-    q_n = np.asarray(prepared["q_n"])
-    q_v = np.asarray(prepared["q_v"])
-    valid = np.asarray(prepared["clv_valid"])
-    if bins.ndim != 1 or any(len(values) != len(bins) for values in (q_n, q_v, valid)):
-        raise ValueError("degree bin 또는 q_N/q_V shape이 잘못됐습니다")
-    if bins.min(initial=0) < 0 or bins.max(initial=0) >= degree_bins:
-        raise ValueError("degree_bin 범위가 잘못됐습니다")
-    rng = np.random.default_rng(seed)
-    source = np.arange(len(bins), dtype=np.int64)
-    for group in range(degree_bins):
-        members = np.flatnonzero(bins == group)
-        if len(members) > 1:
-            order = rng.permutation(members)
-            source[order] = np.roll(order, 1)
-    return {
-        "q_n": q_n[source].copy(),
-        "q_v": q_v[source].copy(),
-        "clv_valid": valid[source].copy(),
-        "source_user": source,
-        "degree_bin": bins.copy(),
     }
 
 
@@ -286,28 +287,11 @@ def _prepare(cfg: M5NConditionedValueBasisConfig) -> dict:
         degree_bins=cfg.shuffle_degree_bins,
     )
     prepared.update(economic)
-    scalar = minimal.build_minimal_nv_inputs(
-        prepared["data"]["train"],
-        n_users=prepared["data"]["n_users"],
-        n_items=prepared["data"]["n_items"],
-        q_n=prepared["q_n"],
-        q_v=prepared["q_v"],
-        clv_valid=prepared["clv_valid"],
-        item_price_percentile=prepared["item_amount_percentile"],
-        item_price_valid=prepared["item_economic_valid"],
-    )
-    prepared.update(scalar)
     prepared["m2_actual"] = {
         "q_n": prepared["q_n"],
         "q_v": prepared["q_v"],
         "clv_valid": prepared["clv_valid"],
-        "user_n_centered": prepared["user_n_centered"],
-        "user_v_centered": prepared["user_v_centered"],
     }
-    prepared["m2_shuffle"] = representation_degree_matched_shuffle(
-        prepared, seed=cfg.shuffle_seed, degree_bins=cfg.shuffle_degree_bins
-    )
-    prepared["scalar_input_diagnostics"] = prepared["minimal_nv_input_diagnostics"]
     prepared["config_hash"] = _config_hash(
         cfg, prepared["input_hash"], prepared["revision"]
     )
@@ -320,41 +304,19 @@ def arm_specifications(
     actual = prepared["m2_actual"]
     return [
         {
-            "model_id": M1_MODEL_ID,
-            "role": "same_run_m1",
+            "model_id": BASIS_M2_MODEL_ID,
+            "role": "new_n_conditioned_value_basis_m2",
             "architecture": "basis",
-            "rho": 0.0,
+            "rho": cfg.rho,
             "weighted": False,
             "assignment": prepared,
-            "assignment_name": "observed_m4",
-            "m2_assignment": actual,
-            "m2_assignment_name": "nonintervention",
-        },
-        {
-            "model_id": M4_MODEL_ID,
-            "role": "same_run_m4_only",
-            "architecture": "basis",
-            "rho": 0.0,
-            "weighted": True,
-            "assignment": prepared,
-            "assignment_name": "observed_m4",
-            "m2_assignment": actual,
-            "m2_assignment_name": "nonintervention",
-        },
-        {
-            "model_id": SCALAR_M5_MODEL_ID,
-            "role": "previous_scalar_m2_plus_m4",
-            "architecture": "scalar",
-            "rho": cfg.rho,
-            "weighted": True,
-            "assignment": prepared,
-            "assignment_name": "observed_m4",
+            "assignment_name": "unweighted",
             "m2_assignment": actual,
             "m2_assignment_name": "observed_nv",
         },
         {
             "model_id": BASIS_M5_MODEL_ID,
-            "role": "actual_n_conditioned_value_basis_m5",
+            "role": "new_n_conditioned_value_basis_m5",
             "architecture": "basis",
             "rho": cfg.rho,
             "weighted": True,
@@ -362,17 +324,6 @@ def arm_specifications(
             "assignment_name": "observed_m4",
             "m2_assignment": actual,
             "m2_assignment_name": "observed_nv",
-        },
-        {
-            "model_id": BASIS_SHUFFLE_MODEL_ID,
-            "role": "m2_assignment_control",
-            "architecture": "basis",
-            "rho": cfg.rho,
-            "weighted": True,
-            "assignment": prepared,
-            "assignment_name": "observed_m4",
-            "m2_assignment": prepared["m2_shuffle"],
-            "m2_assignment_name": "degree_matched_nv_shuffle",
         },
     ]
 
@@ -383,23 +334,6 @@ def _build_model(
     data = prepared["data"]
     assignment = spec["m2_assignment"]
     v3.set_seed(cfg.seed)
-    if spec["architecture"] == "scalar":
-        return M5MinimalNVEconomicLightGCN(
-            n_users=data["n_users"],
-            n_items=data["n_items"],
-            user_n_centered=assignment["user_n_centered"],
-            user_v_centered=assignment["user_v_centered"],
-            user_clv_valid=assignment["clv_valid"],
-            item_repeat_centered=prepared["item_repeat_centered"],
-            item_price_centered=prepared["item_price_centered"],
-            item_semantic_valid=prepared["item_semantic_valid"],
-            adj=data["adj"],
-            id_dim=cfg.id_dim,
-            rho=spec["rho"],
-            n_layers=cfg.n_layers,
-            pref_reg=cfg.pref_reg,
-            scale_delta=cfg.gate_delta,
-        ).to(v3.DEVICE)
     if spec["architecture"] != "basis":
         raise ValueError(f"알 수 없는 M2 architecture: {spec['architecture']}")
     return M5NConditionedValueBasisLightGCN(
@@ -420,61 +354,143 @@ def _build_model(
     ).to(v3.DEVICE)
 
 
+def _load_reused_reference(
+    path: str,
+    *,
+    expected_model_id: str,
+) -> tuple[dict, dict]:
+    source = Path(path)
+    if not source.exists():
+        raise FileNotFoundError(
+            f"재사용할 {expected_model_id} 결과 JSON이 없습니다: {source}"
+        )
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    rows = [
+        row
+        for row in payload.get("absolute_rows", [])
+        if row.get("model_id") == expected_model_id
+    ]
+    if len(rows) != 1:
+        raise RuntimeError(
+            f"{expected_model_id} 절대지표 행이 정확히 하나가 아닙니다"
+        )
+    row = dict(rows[0])
+    arms = payload.get("arms", {})
+    arm = arms.get(expected_model_id)
+    if not arm or not arm.get("metrics"):
+        raise RuntimeError(f"{expected_model_id} arm 또는 전체 지표가 없습니다")
+
+    row.update(
+        {
+            "execution_source": "reused_prior_run",
+            "source_result_path": str(source),
+            "source_code_version": payload["code_version"],
+            "source_revision": payload.get("source_revision"),
+            "reference_contract": "manually_verified_in_RESEARCH_STATUS.md",
+        }
+    )
+    provenance = {
+        "reused_without_retraining": True,
+        "model_id": expected_model_id,
+        "path": str(source),
+        "code_version": payload["code_version"],
+        "source_revision": payload.get("source_revision"),
+        "condition_match_source": "RESEARCH_STATUS.md",
+    }
+    return {"row": row, "metrics": arm["metrics"], "arm": arm}, provenance
+
+
+def load_reused_references(
+    cfg: M5NConditionedValueBasisConfig,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    specifications = (
+        (M1_MODEL_ID, cfg.m1_reference_json),
+        (M4_MODEL_ID, cfg.m4_reference_json),
+    )
+    references = {}
+    provenance = {}
+    for model_id, path in specifications:
+        reference, source = _load_reused_reference(
+            path,
+            expected_model_id=model_id,
+        )
+        references[model_id] = reference
+        provenance[model_id] = source
+    return references, provenance
+
+
 def screening_reading(
-    metric_rows: dict[str, dict], *, economic_score_ratio: float
+    metric_rows: dict[str, dict], *, economic_score_ratios: dict[str, float]
 ) -> dict:
     m1 = metric_rows[M1_MODEL_ID]
     m4 = metric_rows[M4_MODEL_ID]
-    actual = metric_rows[BASIS_M5_MODEL_ID]
-    shuffled = metric_rows[BASIS_SHUFFLE_MODEL_ID]
-    top10_accuracy_beats_m1 = all(
-        actual[metric] > m1[metric] for metric in TOP10_ACCURACY_METRICS
+    m2 = metric_rows[BASIS_M2_MODEL_ID]
+    m5 = metric_rows[BASIS_M5_MODEL_ID]
+    m2_top10_accuracy_beats_reused_m1 = all(
+        m2[metric] > m1[metric] for metric in TOP10_ACCURACY_METRICS
     )
-    top10_economics_beats_m1_and_m4 = all(
-        actual[metric] > m1[metric] and actual[metric] > m4[metric]
-        for metric in ECONOMIC_METRICS
+    m5_top10_accuracy_beats_reused_m4 = all(
+        m5[metric] > m4[metric] for metric in TOP10_ACCURACY_METRICS
     )
-    assignment_metrics = TOP10_ACCURACY_METRICS + ECONOMIC_METRICS
-    actual_beats_nv_shuffle = all(
-        actual[metric] > shuffled[metric] for metric in assignment_metrics
+    m2_top10_economics_beats_reused_m1 = all(
+        m2[metric] > m1[metric] for metric in ECONOMIC_METRICS
     )
-    intervention_operational = economic_score_ratio >= 0.01
+    m5_top10_economics_beats_reused_m4 = all(
+        m5[metric] > m4[metric] for metric in ECONOMIC_METRICS
+    )
+    m5_score_ratio = float(economic_score_ratios[BASIS_M5_MODEL_ID])
+    intervention_operational = m5_score_ratio >= 0.01
+    reported_metrics = TOP10_ACCURACY_METRICS + ECONOMIC_METRICS
 
-    def deltas(reference: dict) -> dict[str, float]:
+    def deltas(model: dict, reference: dict) -> dict[str, float]:
         return {
-            metric: float(actual[metric] - reference[metric])
-            for metric in assignment_metrics
+            metric: float(model[metric] - reference[metric])
+            for metric in reported_metrics
         }
 
-    def geomean_ratio(reference: dict) -> float:
-        ratios = [actual[metric] / reference[metric] for metric in ACCURACY_METRICS]
+    def geomean_ratio(model: dict, reference: dict) -> float:
+        ratios = [model[metric] / reference[metric] for metric in ACCURACY_METRICS]
         return float(math.exp(np.log(ratios).mean()))
 
     return {
-        "positive_screen": bool(
-            top10_accuracy_beats_m1
-            and top10_economics_beats_m1_and_m4
-            and actual_beats_nv_shuffle
-            and intervention_operational
+        "directional_screen_pass": bool(
+            m5_top10_economics_beats_reused_m4 and intervention_operational
         ),
-        "top10_accuracy_beats_m1": top10_accuracy_beats_m1,
-        "top10_economics_beats_m1_and_m4": top10_economics_beats_m1_and_m4,
-        "actual_beats_nv_shuffle": actual_beats_nv_shuffle,
+        "m2_top10_accuracy_beats_reused_m1": (
+            m2_top10_accuracy_beats_reused_m1
+        ),
+        "m2_top10_economics_beats_reused_m1": (
+            m2_top10_economics_beats_reused_m1
+        ),
+        "m5_top10_accuracy_beats_reused_m4": (
+            m5_top10_accuracy_beats_reused_m4
+        ),
+        "m5_top10_economics_beats_reused_m4": (
+            m5_top10_economics_beats_reused_m4
+        ),
         "intervention_operational": intervention_operational,
-        "economic_score_std_ratio_to_id": float(economic_score_ratio),
+        "economic_score_std_ratio_to_id": {
+            key: float(value) for key, value in economic_score_ratios.items()
+        },
         "minimum_intervention_ratio": 0.01,
-        "accuracy_geomean_ratio_vs_m1": geomean_ratio(m1),
-        "accuracy_geomean_ratio_vs_m4": geomean_ratio(m4),
-        "top10_deltas_actual_minus_m1": deltas(m1),
-        "top10_deltas_actual_minus_m4": deltas(m4),
-        "top10_deltas_actual_minus_nv_shuffle": deltas(shuffled),
+        "accuracy_geomean_ratio_m2_vs_reused_m1": geomean_ratio(m2, m1),
+        "accuracy_geomean_ratio_m5_vs_reused_m4": geomean_ratio(m5, m4),
+        "top10_deltas_m2_minus_reused_m1": deltas(m2, m1),
+        "top10_deltas_m5_minus_reused_m4": deltas(m5, m4),
+        "m2_standalone_success_required": False,
+        "clv_assignment_tested": False,
+        "positive_screen_or_attribution_decision_permitted": False,
+        "comparison_scope": (
+            "directional development comparison using contract-verified controls "
+            "from separate completed runs"
+        ),
         "reported_not_gated": (
             "all @20/@50 accuracy, economic, exposure, and CLV-segment metrics"
         ),
-        "next_if_positive": (
-            "freeze the structure before any final test or multiseed expansion"
+        "next_if_directional_pass": (
+            "train the q_N/q_V assignment control before any attribution claim"
         ),
-        "next_if_nonpositive": (
+        "next_if_directional_nonpass": (
             "stop this candidate without tuning rho, bandwidth, or gate range "
             "on the same development interval"
         ),
@@ -491,6 +507,10 @@ def run_n_conditioned_value_basis_screen(
     summary = preflight_summary(cfg)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     prepared = _prepare(cfg)
+    references, provenance = load_reused_references(cfg)
+    print("\n[재사용] RESEARCH_STATUS.md에서 조건을 확인한 M1·M4입니다.")
+    for model_id in REFERENCE_MODEL_IDS:
+        print(f"  - {model_id}: {provenance[model_id]['path']}")
     arms: dict[str, dict] = {}
     models: dict[str, object] = {}
     for spec in arm_specifications(prepared, cfg):
@@ -505,9 +525,12 @@ def run_n_conditioned_value_basis_screen(
         arms[spec["model_id"]] = arm
         models[spec["model_id"]] = model
 
-    rows = []
-    metric_rows = {}
-    for model_id in MODEL_IDS:
+    rows = [references[model_id]["row"] for model_id in REFERENCE_MODEL_IDS]
+    metric_rows = {
+        model_id: references[model_id]["metrics"]
+        for model_id in REFERENCE_MODEL_IDS
+    }
+    for model_id in TRAINED_MODEL_IDS:
         arm = arms[model_id]
         metric_rows[model_id] = arm["metrics"]
         rows.append(
@@ -522,64 +545,54 @@ def run_n_conditioned_value_basis_screen(
                 "m2_architecture": arm["m2_architecture"],
                 "m2_assignment": arm["m2_assignment"],
                 "m4_assignment": arm["clv_assignment"],
+                "execution_source": "current_two_arm_run",
+                "source_result_path": None,
+                "source_code_version": CODE_VERSION,
+                "source_revision": prepared["revision"],
+                "reference_contract": None,
                 **arm["diagnostics"],
                 **arm["training"].get("final_diagnostics", {}),
                 **arm["metrics"],
             }
         )
     frame = pd.DataFrame(rows)
-    comparison = report_helpers._metric_comparison(
+    full_comparison = report_helpers._metric_comparison(
         metric_rows,
-        references=(
-            M1_MODEL_ID,
-            M4_MODEL_ID,
-            SCALAR_M5_MODEL_ID,
-            BASIS_SHUFFLE_MODEL_ID,
-        ),
+        references=REFERENCE_MODEL_IDS,
     )
+    comparison = full_comparison.loc[
+        (
+            (full_comparison["reference"] == M1_MODEL_ID)
+            & (full_comparison["model_id"] == BASIS_M2_MODEL_ID)
+        )
+        | (
+            (full_comparison["reference"] == M4_MODEL_ID)
+            & (full_comparison["model_id"] == BASIS_M5_MODEL_ID)
+        )
+    ].reset_index(drop=True)
 
-    users: np.ndarray | None = None
-    topk: dict[str, np.ndarray] = {}
     score_rows = []
-    for model_id in MODEL_IDS:
+    for model_id in TRAINED_MODEL_IDS:
         arm_users, arm_top50 = report_helpers._masked_topk(
             models[model_id], prepared, max_k=cfg.diagnostic_max_k
         )
-        if users is None:
-            users = arm_users
-        elif not np.array_equal(users, arm_users):
-            raise RuntimeError("arm별 평가 사용자 순서가 다릅니다")
-        topk[model_id] = arm_top50
         score_rows.append(
             legacy._score_diagnostics(
                 models[model_id], arm_users, arm_top50, model_id=model_id
             )
         )
     score_frame = pd.DataFrame(score_rows)
-    actual_score_ratio = float(
-        score_frame.set_index("model_id").at[
-            BASIS_M5_MODEL_ID, "economic_score_std_ratio_to_id"
-        ]
-    )
-    reading = screening_reading(
-        metric_rows, economic_score_ratio=actual_score_ratio
-    )
-
-    assert users is not None
-    overlap_frames = []
-    for reference in (
-        M1_MODEL_ID,
-        M4_MODEL_ID,
-        SCALAR_M5_MODEL_ID,
-        BASIS_SHUFFLE_MODEL_ID,
-    ):
-        overlap = report_helpers.topk_overlap_summary(
-            topk[reference], topk[BASIS_M5_MODEL_ID], prepared["cache"].seg, k=10
+    score_ratios = {
+        model_id: float(
+            score_frame.set_index("model_id").at[
+                model_id, "economic_score_std_ratio_to_id"
+            ]
         )
-        overlap.insert(0, "reference", reference)
-        overlap.insert(1, "model_id", BASIS_M5_MODEL_ID)
-        overlap_frames.append(overlap)
-    overlap_frame = pd.concat(overlap_frames, ignore_index=True)
+        for model_id in TRAINED_MODEL_IDS
+    }
+    reading = screening_reading(
+        metric_rows, economic_score_ratios=score_ratios
+    )
 
     out = Path(cfg.out_dir)
     stem = f"m5_n_conditioned_value_basis_{prepared['config_hash']}"
@@ -587,13 +600,11 @@ def run_n_conditioned_value_basis_screen(
         "absolute_csv": out / f"{stem}.csv",
         "comparison_csv": out / f"{stem}_comparison.csv",
         "score_diagnostics_csv": out / f"{stem}_score_diagnostics.csv",
-        "top10_overlap_csv": out / f"{stem}_top10_overlap.csv",
         "json": out / f"{stem}.json",
     }
     legacy.test10._atomic_csv(paths["absolute_csv"], frame)
     legacy.test10._atomic_csv(paths["comparison_csv"], comparison)
     legacy.test10._atomic_csv(paths["score_diagnostics_csv"], score_frame)
-    legacy.test10._atomic_csv(paths["top10_overlap_csv"], overlap_frame)
     legacy.test10._atomic_json(
         paths["json"],
         {
@@ -605,12 +616,13 @@ def run_n_conditioned_value_basis_screen(
             "absolute_rows": frame.to_dict("records"),
             "comparison_rows": comparison.to_dict("records"),
             "score_diagnostic_rows": score_frame.to_dict("records"),
-            "top10_overlap_rows": overlap_frame.to_dict("records"),
             "screening_reading": reading,
-            "representation_shuffle": {
-                "method": "joint q_N/q_V permutation within degree deciles",
-                "m4_assignment_changed": False,
-                "source_user": prepared["m2_shuffle"]["source_user"].tolist(),
+            "reused_references": {
+                model_id: {
+                    "provenance": provenance[model_id],
+                    "arm": references[model_id]["arm"],
+                }
+                for model_id in REFERENCE_MODEL_IDS
             },
             "arms": arms,
             "result_paths": {key: str(value) for key, value in paths.items()},
@@ -618,9 +630,22 @@ def run_n_conditioned_value_basis_screen(
     )
     frame.attrs["comparison"] = comparison
     frame.attrs["score_diagnostics"] = score_frame
-    frame.attrs["top10_overlap"] = overlap_frame
     frame.attrs["decision"] = reading
+    frame.attrs["reference_provenance"] = provenance
+    frame.attrs["preflight"] = summary
     frame.attrs["result_paths"] = {key: str(value) for key, value in paths.items()}
+    print("\n1) 재사용 M1·M4와 새로 학습한 M2·M5 절대지표")
+    print(frame.to_string(index=False))
+    print("\n2) M2-M1, M5-M4 전체 지표 비교")
+    print(comparison.to_string(index=False))
+    print("\n3) 새 M2·M5 ID 점수 대비 경제점수 영향력")
+    print(score_frame.to_string(index=False))
+    print("\n4) 방향성 판독")
+    print(json.dumps(reading, ensure_ascii=False, indent=2))
+    print("\n5) 재사용 결과 출처")
+    print(json.dumps(provenance, ensure_ascii=False, indent=2))
+    print("\n6) 저장 파일")
+    print(json.dumps(frame.attrs["result_paths"], ensure_ascii=False, indent=2))
     return frame
 
 
