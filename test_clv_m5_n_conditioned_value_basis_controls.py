@@ -117,14 +117,14 @@ def test_joint_nv_shuffle_preserves_tuples_inside_degree_bins():
     assert shuffled_tuples == original_tuples
 
 
-def test_control_runner_trains_only_nv_shuffle_and_qv_only(tmp_path):
+def test_control_runner_is_standalone_and_trains_actual_plus_two_controls(tmp_path):
     import lightgcn_clv_m5_n_conditioned_value_basis_controls as runner
 
     cfg = runner.configure_value_basis_controls(
         out_dir=str(tmp_path / "out"),
-        actual_result_json=str(tmp_path / "actual.json"),
     )
     prepared = {
+        "m2_actual": {"name": "actual"},
         "m2_shuffle": {"name": "shuffle"},
         "m2_v_only": {"name": "v_only"},
     }
@@ -135,12 +135,15 @@ def test_control_runner_trains_only_nv_shuffle_and_qv_only(tmp_path):
     assert all(spec["weighted"] is True for spec in specs)
     assert all(spec["assignment"] is prepared for spec in specs)
     assert all(spec["assignment_name"] == "observed_m4" for spec in specs)
-    assert specs[0]["m2_assignment"] is prepared["m2_shuffle"]
+    assert specs[0]["m2_assignment"] is prepared["m2_actual"]
     assert specs[0]["constant_gate"] is None
-    assert specs[1]["m2_assignment"] is prepared["m2_v_only"]
-    assert specs[1]["constant_gate"] == 1.25
+    assert specs[1]["m2_assignment"] is prepared["m2_shuffle"]
+    assert specs[1]["constant_gate"] is None
+    assert specs[2]["m2_assignment"] is prepared["m2_v_only"]
+    assert specs[2]["constant_gate"] == 1.25
     assert summary["trained_models"] == list(runner.TRAINED_MODEL_IDS)
-    assert summary["reused_models"] == list(runner.REUSED_MODEL_IDS)
+    assert summary["reused_models"] == []
+    assert "actual_result_json" not in summary
     assert summary["fixed"]["final_test_constructed"] is False
     assert summary["fixed"]["holdout_constructed"] is False
 
@@ -162,7 +165,6 @@ def test_mechanism_reading_requires_both_strict_two_metric_comparisons():
     import lightgcn_clv_m5_n_conditioned_value_basis_controls as runner
 
     rows = {
-        runner.M4_MODEL_ID: _metrics(accuracy=1.00, hit=1.00, vndcg=1.00),
         runner.ACTUAL_M5_MODEL_ID: _metrics(
             accuracy=1.01, hit=1.04, vndcg=1.04
         ),
@@ -188,7 +190,7 @@ def test_mechanism_reading_requires_both_strict_two_metric_comparisons():
     assert reading["classification"] == "value_assignment_without_n_increment"
 
 
-def test_colab_trains_only_two_controls_once_without_test_or_holdout():
+def test_colab_trains_standalone_three_arms_once_without_test_or_holdout():
     notebook = json.loads(
         Path(
             "clv_m5_n_conditioned_value_basis_controls_dunnhumby_colab.ipynb"
@@ -199,13 +201,12 @@ def test_colab_trains_only_two_controls_once_without_test_or_holdout():
     )
 
     assert source.count("result_df = run_value_basis_controls(cfg)") == 1
-    assert "REUSED_MODEL_IDS" in source
     assert "TRAINED_MODEL_IDS" in source
-    assert "08e0022881c822dc106e9c232c41c294025db27f" in source
+    assert "54bb7c45fd222a1962c8612e1c22a4eca024ca24" in source
     assert "TO_BE_PINNED" not in source
     assert "summary['fixed']['final_test_constructed'] is False" in source
     assert "summary['fixed']['holdout_constructed'] is False" in source
     assert "degree-matched N/V 순열" in source
     assert "V-only 상수 게이트" in source
-    assert "matches = sorted(search_root.rglob(actual_filename))" in source
-    assert "이전 실험을 저장한 Google 계정" in source
+    assert "actual_result_json" not in source
+    assert "rglob(actual_filename)" not in source
