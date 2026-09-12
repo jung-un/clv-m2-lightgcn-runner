@@ -64,6 +64,7 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
         gate_delta: float = 0.25,
         basis_bandwidth: float = 0.25,
         constant_gate: float | None = None,
+        learn_gate_offset: bool = True,
     ):
         super().__init__()
         if min(n_users, n_items, id_dim) <= 0:
@@ -121,13 +122,19 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
         self.constant_gate = (
             None if constant_gate is None else float(constant_gate)
         )
+        self.learn_gate_offset = bool(learn_gate_offset)
 
         self.E_u = nn.Embedding(n_users, id_dim)
         self.E_i = nn.Embedding(n_items, id_dim)
         nn.init.normal_(self.E_u.weight, std=0.1)
         nn.init.normal_(self.E_i.weight, std=0.1)
-        if self.constant_gate is None:
+        if self.constant_gate is None and self.learn_gate_offset:
             self.gate_offset_parameter = nn.Parameter(torch.zeros(()))
+            self.gate_slope_parameter = nn.Parameter(torch.zeros(()))
+        elif self.constant_gate is None:
+            self.register_buffer(
+                "gate_offset_parameter", torch.zeros(()), persistent=False
+            )
             self.gate_slope_parameter = nn.Parameter(torch.zeros(()))
         else:
             self.register_buffer(
@@ -277,10 +284,15 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
             "joint_end_to_end_training": True,
             "external_reranking": False,
             "n_gate_mode": (
-                "learned_q_n_conditioned"
+                (
+                    "learned_q_n_slope_without_offset"
+                    if not self.learn_gate_offset
+                    else "learned_q_n_conditioned"
+                )
                 if self.constant_gate is None
                 else "fixed_constant"
             ),
+            "learn_gate_offset": self.learn_gate_offset,
             "constant_gate": self.constant_gate,
             "n_gate_offset": float(self.gate_offset_parameter),
             "n_gate_slope": float(self.gate_slope_parameter),
