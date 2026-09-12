@@ -1,9 +1,9 @@
-"""Two-arm mechanism controls for the N-conditioned value-basis M5.
+"""Standalone mechanism controls for the N-conditioned value-basis M5.
 
-The completed observed M5 and its matched M4 reference are reused.  This
-runner trains only (1) a degree-matched joint q_N/q_V assignment control and
-(2) a q_V-only control with the same maximum constant gate as the observed
-model.  M4 always keeps its observed q_C and user-bin fit.
+This runner trains the observed M5, a degree-matched joint q_N/q_V assignment
+control, and a q_V-only constant-gate control in the same run.  It has no
+dependency on a previously saved result.  M4 always keeps its observed q_C
+and user-bin fit.
 """
 
 from __future__ import annotations
@@ -27,15 +27,16 @@ import lightgcn_clv_m5_n_conditioned_value_basis_screen as base
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m5-n-conditioned-value-basis-controls-development-screen-v1"
-EXPECTED_ACTUAL_CODE_VERSION = base.CODE_VERSION
-EXPECTED_ACTUAL_SOURCE_REVISION = "5eb1bcbd8e6ab75d2e77a45b1cf6881c010f207d"
-M4_MODEL_ID = base.M4_MODEL_ID
+CODE_VERSION = "m5-n-conditioned-value-basis-controls-development-screen-v2"
 ACTUAL_M5_MODEL_ID = base.BASIS_M5_MODEL_ID
 SHUFFLED_M5_MODEL_ID = "m5_n_conditioned_value_basis_degree_matched_nv_shuffle"
 V_ONLY_M5_MODEL_ID = "m5_value_basis_constant_gate_personalized_positive_weight_k5"
-REUSED_MODEL_IDS = (M4_MODEL_ID, ACTUAL_M5_MODEL_ID)
-TRAINED_MODEL_IDS = (SHUFFLED_M5_MODEL_ID, V_ONLY_M5_MODEL_ID)
+REUSED_MODEL_IDS: tuple[str, ...] = ()
+TRAINED_MODEL_IDS = (
+    ACTUAL_M5_MODEL_ID,
+    SHUFFLED_M5_MODEL_ID,
+    V_ONLY_M5_MODEL_ID,
+)
 MODEL_IDS = REUSED_MODEL_IDS + TRAINED_MODEL_IDS
 ECONOMIC_METRICS = base.ECONOMIC_METRICS
 ACCURACY_METRICS = base.ACCURACY_METRICS
@@ -43,7 +44,6 @@ ACCURACY_METRICS = base.ACCURACY_METRICS
 
 @dataclass(frozen=True)
 class M5NConditionedValueBasisControlsConfig(base.M5NConditionedValueBasisConfig):
-    actual_result_json: str = ""
     constant_gate: float = 1.25
 
 
@@ -55,12 +55,7 @@ def configure_value_basis_controls(
     defaults = asdict(base_cfg) | {
         "out_dir": (
             f"{data_root}"
-            "_m5_n_conditioned_value_basis_controls_development_screen_v1"
-        ),
-        "actual_result_json": (
-            f"{data_root}"
-            "_m5_n_conditioned_value_basis_reuse_controls_development_screen_v2/"
-            "m5_n_conditioned_value_basis_bea6e1d8bf5b.json"
+            "_m5_n_conditioned_value_basis_controls_development_screen_v2"
         ),
         "constant_gate": 1.25,
     }
@@ -73,8 +68,6 @@ def validate_config(
     cfg: M5NConditionedValueBasisControlsConfig,
 ) -> M5NConditionedValueBasisControlsConfig:
     base.validate_config(cfg)
-    if not cfg.actual_result_json:
-        raise ValueError("완료 actual M5 결과 JSON이 필요합니다")
     if cfg.constant_gate != 1.25:
         raise ValueError("V-only 대조군은 사전 고정 constant_gate=1.25여야 합니다")
     return cfg
@@ -88,9 +81,9 @@ def preflight_summary(cfg: M5NConditionedValueBasisControlsConfig) -> dict:
         "seed": cfg.seed,
         "split": "historical_development_days_684_690",
         "trained_models": list(TRAINED_MODEL_IDS),
-        "reused_models": list(REUSED_MODEL_IDS),
+        "reused_models": [],
         "research_question": (
-            "Did the completed M5 benefit from correctly assigned q_N/q_V, "
+            "Did the observed M5 benefit from correctly assigned q_N/q_V, "
             "and did q_N add anything beyond the observed q_V basis at the same "
             "effective gate ceiling?"
         ),
@@ -141,7 +134,6 @@ def preflight_summary(cfg: M5NConditionedValueBasisControlsConfig) -> dict:
                 "stability, generalization, or final CLV-effect claim"
             ),
         },
-        "actual_result_json": cfg.actual_result_json,
         "out_dir": cfg.out_dir,
     }
 
@@ -261,6 +253,18 @@ def arm_specifications(
 ) -> list[dict]:
     return [
         {
+            "model_id": ACTUAL_M5_MODEL_ID,
+            "role": "observed_nv_actual_m5",
+            "architecture": "q_n_conditioned_basis",
+            "rho": cfg.rho,
+            "weighted": True,
+            "assignment": prepared,
+            "assignment_name": "observed_m4",
+            "m2_assignment": prepared["m2_actual"],
+            "m2_assignment_name": "observed_nv",
+            "constant_gate": None,
+        },
+        {
             "model_id": SHUFFLED_M5_MODEL_ID,
             "role": "degree_matched_nv_assignment_control",
             "architecture": "q_n_conditioned_basis",
@@ -314,120 +318,7 @@ def _build_model(
     ).to(v3.DEVICE)
 
 
-def _find_one(rows: list[dict], model_id: str, label: str) -> dict:
-    selected = [row for row in rows if row.get("model_id") == model_id]
-    if len(selected) != 1:
-        raise RuntimeError(f"{label}의 {model_id} 행이 정확히 하나가 아닙니다")
-    return dict(selected[0])
-
-
-def load_completed_references(
-    cfg: M5NConditionedValueBasisControlsConfig,
-    prepared: dict,
-) -> tuple[dict[str, dict], dict]:
-    source = Path(cfg.actual_result_json)
-    if not source.exists():
-        raise FileNotFoundError(f"완료 actual M5 결과 JSON이 없습니다: {source}")
-    payload = json.loads(source.read_text(encoding="utf-8"))
-    if payload.get("code_version") != EXPECTED_ACTUAL_CODE_VERSION:
-        raise RuntimeError("완료 actual M5 code_version이 고정값과 다릅니다")
-    if payload.get("source_revision") != EXPECTED_ACTUAL_SOURCE_REVISION:
-        raise RuntimeError("완료 actual M5 source revision이 고정값과 다릅니다")
-    if payload.get("input_manifest") != prepared["manifest"]:
-        raise RuntimeError("완료 actual M5와 현재 입력 manifest가 다릅니다")
-    if not payload.get("screening_reading", {}).get("directional_screen_pass"):
-        raise RuntimeError("완료 actual M5가 사전 방향성 screen을 통과하지 않았습니다")
-
-    expected_config = {
-        key: getattr(cfg, key)
-        for key in (
-            "dataset",
-            "seed",
-            "time_cutoff",
-            "evaluation_days",
-            "epochs",
-            "id_dim",
-            "economic_dim",
-            "economic_bins",
-            "shrinkage_strength",
-            "rho",
-            "gate_delta",
-            "basis_bandwidth",
-            "positive_weight_lambda",
-            "n_layers",
-            "negative_count",
-            "batch_size",
-            "lr",
-            "pref_reg",
-            "input_days",
-        )
-    }
-    source_config = payload.get("config", {})
-    mismatches = {
-        key: (source_config.get(key), expected)
-        for key, expected in expected_config.items()
-        if source_config.get(key) != expected
-    }
-    if mismatches:
-        raise RuntimeError(f"완료 actual M5 설정 불일치: {mismatches}")
-
-    actual_row = _find_one(
-        payload.get("absolute_rows", []), ACTUAL_M5_MODEL_ID, "absolute_rows"
-    )
-    m4_row = _find_one(
-        payload.get("absolute_rows", []), M4_MODEL_ID, "absolute_rows"
-    )
-    actual_arm = payload.get("arms", {}).get(ACTUAL_M5_MODEL_ID)
-    m4_arm = (
-        payload.get("reused_references", {})
-        .get(M4_MODEL_ID, {})
-        .get("arm")
-    )
-    if not actual_arm or not actual_arm.get("metrics"):
-        raise RuntimeError("완료 actual M5 arm 또는 지표가 없습니다")
-    if not m4_arm or not m4_arm.get("metrics"):
-        raise RuntimeError("완료 M4 reference arm 또는 지표가 없습니다")
-
-    actual_row.update(
-        {
-            "execution_source": "reused_completed_directional_run",
-            "source_result_path": str(source),
-            "source_code_version": payload["code_version"],
-            "source_revision": payload["source_revision"],
-        }
-    )
-    m4_row.update(
-        {
-            "execution_source": "reused_through_completed_directional_run",
-            "source_result_path": str(source),
-            "source_code_version": payload["code_version"],
-            "source_revision": payload["source_revision"],
-        }
-    )
-    references = {
-        M4_MODEL_ID: {"row": m4_row, "metrics": m4_arm["metrics"], "arm": m4_arm},
-        ACTUAL_M5_MODEL_ID: {
-            "row": actual_row,
-            "metrics": actual_arm["metrics"],
-            "arm": actual_arm,
-        },
-    }
-    provenance = {
-        "reused_without_retraining": True,
-        "path": str(source),
-        "code_version": payload["code_version"],
-        "source_revision": payload["source_revision"],
-        "input_manifest_match": True,
-        "config_match": True,
-        "directional_screen_pass": True,
-        "actual_n_gate_mean": actual_row.get("n_gate_mean"),
-        "actual_n_gate_std": actual_row.get("n_gate_std"),
-    }
-    return references, provenance
-
-
 def mechanism_reading(metric_rows: dict[str, dict]) -> dict:
-    m4 = metric_rows[M4_MODEL_ID]
     actual = metric_rows[ACTUAL_M5_MODEL_ID]
     shuffled = metric_rows[SHUFFLED_M5_MODEL_ID]
     v_only = metric_rows[V_ONLY_M5_MODEL_ID]
@@ -447,7 +338,6 @@ def mechanism_reading(metric_rows: dict[str, dict]) -> dict:
 
     assignment_signal = beats(shuffled)
     n_increment_signal = beats(v_only)
-    actual_beats_m4 = beats(m4)
     if assignment_signal and n_increment_signal:
         classification = "n_and_v_assignment_candidate"
     elif assignment_signal:
@@ -458,14 +348,11 @@ def mechanism_reading(metric_rows: dict[str, dict]) -> dict:
         classification = "no_assignment_or_n_increment_signal"
     return {
         "mechanism_screen_pass": bool(assignment_signal and n_increment_signal),
-        "actual_beats_m4_on_both_top10_economic_metrics": actual_beats_m4,
         "actual_beats_degree_matched_nv_shuffle": assignment_signal,
         "actual_beats_qv_only_constant_gate": n_increment_signal,
         "classification": classification,
-        "actual_minus_m4": deltas(m4),
         "actual_minus_degree_matched_nv_shuffle": deltas(shuffled),
         "actual_minus_qv_only_constant_gate": deltas(v_only),
-        "accuracy_geomean_ratio_actual_vs_m4": accuracy_geomean(m4),
         "accuracy_geomean_ratio_actual_vs_nv_shuffle": accuracy_geomean(shuffled),
         "accuracy_geomean_ratio_actual_vs_qv_only": accuracy_geomean(v_only),
         "decision_scope": (
@@ -497,9 +384,6 @@ def run_value_basis_controls(
     summary = preflight_summary(cfg)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     prepared = _prepare(cfg)
-    references, provenance = load_completed_references(cfg, prepared)
-    print("\n[재사용] 완료 M4와 actual M5를 재학습하지 않습니다.")
-    print(f"  - {provenance['path']}")
 
     arms: dict[str, dict] = {}
     models: dict[str, object] = {}
@@ -515,10 +399,8 @@ def run_value_basis_controls(
         arms[spec["model_id"]] = arm
         models[spec["model_id"]] = model
 
-    rows = [references[model_id]["row"] for model_id in REUSED_MODEL_IDS]
-    metric_rows = {
-        model_id: references[model_id]["metrics"] for model_id in REUSED_MODEL_IDS
-    }
+    rows = []
+    metric_rows = {}
     for model_id in TRAINED_MODEL_IDS:
         arm = arms[model_id]
         metric_rows[model_id] = arm["metrics"]
@@ -534,7 +416,7 @@ def run_value_basis_controls(
                 "m2_architecture": arm["m2_architecture"],
                 "m2_assignment": arm["m2_assignment"],
                 "m4_assignment": arm["clv_assignment"],
-                "execution_source": "current_two_control_run",
+                "execution_source": "current_standalone_three_arm_run",
                 "source_result_path": None,
                 "source_code_version": CODE_VERSION,
                 "source_revision": prepared["revision"],
@@ -547,19 +429,13 @@ def run_value_basis_controls(
 
     full_comparison = report_helpers._metric_comparison(
         metric_rows,
-        references=(M4_MODEL_ID, SHUFFLED_M5_MODEL_ID, V_ONLY_M5_MODEL_ID),
+        references=(SHUFFLED_M5_MODEL_ID, V_ONLY_M5_MODEL_ID),
     )
     comparison = full_comparison.loc[
         full_comparison["model_id"] == ACTUAL_M5_MODEL_ID
     ].reset_index(drop=True)
 
     score_rows = []
-    completed_scores = json.loads(
-        Path(cfg.actual_result_json).read_text(encoding="utf-8")
-    ).get("score_diagnostic_rows", [])
-    score_rows.append(
-        _find_one(completed_scores, ACTUAL_M5_MODEL_ID, "score_diagnostic_rows")
-    )
     for model_id in TRAINED_MODEL_IDS:
         users, top50 = report_helpers._masked_topk(
             models[model_id], prepared, max_k=cfg.diagnostic_max_k
@@ -596,7 +472,6 @@ def run_value_basis_controls(
             "comparison_rows": comparison.to_dict("records"),
             "score_diagnostic_rows": score_frame.to_dict("records"),
             "mechanism_reading": reading,
-            "reused_reference": provenance,
             "arms": arms,
             "result_paths": {key: str(value) for key, value in paths.items()},
         },
@@ -605,13 +480,12 @@ def run_value_basis_controls(
     frame.attrs["score_diagnostics"] = score_frame
     frame.attrs["decision"] = reading
     frame.attrs["control_diagnostics"] = prepared["control_diagnostics"]
-    frame.attrs["reference_provenance"] = provenance
     frame.attrs["preflight"] = summary
     frame.attrs["result_paths"] = {key: str(value) for key, value in paths.items()}
 
-    print("\n1) 재사용 M4·actual M5와 새 대조군 절대지표")
+    print("\n1) 같은 실행의 actual M5·N/V 순열·V-only 절대지표")
     print(frame.to_string(index=False))
-    print("\n2) M4·N/V 순열·V-only 대비 actual M5 전체 지표")
+    print("\n2) N/V 순열·V-only 대비 actual M5 전체 지표")
     print(comparison.to_string(index=False))
     print("\n3) actual·N/V 순열·V-only 경제점수 영향력")
     print(score_frame.to_string(index=False))
