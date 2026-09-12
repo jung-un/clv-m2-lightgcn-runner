@@ -207,3 +207,5 @@ def test_colab_trains_only_two_controls_once_without_test_or_holdout():
     assert "summary['fixed']['holdout_constructed'] is False" in source
     assert "degree-matched N/V 순열" in source
     assert "V-only 상수 게이트" in source
+    assert "matches = sorted(search_root.rglob(actual_filename))" in source
+    assert "이전 실험을 저장한 Google 계정" in source
