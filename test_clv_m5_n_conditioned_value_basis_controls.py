@@ -210,7 +210,7 @@ def test_colab_trains_standalone_three_arms_once_without_test_or_holdout():
 
     assert source.count("result_df = run_value_basis_controls(cfg)") == 1
     assert "TRAINED_MODEL_IDS" in source
-    assert "d603867a343dfe74ad721102b463ed929f2a091c" in source
+    assert "6672492bbd69777e33223a9343dc10a6044032ca" in source
     assert "TO_BE_PINNED" not in source
     assert "summary['fixed']['final_test_constructed'] is False" in source
     assert "summary['fixed']['holdout_constructed'] is False" in source
