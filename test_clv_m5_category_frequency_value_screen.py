@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from clv_m5_category_frequency_value_model import (
-    CategoryFrequencyFeatures,
     M5CategoryFrequencyValueLightGCN,
     build_category_frequency_features,
 )
