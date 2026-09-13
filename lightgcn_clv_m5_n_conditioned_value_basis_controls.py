@@ -27,7 +27,7 @@ import lightgcn_clv_m5_n_conditioned_value_basis_screen as base
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m5-n-conditioned-value-basis-controls-development-screen-v2"
+CODE_VERSION = "m5-clv-scaled-value-basis-controls-development-screen-v3"
 ACTUAL_M5_MODEL_ID = base.BASIS_M5_MODEL_ID
 SHUFFLED_M5_MODEL_ID = "m5_n_conditioned_value_basis_degree_matched_nv_shuffle"
 V_ONLY_M5_MODEL_ID = "m5_value_basis_constant_gate_personalized_positive_weight_k5"
@@ -162,14 +162,15 @@ def degree_matched_nv_shuffle(
     seed: int = 42,
     degree_bins: int = 10,
 ) -> dict[str, np.ndarray]:
-    """Jointly reassign q_N/q_V/valid inside binary-degree strata."""
+    """Jointly reassign q_N/q_V/q_C/valid inside binary-degree strata."""
 
     bins = np.asarray(prepared["degree_bin"], dtype=np.int64)
     q_n = np.asarray(prepared["q_n"], dtype=np.float32)
     q_v = np.asarray(prepared["q_v"], dtype=np.float32)
+    q_c = np.asarray(prepared["q_c"], dtype=np.float32)
     valid = np.asarray(prepared["clv_valid"], dtype=bool)
-    if any(values.shape != bins.shape for values in (q_n, q_v, valid)):
-        raise ValueError("degree·q_N·q_V·valid shape이 일치해야 합니다")
+    if any(values.shape != bins.shape for values in (q_n, q_v, q_c, valid)):
+        raise ValueError("degree·q_N·q_V·q_C·valid shape이 일치해야 합니다")
     if bins.ndim != 1 or np.any((bins < 0) | (bins >= degree_bins)):
         raise ValueError("degree_bin shape 또는 범위가 잘못됐습니다")
 
@@ -185,6 +186,7 @@ def degree_matched_nv_shuffle(
     return {
         "q_n": q_n[source].copy(),
         "q_v": q_v[source].copy(),
+        "q_c": q_c[source].copy(),
         "clv_valid": valid[source].copy(),
         "source_user": source,
         "degree_bin": bins.copy(),
@@ -201,6 +203,7 @@ def _prepare(cfg: M5NConditionedValueBasisControlsConfig) -> dict:
     prepared["m2_v_only"] = {
         "q_n": np.asarray(prepared["q_n"]).copy(),
         "q_v": np.asarray(prepared["q_v"]).copy(),
+        "q_c": np.asarray(prepared["q_c"]).copy(),
         "clv_valid": np.asarray(prepared["clv_valid"]).copy(),
     }
     prepared["config_hash"] = _config_hash(
@@ -226,6 +229,12 @@ def _prepare(cfg: M5NConditionedValueBasisControlsConfig) -> dict:
                 np.sort(np.asarray(prepared["q_v"])),
             )
         ),
+        "shuffle_q_c_multiset_preserved": bool(
+            np.array_equal(
+                np.sort(prepared["m2_shuffle"]["q_c"]),
+                np.sort(np.asarray(prepared["q_c"])),
+            )
+        ),
         "shuffle_valid_multiset_preserved": bool(
             np.array_equal(
                 np.sort(prepared["m2_shuffle"]["clv_valid"]),
@@ -240,6 +249,7 @@ def _prepare(cfg: M5NConditionedValueBasisControlsConfig) -> dict:
             "shuffle_same_degree_bin",
             "shuffle_q_n_multiset_preserved",
             "shuffle_q_v_multiset_preserved",
+            "shuffle_q_c_multiset_preserved",
             "shuffle_valid_multiset_preserved",
         )
     ):
@@ -304,6 +314,7 @@ def _build_model(
         n_items=data["n_items"],
         user_q_n=assignment["q_n"],
         user_q_v=assignment["q_v"],
+        user_q_c=assignment["q_c"],
         user_clv_valid=assignment["clv_valid"],
         item_price_percentile=prepared["item_amount_percentile"],
         item_price_valid=prepared["item_economic_valid"],

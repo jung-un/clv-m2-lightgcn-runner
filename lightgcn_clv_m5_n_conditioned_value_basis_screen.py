@@ -26,7 +26,7 @@ import lightgcn_clv_m5_nv_economic_positive_weight as nv
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m5-n-conditioned-value-basis-reuse-controls-development-screen-v2"
+CODE_VERSION = "m5-clv-scaled-value-basis-reuse-controls-development-screen-v3"
 M1_MODEL_ID = "m1_multineg_mean_k5"
 M4_MODEL_ID = "m4_personalized_positive_weight_k5_minimal_nv_control"
 BASIS_M2_MODEL_ID = "m2_n_conditioned_value_basis_multineg_mean_k5"
@@ -176,10 +176,25 @@ def preflight_summary(cfg: M5NConditionedValueBasisConfig) -> dict:
             "but insufficient intervention; this new hypothesis expands only "
             "that fixed value-position relation without a learnable axis rotation."
         ),
+        "c2_change_before_execution": (
+            "2026-09-13: the user value block is now scaled by q_C as well. "
+            "The previous registered version kept at least 0.75 strength for "
+            "every customer. The checkpoint diagnostic "
+            "m5-value-precision-diagnostic-v1 measured that q_V price matching "
+            "beats M1 wrong recommendations for fixed high-CLV users in both "
+            "datasets (Dunnhumby 0.611, H&M 0.605) and loses for fixed "
+            "low-CLV users in both (0.406, 0.342), with high-minus-low "
+            "bootstrap intervals [+0.204,+0.325] and [+0.231,+0.255]. "
+            "No result of this screen was seen before the change."
+        ),
         "m2": {
             "user_n": "q_N historical purchase-frequency percentile",
             "user_n_role": (
                 "bounded gate in [0.75,1.25] over the user value-position block"
+            ),
+            "user_clv_level_role": (
+                "q_C multiplies the whole user value block, so the value "
+                "matching fades out for low-CLV customers"
             ),
             "user_v": "q_V historical transaction-value percentile",
             "item_input": "train-only item amount percentile",
@@ -196,7 +211,7 @@ def preflight_summary(cfg: M5NConditionedValueBasisConfig) -> dict:
             "item_n_or_item_clv_input": False,
             "economic_graph_propagation": True,
             "joint_end_to_end_training": True,
-            "q_c_used_in_m2": False,
+            "q_c_used_in_m2": True,
         },
         "m4": {
             "formula": (
@@ -290,6 +305,7 @@ def _prepare(cfg: M5NConditionedValueBasisConfig) -> dict:
     prepared["m2_actual"] = {
         "q_n": prepared["q_n"],
         "q_v": prepared["q_v"],
+        "q_c": prepared["q_c"],
         "clv_valid": prepared["clv_valid"],
     }
     prepared["config_hash"] = _config_hash(
@@ -341,6 +357,7 @@ def _build_model(
         n_items=data["n_items"],
         user_q_n=assignment["q_n"],
         user_q_v=assignment["q_v"],
+        user_q_c=assignment["q_c"],
         user_clv_valid=assignment["clv_valid"],
         item_price_percentile=prepared["item_amount_percentile"],
         item_price_valid=prepared["item_economic_valid"],

@@ -24,7 +24,7 @@ def _adj(n_users=2, n_items=3):
     ).coalesce()
 
 
-def _model(*, rho=0.05, layers=0):
+def _model(*, rho=0.05, layers=0, q_c=(1.0, 1.0)):
     from clv_m5_n_conditioned_value_basis_model import (
         M5NConditionedValueBasisLightGCN,
     )
@@ -35,6 +35,7 @@ def _model(*, rho=0.05, layers=0):
         n_items=3,
         user_q_n=np.array([0.2, 0.9], dtype=np.float32),
         user_q_v=np.array([0.15, 0.8], dtype=np.float32),
+        user_q_c=np.asarray(q_c, dtype=np.float32),
         user_clv_valid=np.array([True, True]),
         item_price_percentile=np.array([0.1, 0.5, 0.9], dtype=np.float32),
         item_price_valid=np.array([True, True, True]),
@@ -92,6 +93,29 @@ def test_qn_is_only_a_bounded_user_gate_and_qv_sets_value_position():
     assert diagnostics["explicit_q_n_in_m2"] is True
     assert diagnostics["explicit_q_v_in_m2"] is True
     assert diagnostics["item_n_or_item_clv_input"] is False
+    assert diagnostics["q_c_in_m2"] is True
+
+
+def test_low_clv_users_lose_the_value_block_and_high_clv_users_keep_it():
+    model = _model(layers=0, q_c=(0.0, 1.0))
+
+    strength = model.value_strength().detach()
+    user, _ = model.economic_coordinates()
+
+    assert float(strength[0]) == 0.0
+    assert float(strength[1]) > 0.0
+    torch.testing.assert_close(user[0].detach(), torch.zeros(3))
+    assert float(user[1].detach().abs().sum()) > 0.0
+
+
+def test_value_block_scales_linearly_with_the_clv_percentile():
+    full = _model(layers=0, q_c=(1.0, 1.0))
+    half = _model(layers=0, q_c=(0.5, 1.0))
+
+    torch.testing.assert_close(
+        half.economic_coordinates()[0][0].detach(),
+        0.5 * full.economic_coordinates()[0][0].detach(),
+    )
 
 
 def test_id_and_value_basis_are_propagated_in_one_lightgcn():

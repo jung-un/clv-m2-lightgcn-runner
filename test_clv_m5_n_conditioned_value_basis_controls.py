@@ -32,6 +32,7 @@ def test_constant_gate_is_qv_only_and_keeps_invalid_users_inactive():
         n_items=3,
         user_q_n=np.array([0.1, 0.5, 0.9], dtype=np.float32),
         user_q_v=np.array([0.2, 0.5, 0.8], dtype=np.float32),
+        user_q_c=np.array([0.3, 0.0, 0.9], dtype=np.float32),
         user_clv_valid=np.array([True, False, True]),
         item_price_percentile=np.array([0.1, 0.5, 0.9], dtype=np.float32),
         item_price_valid=np.array([True, True, True]),
@@ -47,6 +48,9 @@ def test_constant_gate_is_qv_only_and_keeps_invalid_users_inactive():
 
     torch.testing.assert_close(
         model.n_gate(), torch.tensor([1.25, 0.0, 1.25])
+    )
+    torch.testing.assert_close(
+        model.value_strength(), torch.tensor([0.375, 0.0, 1.125])
     )
     assert "gate_offset_parameter" not in dict(model.named_parameters())
     assert "gate_slope_parameter" not in dict(model.named_parameters())
@@ -68,6 +72,7 @@ def test_constant_gate_must_stay_inside_the_predeclared_gate_range():
             n_items=3,
             user_q_n=np.array([0.1, 0.5, 0.9], dtype=np.float32),
             user_q_v=np.array([0.2, 0.5, 0.8], dtype=np.float32),
+            user_q_c=np.array([0.2, 0.5, 0.8], dtype=np.float32),
             user_clv_valid=np.array([True, True, True]),
             item_price_percentile=np.array([0.1, 0.5, 0.9], dtype=np.float32),
             item_price_valid=np.array([True, True, True]),
@@ -89,6 +94,7 @@ def test_joint_nv_shuffle_preserves_tuples_inside_degree_bins():
         "degree_bin": np.array([0, 0, 0, 1, 1, 1]),
         "q_n": np.array([0.1, 0.2, 0.3, 0.6, 0.7, 0.8], dtype=np.float32),
         "q_v": np.array([0.9, 0.8, 0.7, 0.4, 0.3, 0.2], dtype=np.float32),
+        "q_c": np.array([0.15, 0.25, 0.35, 0.55, 0.65, 0.75], dtype=np.float32),
         "clv_valid": np.array([True, True, False, True, False, True]),
     }
     shuffled = runner.degree_matched_nv_shuffle(
@@ -102,6 +108,7 @@ def test_joint_nv_shuffle_preserves_tuples_inside_degree_bins():
         zip(
             prepared["q_n"],
             prepared["q_v"],
+            prepared["q_c"],
             prepared["clv_valid"],
             strict=True,
         )
@@ -110,6 +117,7 @@ def test_joint_nv_shuffle_preserves_tuples_inside_degree_bins():
         zip(
             shuffled["q_n"],
             shuffled["q_v"],
+            shuffled["q_c"],
             shuffled["clv_valid"],
             strict=True,
         )

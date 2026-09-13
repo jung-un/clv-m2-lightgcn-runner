@@ -44,6 +44,12 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
     repeat-prone products. q_V and item price percentiles share a fixed
     three-dimensional value-position basis. ID and value coordinates are
     propagated together by the same binary LightGCN.
+
+    The whole user value block is scaled by the historical CLV percentile
+    q_C, so customers with no measured value receive no value matching at
+    all. The 2026-09-13 checkpoint diagnostic measured that this matching
+    helps fixed high-CLV users in both datasets (Dunnhumby 0.611, H&M 0.605)
+    and hurts fixed low-CLV users in both (0.406, 0.342).
     """
 
     def __init__(
@@ -53,6 +59,7 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
         n_items: int,
         user_q_n: np.ndarray,
         user_q_v: np.ndarray,
+        user_q_c: np.ndarray,
         user_clv_valid: np.ndarray,
         item_price_percentile: np.ndarray,
         item_price_valid: np.ndarray,
@@ -84,24 +91,26 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
 
         q_n = np.asarray(user_q_n, dtype=np.float32)
         q_v = np.asarray(user_q_v, dtype=np.float32)
+        q_c = np.asarray(user_q_c, dtype=np.float32)
         user_valid = np.asarray(user_clv_valid, dtype=bool)
         item_price = np.asarray(item_price_percentile, dtype=np.float32)
         item_valid = np.asarray(item_price_valid, dtype=bool)
         for name, values, expected in (
             ("user_q_n", q_n, (n_users,)),
             ("user_q_v", q_v, (n_users,)),
+            ("user_q_c", q_c, (n_users,)),
             ("user_clv_valid", user_valid, (n_users,)),
             ("item_price_percentile", item_price, (n_items,)),
             ("item_price_valid", item_valid, (n_items,)),
         ):
             if values.shape != expected:
                 raise ValueError(f"{name} shape이 잘못됐습니다")
-        if not np.isfinite(q_n).all() or not np.isfinite(q_v).all():
-            raise ValueError("q_N·q_V는 모두 유한해야 합니다")
-        if np.any((q_n < 0.0) | (q_n > 1.0)) or np.any(
-            (q_v < 0.0) | (q_v > 1.0)
+        if not all(np.isfinite(values).all() for values in (q_n, q_v, q_c)):
+            raise ValueError("q_N·q_V·q_C는 모두 유한해야 합니다")
+        if any(
+            np.any((values < 0.0) | (values > 1.0)) for values in (q_n, q_v, q_c)
         ):
-            raise ValueError("q_N·q_V 범위는 [0,1]이어야 합니다")
+            raise ValueError("q_N·q_V·q_C 범위는 [0,1]이어야 합니다")
 
         user_basis = fixed_value_basis(
             q_v, user_valid, bandwidth=basis_bandwidth
@@ -148,6 +157,9 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
             "user_q_n_centered", torch.from_numpy(2.0 * q_n - 1.0), persistent=False
         )
         self.register_buffer(
+            "user_clv_level", torch.from_numpy(q_c.copy()), persistent=False
+        )
+        self.register_buffer(
             "user_clv_valid",
             torch.from_numpy(user_valid.astype(np.float32)),
             persistent=False,
@@ -173,8 +185,14 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
         gate = 1.0 + self.gate_delta * torch.tanh(raw)
         return gate * self.user_clv_valid
 
+    def value_strength(self) -> torch.Tensor:
+        """Per-user strength of the value block: q_C times the q_N gate."""
+
+        return self.n_gate() * self.user_clv_level
+
     def economic_coordinates(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.n_gate()[:, None] * self.user_value_basis, self.item_value_basis
+        strength = self.value_strength()
+        return strength[:, None] * self.user_value_basis, self.item_value_basis
 
     def layer0_embeddings(self) -> tuple[torch.Tensor, torch.Tensor]:
         user_value, item_value = self.economic_coordinates()
@@ -259,8 +277,10 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
     @torch.no_grad()
     def representation_diagnostics(self) -> dict[str, float | int | bool | str]:
         gate = self.n_gate()
+        strength = self.value_strength()
         valid = self.user_clv_valid > 0.0
         valid_gate = gate[valid]
+        valid_strength = strength[valid]
         return {
             "rho": self.rho,
             "id_dim": self.id_dim,
@@ -269,7 +289,11 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
             "n_layers": self.n_layers,
             "explicit_q_n_in_m2": self.constant_gate is None,
             "explicit_q_v_in_m2": True,
-            "q_c_in_m2": False,
+            "q_c_in_m2": True,
+            "q_c_role": "multiplies the whole user value block strength",
+            "value_strength_mean": float(valid_strength.mean()) if valid.any() else 0.0,
+            "value_strength_min": float(valid_strength.min()) if valid.any() else 0.0,
+            "value_strength_max": float(valid_strength.max()) if valid.any() else 0.0,
             "item_n_or_item_clv_input": False,
             "n_role": (
                 "bounded strength of the user value-position basis"
