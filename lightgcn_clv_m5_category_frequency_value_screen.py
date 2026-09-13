@@ -140,6 +140,8 @@ def preflight_summary(cfg: M5CategoryFrequencyValueConfig) -> dict:
         "seed": cfg.seed,
         "split": "historical_development_days_684_690",
         "trained_models": list(MODEL_IDS),
+        "reused_models": [],
+        "prior_result_file_required": False,
         "research_question": (
             "Within M5, does allocating the unchanged historical purchase-"
             "frequency component q_N over user-specific categories improve the "
@@ -238,7 +240,12 @@ def _config_hash(
 
 
 def _prepare(cfg: M5CategoryFrequencyValueConfig) -> dict:
-    prepared = legacy.common._prepare(legacy._common_config(cfg))
+    # The shared loader normally looks up a completed M1 result.  This screen
+    # trains and compares only its two arms, so no prior-result file is needed.
+    with patch.object(
+        legacy.common.gatefree, "_load_compatible_baseline", return_value=None
+    ):
+        prepared = legacy.common._prepare(legacy._common_config(cfg))
     economic = nv.build_nv_economic_inputs(
         prepared["data"]["train"],
         n_users=prepared["data"]["n_users"],
