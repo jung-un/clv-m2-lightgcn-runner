@@ -6,7 +6,9 @@ import csv
 import hashlib
 import json
 import os
+import pickle
 import time
+import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +26,32 @@ class RunIdentity:
     config_hash: str
     source_revision: str
     input_hash: str
+
+
+CORRUPT_CHECKPOINT_ERRORS = (
+    EOFError,
+    RuntimeError,
+    pickle.UnpicklingError,
+    zipfile.BadZipFile,
+)
+
+
+def load_checkpoint_or_discard(path: Path, **load_kwargs: Any):
+    """Load a resume checkpoint, or delete it and return None if truncated.
+
+    Drive writes are interrupted often enough that a zero-length or partial
+    checkpoint would otherwise stop every later run of the same arm. Training
+    restarts from scratch instead, so no result is silently reused.
+    """
+
+    try:
+        return torch.load(
+            path, map_location="cpu", weights_only=False, **load_kwargs
+        )
+    except CORRUPT_CHECKPOINT_ERRORS as error:
+        print(f"  [경고] 손상된 checkpoint를 버리고 처음부터 학습합니다: {path} ({error})")
+        path.unlink(missing_ok=True)
+        return None
 
 
 def clone_state(module: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -183,11 +211,9 @@ class ProgressStore:
     ) -> dict[str, Any] | None:
         if not self.latest_checkpoint.exists():
             return None
-        payload = torch.load(
-            self.latest_checkpoint,
-            map_location="cpu",
-            weights_only=False,
-        )
+        payload = load_checkpoint_or_discard(self.latest_checkpoint)
+        if payload is None:
+            return None
         self._validate_identity(payload.get("identity", {}))
         model.load_state_dict(payload["model_state"])
         optimizer.load_state_dict(payload["optimizer_state"])

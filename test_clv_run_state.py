@@ -127,3 +127,27 @@ def test_completed_checkpoint_is_detected(tmp_path):
 
     assert store.is_complete() is True
     assert store.read_progress()["checkpoint_sha256"] == "deadbeef"
+
+
+def test_truncated_checkpoint_is_discarded_instead_of_raising(tmp_path):
+    import clv_run_state
+
+    path = tmp_path / "latest.pt"
+    path.write_bytes(b"")
+
+    assert clv_run_state.load_checkpoint_or_discard(path) is None
+    assert not path.exists()
+
+
+def test_intact_checkpoint_still_loads(tmp_path):
+    import torch
+
+    import clv_run_state
+
+    path = tmp_path / "latest.pt"
+    torch.save({"epoch": 3}, path)
+
+    payload = clv_run_state.load_checkpoint_or_discard(path)
+
+    assert payload == {"epoch": 3}
+    assert path.exists()

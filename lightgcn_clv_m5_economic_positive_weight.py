@@ -20,7 +20,13 @@ from clv_m5_economic_positive_weight_model import (
     positive_row_weights,
     weighted_multi_negative_bpr,
 )
-from clv_run_state import ProgressStore, RunIdentity, clone_state, file_sha256
+from clv_run_state import (
+    ProgressStore,
+    RunIdentity,
+    clone_state,
+    file_sha256,
+    load_checkpoint_or_discard,
+)
 import lightgcn_clv_axis_specific_test10 as test10
 import lightgcn_clv_gated_relation_overall_price as common
 import lightgcn_clv_gradient_isolated_economic_interaction as report_helpers
@@ -682,13 +688,18 @@ def _run_arm(
 ) -> tuple[dict, M5EconomicLightGCN]:
     paths = _arm_paths(prepared, cfg, spec["model_id"])
     model = _build_model(prepared, cfg, spec)
-    if paths["result"].exists() and paths["checkpoint"].exists():
+    checkpoint = (
+        load_checkpoint_or_discard(paths["checkpoint"])
+        if paths["result"].exists() and paths["checkpoint"].exists()
+        else None
+    )
+    if checkpoint is not None:
         print(f"  [cached] {spec['model_id']} 완료 결과 재사용")
         payload = json.loads(paths["result"].read_text(encoding="utf-8"))
-        checkpoint = torch.load(paths["checkpoint"], map_location=v3.DEVICE)
         if checkpoint.get("input_hash") != prepared["input_hash"]:
             raise RuntimeError("cached checkpoint와 현재 입력 hash가 다릅니다")
         model.load_state_dict(checkpoint["state"], strict=True)
+        model.to(v3.DEVICE)
         model.eval()
         return payload, model
 
