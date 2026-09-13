@@ -68,6 +68,7 @@ def test_no_offset_gate_learns_only_the_qn_slope():
         n_items=3,
         user_q_n=np.array([0.1, 0.5, 0.9], dtype=np.float32),
         user_q_v=np.array([0.2, 0.5, 0.8], dtype=np.float32),
+        user_q_c=np.array([0.15, 0.5, 0.85], dtype=np.float32),
         user_clv_valid=np.array([True, True, True]),
         item_price_percentile=np.array([0.1, 0.5, 0.9], dtype=np.float32),
         item_price_valid=np.array([True, True, True]),
@@ -103,6 +104,7 @@ def test_four_arms_change_only_n_proxy_and_keep_plain_m2(tmp_path):
     prepared = {
         "q_n": np.array([0.2, 0.8, 0.0], dtype=np.float32),
         "q_v": np.array([0.3, 0.7, 0.0], dtype=np.float32),
+        "q_c": np.array([0.25, 0.75, 0.0], dtype=np.float32),
         "clv_valid": observed,
         "n_proxy_candidates": {
             "repeat_rate": np.array([0.2, 0.8, 0.0], dtype=np.float32),

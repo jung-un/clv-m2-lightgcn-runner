@@ -355,6 +355,7 @@ def _model_kwargs(prepared: dict, cfg: M5ValueBasisRepeatFrequencyConfig) -> dic
         "n_items": data["n_items"],
         "user_q_n": prepared["q_n"],
         "user_q_v": prepared["q_v"],
+        "user_q_c": prepared["q_c"],
         "user_clv_valid": prepared["clv_valid"],
         "item_price_percentile": prepared["item_amount_percentile"],
         "item_price_valid": prepared["item_economic_valid"],

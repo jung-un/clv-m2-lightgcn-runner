@@ -240,6 +240,7 @@ def _prepare(cfg: M2NProxyValueBasisConfig) -> dict:
 def arm_specifications(prepared: dict, cfg: M2NProxyValueBasisConfig) -> list[dict]:
     common = {
         "q_v": prepared["q_v"],
+        "q_c": prepared["q_c"],
         "clv_valid": prepared["clv_valid"],
     }
     candidates = prepared["n_proxy_candidates"]
@@ -299,6 +300,7 @@ def _build_model(prepared: dict, cfg: M2NProxyValueBasisConfig, spec: dict):
         n_items=data["n_items"],
         user_q_n=assignment["q_n"],
         user_q_v=assignment["q_v"],
+        user_q_c=assignment["q_c"],
         user_clv_valid=assignment["clv_valid"],
         item_price_percentile=prepared["item_amount_percentile"],
         item_price_valid=prepared["item_economic_valid"],
