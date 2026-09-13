@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -275,3 +278,23 @@ def test_reading_requires_both_top10_economic_metrics():
 
     rows[runner.M3_N_MODEL_ID]["vndcg@10"] = 0.99
     assert runner.screening_reading(rows)["n_m3_directional_pass"] is False
+
+
+def test_colab_runs_two_arm_development_screen_once():
+    notebook = json.loads(
+        Path(
+            "clv_m5_value_basis_repeat_frequency_first_hop_dunnhumby_colab.ipynb"
+        ).read_text(encoding="utf-8")
+    )
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert source.count(
+        "result_df = run_value_basis_repeat_frequency_screen(cfg)"
+    ) == 1
+    assert "historical_development_days_684_690" in source
+    assert "summary['fixed']['final_test_constructed'] is False" in source
+    assert "summary['fixed']['holdout_constructed'] is False" in source
+    assert "d5d7462ec459a6e67d160ed4b853afb7b0ebfcb3" in source
+    assert "TO_BE_PINNED" not in source
