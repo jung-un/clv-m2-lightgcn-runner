@@ -298,7 +298,11 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
             "n_role": (
                 "bounded strength of the user value-position basis"
                 if self.constant_gate is None
-                else "constant-gate q_V-only ablation"
+                else (
+                    "no separate q_N gate; q_C is the user value-block strength"
+                    if self.constant_gate == 1.0
+                    else "fixed-gate value-basis control"
+                )
             ),
             "v_role": "user transaction-value position versus item price position",
             "basis": "fixed normalized Gaussian RBF at 0.0, 0.5, 1.0",
