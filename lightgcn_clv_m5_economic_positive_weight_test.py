@@ -659,17 +659,23 @@ def _persist(
     mean_frame = pd.DataFrame(mean_rows)
 
     comparison_rows = []
-    reference_names = (
-        "M1_MODEL_ID",
-        "M4P_MODEL_ID",
-        "M5_SHUFFLED_MODEL_ID",
-        "M5_DEGREE_GATE_MODEL_ID",
-    )
-    references = tuple(
-        model_id
-        for name in reference_names
-        if (model_id := getattr(screen, name, None)) in MODEL_IDS
-    )
+    custom_references = getattr(screen, "COMPARISON_REFERENCE_IDS", None)
+    if custom_references is None:
+        reference_names = (
+            "M1_MODEL_ID",
+            "M4P_MODEL_ID",
+            "M5_SHUFFLED_MODEL_ID",
+            "M5_DEGREE_GATE_MODEL_ID",
+        )
+        references = tuple(
+            model_id
+            for name in reference_names
+            if (model_id := getattr(screen, name, None)) in MODEL_IDS
+        )
+    else:
+        references = tuple(
+            model_id for model_id in custom_references if model_id in MODEL_IDS
+        )
     for seed in cfg.seeds:
         for reference in references:
             for model_id in MODEL_IDS:
@@ -802,7 +808,7 @@ def run_m5_economic_positive_test(
     print(frame.to_string(index=False))
     print("\n동일 seed 대조군 비교:")
     print(frame.attrs["comparison"].to_string(index=False))
-    print("\nM2×M4' 상호작용:")
+    print(f"\n{getattr(screen, 'INTERACTION_LABEL', 'M2×M4 상호작용')}:")
     print(frame.attrs["interaction"].to_string(index=False))
     print("결과 파일:", frame.attrs["result_paths"])
     return frame
