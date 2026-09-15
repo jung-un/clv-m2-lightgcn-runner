@@ -72,6 +72,7 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
         basis_bandwidth: float = 0.25,
         constant_gate: float | None = None,
         learn_gate_offset: bool = True,
+        economic_propagation: bool = True,
     ):
         super().__init__()
         if min(n_users, n_items, id_dim) <= 0:
@@ -132,6 +133,7 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
             None if constant_gate is None else float(constant_gate)
         )
         self.learn_gate_offset = bool(learn_gate_offset)
+        self.economic_propagation = bool(economic_propagation)
 
         self.E_u = nn.Embedding(n_users, id_dim)
         self.E_i = nn.Embedding(n_items, id_dim)
@@ -217,7 +219,17 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
         return self._propagate(self.E_u.weight, self.E_i.weight)
 
     def propagated_embeddings(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._propagate(*self.layer0_embeddings())
+        if self.economic_propagation:
+            return self._propagate(*self.layer0_embeddings())
+        # The value block keeps each user's own CLV position: it is appended
+        # after ID propagation instead of being averaged with neighbours.
+        user_id, item_id = self.id_embeddings()
+        user_value, item_value = self.economic_coordinates()
+        scale = math.sqrt(self.rho)
+        return (
+            torch.cat([user_id, scale * user_value], dim=1),
+            torch.cat([item_id, scale * item_value], dim=1),
+        )
 
     def embeddings(self, need_value: bool = True):
         user, item = self.propagated_embeddings()
@@ -308,7 +320,7 @@ class M5NConditionedValueBasisLightGCN(nn.Module):
             "basis": "fixed normalized Gaussian RBF at 0.0, 0.5, 1.0",
             "basis_bandwidth": self.basis_bandwidth,
             "semantic_axis_rotation": False,
-            "economic_graph_propagation": True,
+            "economic_graph_propagation": self.economic_propagation,
             "joint_end_to_end_training": True,
             "external_reranking": False,
             "n_gate_mode": (
