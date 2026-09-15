@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -148,3 +151,22 @@ def test_seed42_config_rejects_unrequested_changes(tmp_path, field, value):
         runner.configure_minimal_scalar_clv_test_run(
             out_dir=str(tmp_path / "results"), **{field: value}
         )
+
+
+def test_colab_runs_one_seed_and_five_minimal_models():
+    path = Path(
+        "clv_m5_minimal_scalar_historical_clv_m1_m5_"
+        "dunnhumby_test_seed42_colab.ipynb"
+    )
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert source.count("result_df = run_minimal_scalar_clv_test(cfg)") == 1
+    assert "cfg.seeds == (42,)" in source
+    assert "cfg.negative_count == 1" in source
+    assert "cfg.economic_dim == 1" in source
+    assert "len(summary['models']) == 5" in source
+    assert "2933194dfcbe6d2e438aefaa24a5fb649ad5ec35" in source
+    assert "TO_BE_PINNED" not in source
