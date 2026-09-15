@@ -29,11 +29,24 @@ def test_k1_config_locks_only_requested_ten_seed_protocol(tmp_path):
     assert len(screen.MODEL_IDS) == 4
 
 
+def test_k1_seed42_config_runs_only_four_fresh_arms(tmp_path):
+    cfg = runner.configure_m5_nv_economic_positive_k1_seed42_run(
+        out_dir=str(tmp_path / "seed42")
+    )
+
+    assert cfg.seeds == (42,)
+    assert cfg.negative_count == 1
+    assert cfg.reused_seed42_json == ""
+    summary = runner.preflight_summary(cfg)
+    assert "single-seed" in summary["protocol_status"]
+    assert summary["reporting"]["primary_output"].startswith("seed-42")
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("negative_count", 5),
-        ("seeds", (42,)),
+        ("seeds", (43,)),
         ("epochs", 99),
         ("n_layers", 3),
         ("lr", 1e-3),
@@ -130,4 +143,24 @@ def test_colab_runs_the_locked_four_arm_ten_seed_job():
     assert "cfg.negative_count == 1" in source
     assert "len(summary['models']) == 4" in source
     assert "summary['protocol_status']" in source
+    assert "TO_BE_PINNED" not in source
+
+
+def test_seed42_colab_runs_only_the_four_requested_arms():
+    notebook_path = Path(
+        "clv_m5_explicit_nv_personalized_economic_positive_weight_"
+        "dunnhumby_test_seed42_k1_colab.ipynb"
+    )
+    if not notebook_path.exists():
+        pytest.skip("seed-42 notebook is added after the source commit is pinned")
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert source.count("result_df = run_m5_nv_economic_positive_k1_test(cfg)") == 1
+    assert "configure_m5_nv_economic_positive_k1_seed42_run" in source
+    assert "cfg.seeds == (42,)" in source
+    assert "cfg.negative_count == 1" in source
+    assert "len(summary['models']) == 4" in source
     assert "TO_BE_PINNED" not in source

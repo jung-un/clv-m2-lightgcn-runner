@@ -20,6 +20,7 @@ import lightgcn_clv_v3 as v3
 
 CODE_VERSION = "m5-explicit-nv-personalized-positive-weight-single-negative-bpr-test10-v1"
 M5NVEconomicPositiveK1TestConfig = base.M5EconomicPositiveTestConfig
+PILOT_SEEDS = base.PILOT_SEEDS
 FULL_SEEDS = base.FULL_SEEDS
 
 
@@ -42,12 +43,29 @@ def configure_m5_nv_economic_positive_k1_test_run(
     )
 
 
+def configure_m5_nv_economic_positive_k1_seed42_run(
+    **overrides,
+) -> M5NVEconomicPositiveK1TestConfig:
+    """Configure the requested four-arm seed-42 directional check."""
+
+    defaults = {
+        "seeds": PILOT_SEEDS,
+        "out_dir": (
+            f"{v3.default_out_dir('dunnhumby')}"
+            "_m5_explicit_nv_personalized_positive_weight_"
+            "single_negative_bpr_test_seed42_v1"
+        ),
+    }
+    return configure_m5_nv_economic_positive_k1_test_run(
+        **(defaults | overrides)
+    )
+
+
 def validate_k1_test_config(
     cfg: M5NVEconomicPositiveK1TestConfig,
 ) -> M5NVEconomicPositiveK1TestConfig:
     required = {
         "dataset": "dunnhumby",
-        "seeds": FULL_SEEDS,
         "epochs": 100,
         "id_dim": 64,
         "economic_dim": 4,
@@ -67,8 +85,10 @@ def validate_k1_test_config(
     for key, expected in required.items():
         if getattr(cfg, key) != expected:
             raise ValueError(
-                f"단일 음성 BPR 10시드 재실험은 {key}={expected!r}이어야 합니다"
+                f"단일 음성 BPR 재실험은 {key}={expected!r}이어야 합니다"
             )
+    if cfg.seeds not in {PILOT_SEEDS, FULL_SEEDS}:
+        raise ValueError("단일 음성 BPR 재실험은 seed 42 또는 seed 42~51이어야 합니다")
     if not cfg.out_dir:
         raise ValueError("단일 음성 BPR 10시드 재실험에는 out_dir가 필요합니다")
     return cfg
@@ -87,8 +107,11 @@ def preflight_summary(cfg: M5NVEconomicPositiveK1TestConfig) -> dict:
             "and M5 interventions compare with M1?"
         ),
         "protocol_status": (
-            "post-hoc baseline-loss correction on an already exposed test; "
+            "post-hoc single-seed directional check on an already exposed test; "
             "not a fresh confirmatory test"
+            if cfg.seeds == PILOT_SEEDS
+            else "post-hoc ten-seed baseline-loss correction on an already "
+            "exposed test; not a fresh confirmatory test"
         ),
         "single_changed_factor_from_prior_ten_seed_run": {
             "negative_count": "5 -> 1",
@@ -144,7 +167,11 @@ def preflight_summary(cfg: M5NVEconomicPositiveK1TestConfig) -> dict:
             "external_reranking": False,
         },
         "reporting": {
-            "primary_output": "ten-seed means and same-seed paired differences",
+            "primary_output": (
+                "seed-42 absolute metrics and within-seed differences"
+                if cfg.seeds == PILOT_SEEDS
+                else "ten-seed means and same-seed paired differences"
+            ),
             "all_accuracy_economic_exposure_segment_metrics": True,
             "model_selection_on_this_test": False,
             "significance_claim": False,
