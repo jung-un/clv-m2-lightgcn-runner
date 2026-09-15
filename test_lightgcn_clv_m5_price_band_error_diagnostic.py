@@ -53,7 +53,6 @@ def test_pairs_split_into_same_and_cross_band_with_q_v_direction():
     # missed truths: 5 (band 3), 0 (band 0); false positives: 1 (band 0), 4 (band 3)
     assert row.candidate_pair_count == 4
     assert row.same_band_pairs == 2
-    assert np.isclose(row.chance_same_band_share, 0.5)
     # cross pairs: (5 vs 1) truth closer to 0.85 -> win; (0 vs 4) -> loss
     assert row.cross_band_wins == 1
     # same pairs: (5 vs 4) truth closer -> win; (0 vs 1) truth farther -> loss
@@ -75,6 +74,11 @@ def test_false_negative_lift_compares_value_band_to_all_unbought():
     assert np.isclose(high.false_negative_lift, (1 / 2) / (2 / 5))
 
 
+def test_random_pair_same_band_share_is_one_over_bands_for_equal_counts():
+    assert np.isclose(band.random_pair_same_band_share(np.array([5, 5, 5, 5])), 0.25)
+    assert np.isclose(band.random_pair_same_band_share(np.array([10, 0, 0, 0])), 1.0)
+
+
 def test_reading_requires_enough_same_band_error_and_a_role_split():
     summary = pd.DataFrame(
         [
@@ -82,16 +86,15 @@ def test_reading_requires_enough_same_band_error_and_a_role_split():
                 "group_type": "fixed_clv_segment",
                 "group": HIGH,
                 "same_band_pair_share": 0.40,
-                "chance_same_band_share": 0.30,
                 "same_band_q_v_win_rate": 0.52,
                 "cross_band_q_v_win_rate": 0.65,
                 "false_negative_lift": 1.8,
             }
         ]
     )
-    supported = band.dataset_reading(summary)
+    supported = band.dataset_reading(summary, 0.25)
     summary.loc[0, "same_band_q_v_win_rate"] = 0.70
-    not_split = band.dataset_reading(summary)
+    not_split = band.dataset_reading(summary, 0.25)
 
     assert supported["design_supported_in_this_dataset"] is True
     assert not_split["roles_split"] is False

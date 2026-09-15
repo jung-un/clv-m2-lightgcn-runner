@@ -38,7 +38,7 @@ import lightgcn_clv_m5_value_precision_diagnostic as precision
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "m5-price-band-error-diagnostic-v1"
+CODE_VERSION = "m5-price-band-error-diagnostic-v2"
 N_BANDS = 4
 MIN_HIGH_CLV_SAME_BAND_SHARE = 0.30
 
@@ -72,8 +72,8 @@ def preflight_summary(cfg) -> dict:
         "questions": {
             "same_band_error_share": (
                 "share of (missed truth, Top-10 false positive) pairs whose "
-                "two items fall in the same price band, with the share expected "
-                "if the two items' bands were independent"
+                "two items fall in the same price band, with the share for two "
+                "items drawn at random from the catalogue"
             ),
             "division_of_labor": (
                 "q_V price-position balanced win rate separately for cross-band "
@@ -184,12 +184,6 @@ def _pair_rows(
         ).reshape(-1)
         wins = difference > tolerance
         ties = np.abs(difference) <= tolerance
-        chance = float(
-            np.sum(
-                np.bincount(missed_band, minlength=N_BANDS) / len(missed)
-                * np.bincount(false_band, minlength=N_BANDS) / len(false_positive)
-            )
-        )
 
         band = int(user_band[int(user)])
         unbought = band_sizes - purchased_by_band[position]
@@ -203,7 +197,6 @@ def _pair_rows(
                 "user_value_band": band,
                 "candidate_pair_count": int(len(same)),
                 "same_band_pairs": int(same.sum()),
-                "chance_same_band_share": chance,
                 "same_band_wins": int((wins & same).sum()),
                 "same_band_ties": int((ties & same).sum()),
                 "cross_band_wins": int((wins & ~same).sum()),
@@ -256,12 +249,6 @@ def summarize(per_user: pd.DataFrame) -> pd.DataFrame:
                 "n_users": int(len(frame)),
                 "candidate_pair_count": int(pairs),
                 "same_band_pair_share": same / pairs,
-                "chance_same_band_share": float(
-                    np.average(
-                        frame.chance_same_band_share,
-                        weights=frame.candidate_pair_count,
-                    )
-                ),
                 "same_band_q_v_win_rate": _balanced(
                     frame.same_band_wins.sum(), frame.same_band_ties.sum(), same
                 ),
@@ -278,7 +265,14 @@ def summarize(per_user: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def dataset_reading(summary: pd.DataFrame) -> dict:
+def random_pair_same_band_share(band_sizes: np.ndarray) -> float:
+    """Same-band probability for two items drawn at random from the catalogue."""
+
+    share = np.asarray(band_sizes, dtype=np.float64) / float(np.sum(band_sizes))
+    return float(np.sum(share**2))
+
+
+def dataset_reading(summary: pd.DataFrame, random_same_band_share: float) -> dict:
     high = summary[
         summary.group_type.eq("fixed_clv_segment")
         & summary.group.eq(fixed.SEGMENT_ORDER[2])
@@ -292,7 +286,7 @@ def dataset_reading(summary: pd.DataFrame) -> dict:
     split = bool(row.cross_band_q_v_win_rate > 0.5 and same_gap < cross_gap)
     return {
         "high_clv_same_band_pair_share": float(row.same_band_pair_share),
-        "high_clv_chance_same_band_share": float(row.chance_same_band_share),
+        "random_pair_same_band_share": float(random_same_band_share),
         "high_clv_same_band_q_v_win_rate": float(row.same_band_q_v_win_rate),
         "high_clv_cross_band_q_v_win_rate": float(row.cross_band_q_v_win_rate),
         "high_clv_false_negative_lift": float(row.false_negative_lift),
@@ -366,7 +360,7 @@ def run_price_band_error_diagnostic(cfg=None) -> dict[str, str]:
     if per_user.empty:
         raise RuntimeError("비교 가능한 M1 누락정답–오추천 쌍이 없습니다")
     summary = summarize(per_user)
-    reading = dataset_reading(summary)
+    reading = dataset_reading(summary, random_pair_same_band_share(band_sizes))
 
     paths = _paths(cfg)
     test10._atomic_csv(paths["summary_csv"], summary)
