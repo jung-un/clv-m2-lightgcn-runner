@@ -637,6 +637,12 @@ def _persist(
     absolute = pd.DataFrame(absolute_rows).sort_values(
         ["seed", "model_id"]
     ).reset_index(drop=True)
+    seed42_reused = bool(
+        absolute[
+            absolute["seed"].eq(42)
+            & absolute["result_origin"].eq("reused_completed_seed42_test")
+        ].shape[0]
+    )
     arm_map = {(arm["seed"], arm["model_id"]): arm for arm in arms}
 
     mean_rows = []
@@ -653,11 +659,16 @@ def _persist(
     mean_frame = pd.DataFrame(mean_rows)
 
     comparison_rows = []
-    references = (
-        screen.M1_MODEL_ID,
-        screen.M4P_MODEL_ID,
-        screen.M5_SHUFFLED_MODEL_ID,
-        screen.M5_DEGREE_GATE_MODEL_ID,
+    reference_names = (
+        "M1_MODEL_ID",
+        "M4P_MODEL_ID",
+        "M5_SHUFFLED_MODEL_ID",
+        "M5_DEGREE_GATE_MODEL_ID",
+    )
+    references = tuple(
+        model_id
+        for name in reference_names
+        if (model_id := getattr(screen, name, None)) in MODEL_IDS
     )
     for seed in cfg.seeds:
         for reference in references:
@@ -751,8 +762,8 @@ def _persist(
                 ),
                 "seed42_reuse": (
                     "the completed seed-42 test result was reused without retraining or reevaluation"
-                    if cfg.seeds == FULL_SEEDS
-                    else "not applicable to the seed-42 protocol run"
+                    if seed42_reused
+                    else "seed 42 was newly trained under the current protocol"
                 ),
             },
             "arms": arms,
