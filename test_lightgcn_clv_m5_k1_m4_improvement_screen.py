@@ -56,7 +56,7 @@ def test_first_purchase_weight_leaves_repeat_rows_at_the_base_level():
     )
 
     assert diagnostics["weight_mode"] == "first_purchase"
-    assert np.isclose(diagnostics["first_purchase_row_share"], 0.75)
+    assert np.isclose(diagnostics["weighted_row_share"], 0.75)
     # user 0 buys item 0 twice: only the first row carries the emphasis
     assert weights[0] > weights[1]
     # user 1 has q_C = 0, so its row stays at the base level like the repeat row
@@ -92,6 +92,8 @@ def test_six_arms_cross_the_value_basis_with_each_improvement():
     assert [(spec["rho"] > 0, spec["improvement"]) for spec in specs] == [
         (False, None),
         (True, None),
+        (False, "original"),
+        (True, "original"),
         (False, "first_purchase"),
         (True, "first_purchase"),
         (False, "complementary"),
@@ -116,6 +118,8 @@ def _reading(m5_first_econ, *, change=0.2, m5_first_accuracy=1.0):
     rows = {
         improvement.M1_MODEL_ID: _metrics(0.380),
         improvement.M2_MODEL_ID: _metrics(0.389),
+        improvement.M4_ORIGINAL_MODEL_ID: _metrics(0.384),
+        improvement.M5_ORIGINAL_MODEL_ID: _metrics(0.386),
         improvement.M4_FIRST_MODEL_ID: _metrics(0.384),
         improvement.M5_FIRST_MODEL_ID: _metrics(
             m5_first_econ, accuracy=m5_first_accuracy
@@ -127,6 +131,7 @@ def _reading(m5_first_econ, *, change=0.2, m5_first_accuracy=1.0):
         rows,
         top10_change_shares={
             improvement.M2_MODEL_ID: 0.19,
+            improvement.M5_ORIGINAL_MODEL_ID: 0.2,
             improvement.M5_FIRST_MODEL_ID: change,
             improvement.M5_COMPLEMENT_MODEL_ID: 0.2,
         },
@@ -147,6 +152,19 @@ def test_an_improvement_passes_only_when_m5_beats_both_parts_and_keeps_accuracy(
     assert _reading(0.395, m5_first_accuracy=0.985)["improvements"]["first_purchase"][
         "m5_accuracy_guard_vs_m4"
     ] is False
+
+
+def test_reading_compares_each_improved_m5_with_the_original_combination():
+    reading = _reading(0.395)
+    first = reading["improvements"]["first_purchase"]
+
+    assert np.isclose(
+        first["deltas_m5_minus_original_m5"][
+            "price_purchase_amount_weighted_hit@10"
+        ],
+        0.395 - 0.386,
+    )
+    assert "deltas_m5_minus_original_m5" not in reading["improvements"]["original"]
 
 
 def test_reading_reports_the_interaction_and_leaves_attribution_untested():

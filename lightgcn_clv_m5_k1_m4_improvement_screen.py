@@ -49,6 +49,8 @@ import lightgcn_clv_v3 as v3
 CODE_VERSION = "m5-k1-m4-improvement-screen-v1"
 M1_MODEL_ID = "m1_bpr_k1"
 M2_MODEL_ID = "m2_clv_scaled_value_basis_bpr_k1"
+M4_ORIGINAL_MODEL_ID = "m4_original_weight_bpr_k1"
+M5_ORIGINAL_MODEL_ID = "m5_value_basis_original_weight_bpr_k1"
 M4_FIRST_MODEL_ID = "m4_first_purchase_weight_bpr_k1"
 M5_FIRST_MODEL_ID = "m5_value_basis_first_purchase_weight_bpr_k1"
 M4_COMPLEMENT_MODEL_ID = "m4_complementary_weight_bpr_k1"
@@ -56,12 +58,15 @@ M5_COMPLEMENT_MODEL_ID = "m5_value_basis_complementary_weight_bpr_k1"
 MODEL_IDS = (
     M1_MODEL_ID,
     M2_MODEL_ID,
+    M4_ORIGINAL_MODEL_ID,
+    M5_ORIGINAL_MODEL_ID,
     M4_FIRST_MODEL_ID,
     M5_FIRST_MODEL_ID,
     M4_COMPLEMENT_MODEL_ID,
     M5_COMPLEMENT_MODEL_ID,
 )
 IMPROVEMENTS = {
+    "original": (M4_ORIGINAL_MODEL_ID, M5_ORIGINAL_MODEL_ID),
     "first_purchase": (M4_FIRST_MODEL_ID, M5_FIRST_MODEL_ID),
     "complementary": (M4_COMPLEMENT_MODEL_ID, M5_COMPLEMENT_MODEL_ID),
 }
@@ -117,6 +122,10 @@ def preflight_summary(cfg: M5K1ImprovementConfig) -> dict:
         "weights": {
             M1_MODEL_ID: "1",
             M2_MODEL_ID: "1",
+            M4_ORIGINAL_MODEL_ID: (
+                "1 + lambda*q_C*item_amount_percentile*clipped_user_bin_fit on "
+                "every train row (the current M4)"
+            ),
             M4_FIRST_MODEL_ID: (
                 "1 + lambda*q_C*item_amount_percentile*clipped_user_bin_fit on "
                 "first-purchase rows only, 1 on repeat rows"
@@ -209,7 +218,7 @@ def row_weights(
     users = prepared["data"]["tr_u"].astype(np.int64)
     items = prepared["data"]["tr_i"].astype(np.int64)
     q_c = np.asarray(prepared["q_c"], dtype=np.float64)[users]
-    if improvement == "first_purchase":
+    if improvement in {"original", "first_purchase"}:
         amount = np.asarray(prepared["item_amount_percentile"], dtype=np.float64)[items]
         fit = np.clip(
             np.asarray(prepared["user_bin_fit"], dtype=np.float64)[
@@ -218,11 +227,15 @@ def row_weights(
             0.0,
             None,
         )
-        flags = first_purchase_row_flags(prepared["data"]["train"])
-        raw = 1.0 + cfg.positive_weight_lambda * q_c * amount * fit * flags
+        applies = (
+            np.ones(rows, dtype=np.float64)
+            if improvement == "original"
+            else first_purchase_row_flags(prepared["data"]["train"]).astype(np.float64)
+        )
+        raw = 1.0 + cfg.positive_weight_lambda * q_c * amount * fit * applies
         diagnostics = {
-            "weight_mode": "first_purchase",
-            "first_purchase_row_share": float(flags.mean()),
+            "weight_mode": improvement,
+            "weighted_row_share": float((applies > 0).mean()),
         }
     elif improvement == "complementary":
         fit = np.clip(value_basis_fit(prepared, cfg), 0.0, 1.0)
@@ -253,6 +266,18 @@ def arm_specifications(cfg: M5K1ImprovementConfig) -> list[dict]:
     return [
         {"model_id": M1_MODEL_ID, "role": "k1_m1", "rho": 0.0, "improvement": None},
         {"model_id": M2_MODEL_ID, "role": "k1_m2_value_basis", "rho": cfg.rho, "improvement": None},
+        {
+            "model_id": M4_ORIGINAL_MODEL_ID,
+            "role": "k1_m4_original",
+            "rho": 0.0,
+            "improvement": "original",
+        },
+        {
+            "model_id": M5_ORIGINAL_MODEL_ID,
+            "role": "k1_m5_original",
+            "rho": cfg.rho,
+            "improvement": "original",
+        },
         {
             "model_id": M4_FIRST_MODEL_ID,
             "role": "k1_m4_first_purchase",
@@ -525,7 +550,21 @@ def improvement_reading(
                 for metric in reported
             },
         }
-    passing = [name for name, reading in readings.items() if reading["improvement_pass"]]
+    original_m5 = metric_rows[M5_ORIGINAL_MODEL_ID]
+    for name, reading in readings.items():
+        if name == "original":
+            continue
+        reading["deltas_m5_minus_original_m5"] = {
+            metric: float(
+                metric_rows[IMPROVEMENTS[name][1]][metric] - original_m5[metric]
+            )
+            for metric in TOP10_ACCURACY_METRICS + ECONOMIC_METRICS
+        }
+    passing = [
+        name
+        for name, reading in readings.items()
+        if reading["improvement_pass"] and name != "original"
+    ]
     return {
         "classification": (
             "no_improvement_passes"
@@ -584,7 +623,13 @@ def run_improvement_screen(cfg: M5K1ImprovementConfig | None = None) -> pd.DataF
         ]
     )
     comparison = report_helpers._metric_comparison(
-        metric_rows, references=(M1_MODEL_ID, M4_FIRST_MODEL_ID, M4_COMPLEMENT_MODEL_ID)
+        metric_rows,
+        references=(
+            M1_MODEL_ID,
+            M4_ORIGINAL_MODEL_ID,
+            M4_FIRST_MODEL_ID,
+            M4_COMPLEMENT_MODEL_ID,
+        ),
     )
 
     topk = {
@@ -601,6 +646,7 @@ def run_improvement_screen(cfg: M5K1ImprovementConfig | None = None) -> pd.DataF
             ).assign(reference=reference, model_id=model_id)
             for reference, model_id in (
                 (M1_MODEL_ID, M2_MODEL_ID),
+                (M4_ORIGINAL_MODEL_ID, M5_ORIGINAL_MODEL_ID),
                 (M4_FIRST_MODEL_ID, M5_FIRST_MODEL_ID),
                 (M4_COMPLEMENT_MODEL_ID, M5_COMPLEMENT_MODEL_ID),
             )
@@ -610,7 +656,12 @@ def run_improvement_screen(cfg: M5K1ImprovementConfig | None = None) -> pd.DataF
     overall = overlap[overlap.group.eq("전체")].set_index("model_id")
     change_shares = {
         model_id: float(overall.at[model_id, "top10_set_changed_user_share"])
-        for model_id in (M2_MODEL_ID, M5_FIRST_MODEL_ID, M5_COMPLEMENT_MODEL_ID)
+        for model_id in (
+            M2_MODEL_ID,
+            M5_ORIGINAL_MODEL_ID,
+            M5_FIRST_MODEL_ID,
+            M5_COMPLEMENT_MODEL_ID,
+        )
     }
     reading = improvement_reading(metric_rows, top10_change_shares=change_shares)
 
