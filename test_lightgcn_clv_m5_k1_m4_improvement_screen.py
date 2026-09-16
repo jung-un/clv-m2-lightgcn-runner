@@ -178,3 +178,81 @@ def test_reading_reports_the_interaction_and_leaves_attribution_untested():
         (0.395 - 0.384) - (0.389 - 0.380),
     )
     assert reading["clv_attribution_tested"] is False
+
+
+class _RecordingStore:
+    """Minimal ProgressStore stand-in with the real save_epoch signature."""
+
+    def __init__(self):
+        self.saved = []
+
+    def restore_epoch(self, model, optimizer, rng):
+        return None
+
+    def mark_stage(self, status, **fields):
+        return {}
+
+    def heartbeat(self, **fields):
+        return True
+
+    def save_epoch(self, model, optimizer, rng, **epoch_state):
+        self.saved.append(epoch_state)
+        return None
+
+
+def _tiny_model():
+    import torch
+
+    from clv_m5_n_conditioned_value_basis_model import (
+        M5NConditionedValueBasisLightGCN,
+    )
+
+    indices = torch.tensor([[0, 2, 1, 4], [2, 0, 4, 1]], dtype=torch.long)
+    values = torch.tensor([0.5, 0.5, 0.5, 0.5])
+    adj = torch.sparse_coo_tensor(indices, values, (6, 6), check_invariants=False).coalesce()
+    torch.manual_seed(5)
+    return M5NConditionedValueBasisLightGCN(
+        n_users=2,
+        n_items=4,
+        user_q_n=np.array([0.2, 0.8], dtype=np.float32),
+        user_q_v=np.array([0.3, 0.7], dtype=np.float32),
+        user_q_c=np.array([0.4, 0.9], dtype=np.float32),
+        user_clv_valid=np.array([True, True]),
+        item_price_percentile=np.array([0.2, 0.5, 0.7, 0.9], dtype=np.float32),
+        item_price_valid=np.array([True, True, True, True]),
+        adj=adj,
+        id_dim=4,
+        rho=0.25,
+        n_layers=1,
+        economic_propagation=False,
+    )
+
+
+def test_training_loop_runs_and_checkpoints_each_epoch():
+    prepared = {
+        "data": {
+            # user 0 bought items 0 and 1, user 1 bought item 2; items 3 and the
+            # rest stay unseen so a uniform negative always exists
+            "tr_u": np.array([0, 0, 1, 1], dtype=np.int64),
+            "tr_i": np.array([0, 1, 2, 2], dtype=np.int64),
+            "pos_key": np.array([0, 1, 6, 6], dtype=np.int64),
+            "n_items": 4,
+        }
+    }
+    cfg = improvement.M5K1ImprovementConfig(
+        out_dir="/tmp/improve", baseline_result_dir="/tmp/base", epochs=2, batch_size=2
+    )
+    store = _RecordingStore()
+
+    training = improvement._train_arm(
+        _tiny_model(),
+        prepared,
+        cfg,
+        {"model_id": "tiny"},
+        np.ones(4, dtype=np.float64),
+        store,
+    )
+
+    assert training["epochs_run"] == 2
+    assert [state["epoch"] for state in store.saved] == [1, 2]
+    assert len(training["history"]) == 2

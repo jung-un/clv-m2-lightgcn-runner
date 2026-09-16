@@ -412,7 +412,7 @@ def _train_arm(
             f"loss {record['loss']:.4f} | P(pos>neg) {record['p_correct']:.3f} | "
             f"{record['epoch_sec']:.0f}s"
         )
-        store.save_epoch(model, optimizer, rng, {"epoch": epoch, "history": history})
+        store.save_epoch(model, optimizer, rng, epoch=epoch, history=history)
     return {
         "epochs_run": int(last_epoch),
         "wall_clock_sec": round(time.time() - started, 1),
