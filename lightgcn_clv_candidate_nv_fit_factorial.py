@@ -31,6 +31,12 @@ import lightgcn_clv_v3 as v3
 
 
 CODE_VERSION = "m5-candidate-specific-nv-fit-factorial-development-screen-v1"
+# The original six-arm run completed under this revision and failed only while
+# rendering the already-saved result table.  It is safe to reuse that final
+# payload after the repr-only fix; no training/model code changed.
+RECOVERABLE_RESULT_REVISIONS = frozenset(
+    {"0fd2e6d39de99b70258b54e113fe0bdecfb9ccb0"}
+)
 M1_MODEL_ID = "m1_bpr_k1_candidate_nv_factorial"
 M2_MODEL_ID = "m2_candidate_nv_expression_bpr_k1"
 M3_MODEL_ID = "m3_candidate_nv_edge_weight_bpr_k1"
@@ -771,12 +777,76 @@ def attach_result_metadata(
     )
 
 
+def load_completed_screen_result(
+    cfg: CandidateNVFitConfig,
+) -> pd.DataFrame | None:
+    """Recover the completed pre-fix screen without retraining six arms.
+
+    The compatible revision wrote every CSV/JSON output before failing in
+    pandas' wide-table representation.  Reuse is restricted to the exact
+    config, input manifest, six arms and 100-epoch completion contract.
+    """
+
+    cfg = validate_config(cfg)
+    out = Path(cfg.out_dir)
+    if not out.exists():
+        return None
+    current_manifest = legacy.moe.build_input_manifest(v3.SCHEMA[cfg.dataset])
+    current_input_hash = legacy.moe.manifest_hash(current_manifest)
+    candidates = sorted(
+        out.glob("m5_candidate_nv_fit_*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if payload.get("code_version") != CODE_VERSION:
+            continue
+        if payload.get("source_revision") not in RECOVERABLE_RESULT_REVISIONS:
+            continue
+        if _canonical(payload.get("config")) != _canonical(asdict(cfg)):
+            continue
+        manifest = payload.get("input_manifest")
+        if not isinstance(manifest, dict):
+            continue
+        if legacy.moe.manifest_hash(manifest) != current_input_hash:
+            continue
+        rows = payload.get("absolute_rows")
+        if not isinstance(rows, list):
+            continue
+        if [row.get("model_id") for row in rows] != list(MODEL_IDS):
+            continue
+        if any(row.get("final_epoch") != cfg.epochs for row in rows):
+            continue
+        frame = pd.DataFrame(rows)
+        frame.attrs.update(
+            comparison=payload.get("comparison_rows", []),
+            top10_overlap=payload.get("top10_overlap_rows", []),
+            score_diagnostics=payload.get("score_diagnostic_rows", []),
+            mechanism_diagnostics=payload.get("mechanism_diagnostics", {}),
+            decision=payload.get("screening_reading", {}),
+            result_paths=payload.get("result_paths", {"json": str(path)}),
+        )
+        print(
+            "[cached completed screen] 학습 완료 결과를 재사용합니다: "
+            f"{path}"
+        )
+        return frame
+    return None
+
+
 def run_candidate_nv_fit_screen(
     cfg: CandidateNVFitConfig | None = None,
 ) -> pd.DataFrame:
     cfg = validate_config(cfg or configure_candidate_nv_fit_screen())
     summary = preflight_summary(cfg)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    completed = load_completed_screen_result(cfg)
+    if completed is not None:
+        return completed
     prepared = _prepare(cfg)
 
     arms: dict[str, dict] = {}

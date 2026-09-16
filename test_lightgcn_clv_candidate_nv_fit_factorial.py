@@ -1,4 +1,5 @@
 import ast
+from dataclasses import asdict
 import json
 from pathlib import Path
 
@@ -204,6 +205,53 @@ def test_result_metadata_keeps_wide_dataframe_repr_safe():
     assert frame.attrs["top10_overlap"] == overlap.to_dict("records")
     assert frame.attrs["score_diagnostics"] == score_diagnostics.to_dict("records")
     assert "[6 rows x 207 columns]" in repr(frame)
+
+
+def test_completed_screen_json_is_reused_without_retraining(tmp_path, monkeypatch):
+    cfg = screen.configure_candidate_nv_fit_screen(
+        out_dir=str(tmp_path), baseline_result_dir="/tmp/base"
+    )
+    rows = [
+        {
+            "model_id": model_id,
+            "final_epoch": cfg.epochs,
+            "recall@10": float(index),
+        }
+        for index, model_id in enumerate(screen.MODEL_IDS)
+    ]
+    payload = {
+        "code_version": screen.CODE_VERSION,
+        "source_revision": next(iter(screen.RECOVERABLE_RESULT_REVISIONS)),
+        "config": asdict(cfg),
+        "input_manifest": {
+            "transactions": {"bytes": 123, "sha256": "same-input"}
+        },
+        "absolute_rows": rows,
+        "comparison_rows": [{"metric": "recall@10"}],
+        "top10_overlap_rows": [{"changed_user_share": 0.1}],
+        "score_diagnostic_rows": [{"model_id": screen.M2_MODEL_ID}],
+        "mechanism_diagnostics": {"candidate_fit": {"std": 0.1}},
+        "screening_reading": {"classification": "directional_nonpass"},
+        "result_paths": {"json": str(tmp_path / "result.json")},
+    }
+    saved = tmp_path / "m5_candidate_nv_fit_old_hash.json"
+    saved.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        screen.legacy.moe,
+        "build_input_manifest",
+        lambda _schema: {
+            "transactions": {"bytes": 123, "sha256": "same-input"}
+        },
+    )
+
+    result = screen.load_completed_screen_result(cfg)
+
+    assert result is not None
+    assert result["model_id"].tolist() == list(screen.MODEL_IDS)
+    assert result.attrs["comparison"] == payload["comparison_rows"]
+    assert result.attrs["top10_overlap"] == payload["top10_overlap_rows"]
+    assert result.attrs["score_diagnostics"] == payload["score_diagnostic_rows"]
+    assert result.attrs["decision"] == payload["screening_reading"]
 
 
 def test_colab_pins_reviewed_source_and_runs_six_arm_screen_once():
