@@ -271,7 +271,7 @@ def test_colab_pins_reviewed_source_and_runs_six_arm_screen_once():
                 line for line in cell.splitlines() if not line.startswith("%")
             )
             ast.parse(cleaned)
-    assert "64c55158ed506549a763895861a2cfe4b1c353d2" in source
+    assert "79b78fee59496475458a8e05030ceb1c862e2f16" in source
     assert source.count("result_df = screen.run_candidate_nv_fit_screen(cfg)") == 1
     assert "cfg.negative_count == 1" in source
     assert "len(summary['trained_models']) == 6" in source
