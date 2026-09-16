@@ -1,3 +1,7 @@
+import ast
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -178,3 +182,28 @@ def test_reading_separates_baseline_direction_and_combination_increment():
     assert reading["m5a_beats_m1_on_all_four_top10_metrics"] is True
     assert reading["m5a_beats_m4_on_all_four_top10_metrics"] is True
     assert reading["clv_attribution_tested"] is False
+
+
+def test_colab_pins_reviewed_source_and_runs_six_arm_screen_once():
+    path = Path("clv_m5_candidate_nv_fit_factorial_dunnhumby_colab.ipynb")
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    code = [
+        "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if cell["cell_type"] == "code"
+    ]
+    source = "\n".join(code)
+
+    for cell in code:
+        if not cell.lstrip().startswith(("%", "!")):
+            # IPython magics only occur as standalone lines in the setup cell.
+            cleaned = "\n".join(
+                line for line in cell.splitlines() if not line.startswith("%")
+            )
+            ast.parse(cleaned)
+    assert "0fd2e6d39de99b70258b54e113fe0bdecfb9ccb0" in source
+    assert source.count("result_df = screen.run_candidate_nv_fit_screen(cfg)") == 1
+    assert "cfg.negative_count == 1" in source
+    assert "len(summary['trained_models']) == 6" in source
+    assert "final_test_constructed" in source
+    assert "holdout_constructed" in source
