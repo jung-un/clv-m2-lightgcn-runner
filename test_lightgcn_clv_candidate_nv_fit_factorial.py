@@ -184,6 +184,28 @@ def test_reading_separates_baseline_direction_and_combination_increment():
     assert reading["clv_attribution_tested"] is False
 
 
+def test_result_metadata_keeps_wide_dataframe_repr_safe():
+    frame = pd.DataFrame(np.zeros((6, 207)))
+    comparison = pd.DataFrame({"metric": ["recall@10"]})
+    overlap = pd.DataFrame({"changed_user_share": [0.1]})
+    score_diagnostics = pd.DataFrame({"model_id": [screen.M2_MODEL_ID]})
+
+    screen.attach_result_metadata(
+        frame,
+        comparison=comparison,
+        overlap=overlap,
+        score_diagnostics=score_diagnostics,
+        mechanism={"candidate_fit": {"std": 0.1}},
+        reading={"classification": "directional_nonpass"},
+        paths={"json": Path("/tmp/result.json")},
+    )
+
+    assert frame.attrs["comparison"] == comparison.to_dict("records")
+    assert frame.attrs["top10_overlap"] == overlap.to_dict("records")
+    assert frame.attrs["score_diagnostics"] == score_diagnostics.to_dict("records")
+    assert "[6 rows x 207 columns]" in repr(frame)
+
+
 def test_colab_pins_reviewed_source_and_runs_six_arm_screen_once():
     path = Path("clv_m5_candidate_nv_fit_factorial_dunnhumby_colab.ipynb")
     notebook = json.loads(path.read_text(encoding="utf-8"))

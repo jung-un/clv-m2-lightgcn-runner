@@ -749,6 +749,28 @@ def screening_reading(metric_rows: dict[str, dict]) -> dict:
     }
 
 
+def attach_result_metadata(
+    frame: pd.DataFrame,
+    *,
+    comparison: pd.DataFrame,
+    overlap: pd.DataFrame,
+    score_diagnostics: pd.DataFrame,
+    mechanism: dict,
+    reading: dict,
+    paths: dict[str, Path],
+) -> None:
+    """Attach repr-safe result metadata to the returned absolute table."""
+
+    frame.attrs.update(
+        comparison=comparison.to_dict("records"),
+        top10_overlap=overlap.to_dict("records"),
+        score_diagnostics=score_diagnostics.to_dict("records"),
+        mechanism_diagnostics=mechanism,
+        decision=reading,
+        result_paths={key: str(value) for key, value in paths.items()},
+    )
+
+
 def run_candidate_nv_fit_screen(
     cfg: CandidateNVFitConfig | None = None,
 ) -> pd.DataFrame:
@@ -878,13 +900,14 @@ def run_candidate_nv_fit_screen(
             "result_paths": {key: str(value) for key, value in paths.items()},
         },
     )
-    frame.attrs.update(
+    attach_result_metadata(
+        frame,
         comparison=comparison,
-        top10_overlap=overlap,
+        overlap=overlap,
         score_diagnostics=score_diagnostics,
-        mechanism_diagnostics=mechanism,
-        decision=reading,
-        result_paths={key: str(value) for key, value in paths.items()},
+        mechanism=mechanism,
+        reading=reading,
+        paths=paths,
     )
     print("\n1) 6-arm 절대지표")
     print(frame)
