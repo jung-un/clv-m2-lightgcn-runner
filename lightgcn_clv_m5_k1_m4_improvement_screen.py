@@ -423,7 +423,11 @@ def _train_arm(
 
 def _run_arm(prepared: dict, cfg: M5K1ImprovementConfig, spec: dict) -> tuple[dict, object]:
     paths = _arm_paths(prepared, spec, cfg)
-    model = screen._build_model(prepared, cfg, spec | {"m2_assignment": prepared["m2_actual"]})
+    # A spec may carry its own M2 assignment (an assignment control); otherwise
+    # the observed one is used.
+    model = screen._build_model(
+        prepared, cfg, {"m2_assignment": prepared["m2_actual"], **spec}
+    )
     weights, weight_diagnostics = row_weights(prepared, cfg, spec["improvement"])
     checkpoint = (
         legacy.load_checkpoint_or_discard(paths["checkpoint"])
