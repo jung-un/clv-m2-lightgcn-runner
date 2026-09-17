@@ -1,4 +1,6 @@
 import importlib
+import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -155,3 +157,24 @@ def test_training_metadata_uses_the_hm_split_label():
 
     assert stage == "hm2y_development_train"
     assert split == hm.SPLIT_LABEL
+
+
+def test_colab_pins_reviewed_source_and_explains_epoch_resume():
+    path = Path(
+        "clv_m4_personalized_positive_weight_k1_assignment_control_"
+        "hm2y_colab.ipynb"
+    )
+    if not path.exists():
+        pytest.fail(f"H&M M4 Colab이 아직 없습니다: {path}")
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "REVIEWED_SHA = '4cb1ae12849825975f9d89e035353e720fa130cc'" in source
+    assert source.count("run_hm2y_m4_assignment_screen(cfg)") == 1
+    assert "summary['trained_models'] == list(hm_screen.MODEL_IDS)" in source
+    assert "summary['fixed']['final_test_constructed'] is False" in source
+    assert "summary['checkpointing']['save_after_each_completed_epoch'] is True" in source
+    assert "마지막으로 완료된 epoch 다음" in source
+    assert "rm -rf" not in source
