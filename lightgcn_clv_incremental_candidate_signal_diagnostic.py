@@ -31,7 +31,7 @@ import lightgcn_clv_fixed_segment_error_diagnostic as fixed
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "clv-incremental-candidate-signal-diagnostic-v2"
+CODE_VERSION = "clv-incremental-candidate-signal-diagnostic-v3"
 N_SIGNAL = "n_purchaser_activity_fit"
 V_SIGNAL = "v_price_position_fit"
 NV_SIGNAL = "mean_n_v_candidate_fit"
@@ -40,6 +40,8 @@ SIGNAL_ORDER = (N_SIGNAL, V_SIGNAL, NV_SIGNAL)
 BOOTSTRAP_SAMPLES = 2000
 BOOTSTRAP_SEED = 42
 DEFAULT_SCORE_GAP_CAPS = (0.25, 0.10)
+UPPER_TAIL_CUT = 0.8
+UPPER_TAIL_GROUPS = ("high_q_c", "high_q_n", "high_q_v")
 
 
 @dataclass(frozen=True)
@@ -149,6 +151,10 @@ def preflight_summary(cfg: IncrementalCandidateSignalConfig) -> dict:
                 "report the fixed high-CLV segment separately; an interval "
                 "above 0.5 in both datasets is descriptive segment robustness, "
                 "not an independent confirmatory test or a tuned hard gate"
+            ),
+            "upper_tail_comparison": (
+                "compare the N signal for train-only high-q_C, high-q_N and "
+                "high-q_V users using one fixed >=0.8 percentile rule"
             ),
         },
         "statistical_note": (
@@ -680,6 +686,86 @@ def bootstrap_signal_rates(
     }
 
 
+def upper_tail_membership(
+    *,
+    q_n: np.ndarray,
+    q_v: np.ndarray,
+    q_c: np.ndarray,
+    valid: np.ndarray,
+    percentile_cut: float = UPPER_TAIL_CUT,
+) -> dict[str, np.ndarray]:
+    """Return comparable upper-tail groups from train-only percentile inputs."""
+
+    valid = np.asarray(valid, dtype=bool)
+    values = {
+        "high_q_c": np.asarray(q_c, dtype=np.float64),
+        "high_q_n": np.asarray(q_n, dtype=np.float64),
+        "high_q_v": np.asarray(q_v, dtype=np.float64),
+    }
+    if not 0.0 < float(percentile_cut) < 1.0:
+        raise ValueError("상위집단 percentile_cut은 0과 1 사이여야 합니다")
+    if any(value.shape != valid.shape for value in values.values()):
+        raise ValueError("q_C·q_N·q_V와 valid shape이 같아야 합니다")
+    output = {}
+    for name, value in values.items():
+        output[name] = valid & np.isfinite(value) & (value >= percentile_cut)
+    return output
+
+
+def upper_tail_n_signal_report(
+    rows: pd.DataFrame,
+    membership: dict[str, np.ndarray],
+    *,
+    samples: int = BOOTSTRAP_SAMPLES,
+    seed: int = BOOTSTRAP_SEED,
+    score_gap_caps_in_user_sd: tuple[float, ...] = DEFAULT_SCORE_GAP_CAPS,
+) -> pd.DataFrame:
+    """Compare the N signal in fixed high-q_C, high-q_N and high-q_V users."""
+
+    required = set(UPPER_TAIL_GROUPS)
+    if set(membership) != required:
+        raise ValueError(f"상위집단은 {sorted(required)}를 정확히 포함해야 합니다")
+    n_rows = len(next(iter(membership.values())))
+    if any(np.asarray(value).shape != (n_rows,) for value in membership.values()):
+        raise ValueError("상위집단 membership shape이 서로 다릅니다")
+    if samples <= 0:
+        raise ValueError("bootstrap samples는 양수여야 합니다")
+
+    output = []
+    n_rows_only = rows[rows.signal.eq(N_SIGNAL)]
+    for cap_index, cap in enumerate((None, *score_gap_caps_in_user_sd)):
+        cap_label = "all" if cap is None else f"{float(cap):g}"
+        per_user = _per_user_rates(n_rows_only, cap)
+        for group_index, group in enumerate(UPPER_TAIL_GROUPS):
+            members = np.asarray(membership[group], dtype=bool)
+            selected = per_user[
+                per_user.user_idx.map(
+                    lambda user: 0 <= int(user) < len(members) and members[int(user)]
+                )
+            ]
+            values = selected.balanced_win_rate.to_numpy(np.float64)
+            if not len(values):
+                continue
+            rng = np.random.default_rng(seed + cap_index * 100 + group_index)
+            draws = np.empty(samples, dtype=np.float64)
+            for draw in range(samples):
+                positions = rng.integers(0, len(values), size=len(values))
+                draws[draw] = values[positions].mean()
+            low, high = np.percentile(draws, [2.5, 97.5])
+            output.append(
+                {
+                    "m1_score_gap_cap_in_user_sd": cap_label,
+                    "group": group,
+                    "n_users": int(len(values)),
+                    "observed": float(values.mean()),
+                    "ci_low": float(low),
+                    "ci_high": float(high),
+                    "interval_above_0_5": bool(low > 0.5),
+                }
+            )
+    return pd.DataFrame(output)
+
+
 def bootstrap_report_frame(report: dict) -> pd.DataFrame:
     rows = []
     for cap, groups in report["groups"].items():
@@ -705,6 +791,7 @@ def _paths(cfg: IncrementalCandidateSignalConfig) -> dict[str, Path]:
         "summary_csv": root / f"{stem}_summary.csv",
         "per_user_csv": root / f"{stem}_per_user.csv",
         "bootstrap_csv": root / f"{stem}_bootstrap.csv",
+        "upper_tail_csv": root / f"{stem}_upper_tail_n_comparison.csv",
         "json": root / f"{stem}_diagnostic.json",
     }
 
@@ -763,10 +850,21 @@ def run_incremental_candidate_signal_diagnostic(cfg=None) -> dict[str, str]:
         score_gap_caps_in_user_sd=cfg.score_gap_caps_in_user_sd,
     )
     bootstrap_frame = bootstrap_report_frame(bootstrap)
+    upper_membership = upper_tail_membership(
+        q_n=q_n, q_v=q_v, q_c=q_c, valid=clv_valid
+    )
+    upper_tail = upper_tail_n_signal_report(
+        pair_rows,
+        upper_membership,
+        samples=cfg.bootstrap_samples,
+        seed=cfg.bootstrap_seed,
+        score_gap_caps_in_user_sd=cfg.score_gap_caps_in_user_sd,
+    )
     paths = _paths(cfg)
     test10._atomic_csv(paths["summary_csv"], summary)
     test10._atomic_csv(paths["per_user_csv"], per_user)
     test10._atomic_csv(paths["bootstrap_csv"], bootstrap_frame)
+    test10._atomic_csv(paths["upper_tail_csv"], upper_tail)
     test10._atomic_json(
         paths["json"],
         {
@@ -799,6 +897,20 @@ def run_incremental_candidate_signal_diagnostic(cfg=None) -> dict[str, str]:
             },
             "summary_rows": summary.to_dict("records"),
             "bootstrap": bootstrap,
+            "upper_tail_n_comparison": {
+                "percentile_cut": UPPER_TAIL_CUT,
+                "groups": list(UPPER_TAIL_GROUPS),
+                "membership_counts_all_train_users": {
+                    name: int(values.sum())
+                    for name, values in upper_membership.items()
+                },
+                "rows": upper_tail.to_dict("records"),
+                "interpretation_rule": (
+                    "q_C targeting is uniquely supported only if high_q_c is "
+                    "above 0.5 and descriptively stronger than high_q_n and "
+                    "high_q_v under every fixed score-gap cap in both datasets"
+                ),
+            },
             "result_paths": {key: str(value) for key, value in paths.items()},
         },
     )
@@ -808,6 +920,8 @@ def run_incremental_candidate_signal_diagnostic(cfg=None) -> dict[str, str]:
     print(json.dumps(bootstrap, ensure_ascii=False, indent=2))
     print("\n3) 매칭 진단")
     print(json.dumps(matching, ensure_ascii=False, indent=2))
+    print("\n4) q_C·q_N·q_V 상위 20% N 후보 구별력 비교")
+    print(upper_tail.to_string(index=False))
     print("\n결과 파일:", {key: str(value) for key, value in paths.items()})
     return {key: str(value) for key, value in paths.items()}
 

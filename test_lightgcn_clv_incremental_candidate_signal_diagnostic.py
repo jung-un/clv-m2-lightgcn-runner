@@ -253,3 +253,65 @@ def test_hm_uses_the_current_prepared_axes_instead_of_legacy_loader_axes():
     assert diagnostic.select_current_axes(
         "dunnhumby", {"axes": prepared_axes}, legacy_axes
     ) is legacy_axes
+
+
+def test_upper_tail_membership_compares_qc_qn_qv_with_one_fixed_rule():
+    q_n = np.array([0.1, 0.81, 0.4, 0.95, 0.7])
+    q_v = np.array([0.9, 0.2, 0.82, 0.4, 0.1])
+    q_c = np.array([0.2, 0.3, 0.4, 0.85, 0.95])
+    valid = np.ones(5, dtype=bool)
+
+    groups = diagnostic.upper_tail_membership(
+        q_n=q_n, q_v=q_v, q_c=q_c, valid=valid, percentile_cut=0.8
+    )
+
+    np.testing.assert_array_equal(groups["high_q_n"], [False, True, False, True, False])
+    np.testing.assert_array_equal(groups["high_q_v"], [True, False, True, False, False])
+    np.testing.assert_array_equal(groups["high_q_c"], [False, False, False, True, True])
+
+
+def test_upper_tail_report_uses_user_macro_n_signal_and_score_gap_caps():
+    rows = []
+    for user, wins in ((0, 8), (1, 6), (2, 4), (3, 2)):
+        row = {
+            "user_idx": user,
+            "fixed_clv_segment": "고CLV",
+            "signal": diagnostic.N_SIGNAL,
+            "candidate_pair_count": 10,
+            "truth_wins": wins,
+            "ties": 0,
+            "control_wins": 10 - wins,
+            "score_gap_sum": 0.1,
+            "score_gap_max": 0.01,
+            "normalized_score_gap_sum": 0.2,
+            "normalized_score_gap_max": 0.02,
+        }
+        for cap in diagnostic.DEFAULT_SCORE_GAP_CAPS:
+            columns = diagnostic._stat_columns(cap)
+            row.update({
+                columns["pairs"]: 10,
+                columns["wins"]: wins,
+                columns["ties"]: 0,
+                columns["losses"]: 10 - wins,
+                columns["gap_sum"]: 0.1,
+                columns["gap_max"]: 0.01,
+                columns["normalized_gap_sum"]: 0.2,
+                columns["normalized_gap_max"]: 0.02,
+            })
+        rows.append(row)
+    membership = {
+        "high_q_c": np.array([True, True, False, False]),
+        "high_q_n": np.array([True, False, True, False]),
+        "high_q_v": np.array([False, False, True, True]),
+    }
+
+    report = diagnostic.upper_tail_n_signal_report(
+        pd.DataFrame(rows), membership, samples=200, seed=7
+    )
+
+    all_rows = report[report.m1_score_gap_cap_in_user_sd.eq("all")]
+    observed = dict(zip(all_rows.group, all_rows.observed, strict=True))
+    assert np.isclose(observed["high_q_c"], 0.7)
+    assert np.isclose(observed["high_q_n"], 0.6)
+    assert np.isclose(observed["high_q_v"], 0.3)
+    assert set(report.m1_score_gap_cap_in_user_sd) == {"all", "0.25", "0.1"}
