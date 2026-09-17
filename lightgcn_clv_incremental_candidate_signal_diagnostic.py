@@ -308,7 +308,11 @@ def collect_matched_pair_rows(
         reservoir, dtype=torch.long, device=item_embedding.device
     )
     reservoir_embedding = item_embedding.index_select(0, reservoir_tensor)
-    reservoir_position = {int(item): pos for pos, item in enumerate(reservoir)}
+    reservoir_bins = context["popularity_bin"][reservoir]
+    reservoir_group_positions = {
+        group: np.flatnonzero(reservoir_bins == group)
+        for group in range(int(context["popularity_bin"].max(initial=0)) + 1)
+    }
     rows = []
     truth_total = 0
     matched_truths = 0
@@ -320,41 +324,71 @@ def collect_matched_pair_rows(
         )
         batch_user_embedding = user_embedding.index_select(0, tensor_users)
         reservoir_scores = (batch_user_embedding @ reservoir_embedding.T).cpu().numpy()
+        truth_lists = [np.asarray(truth[int(user)], dtype=np.int64) for user in batch_users]
+        truth_counts = np.asarray([len(items) for items in truth_lists], dtype=np.int64)
+        if truth_counts.sum():
+            all_truth_items = np.concatenate(truth_lists)
+            local_users = np.repeat(np.arange(len(batch_users)), truth_counts)
+            all_truth_scores = (
+                batch_user_embedding.index_select(
+                    0,
+                    torch.as_tensor(
+                        local_users, dtype=torch.long, device=user_embedding.device
+                    ),
+                )
+                * item_embedding.index_select(
+                    0,
+                    torch.as_tensor(
+                        all_truth_items, dtype=torch.long, device=item_embedding.device
+                    ),
+                )
+            ).sum(dim=1).cpu().numpy()
+        else:
+            all_truth_scores = np.empty(0, dtype=np.float32)
+        truth_offset = 0
         for local, user in enumerate(batch_users):
             user = int(user)
-            truth_items = np.asarray(truth[user], dtype=np.int64)
+            truth_items = truth_lists[local]
             truth_total += len(truth_items)
             if not len(truth_items) or user not in by_user.index:
+                truth_offset += len(truth_items)
                 continue
-            truth_tensor = torch.as_tensor(
-                truth_items, dtype=torch.long, device=item_embedding.device
-            )
-            truth_scores = (
-                batch_user_embedding[local] * item_embedding.index_select(0, truth_tensor)
-            ).sum(dim=1).cpu().numpy()
+            truth_scores = all_truth_scores[
+                truth_offset : truth_offset + len(truth_items)
+            ]
+            truth_offset += len(truth_items)
             left, right = int(csr_ptr[user]), int(csr_ptr[user + 1])
-            forbidden = set(map(int, csr_items[left:right]))
-            forbidden.update(map(int, truth_items))
+            forbidden = np.concatenate(
+                [np.asarray(csr_items[left:right], dtype=np.int64), truth_items]
+            )
+            reservoir_allowed = ~np.isin(reservoir, forbidden, assume_unique=False)
+            score_scale = max(float(np.std(reservoir_scores[local])), 1e-12)
             group = by_user.loc[user]
             for truth_item, truth_score in zip(
                 truth_items.tolist(), truth_scores.tolist(), strict=True
             ):
-                controls = match_controls_for_truth(
-                    truth_item=int(truth_item),
-                    truth_score=float(truth_score),
-                    candidate_items=reservoir,
-                    candidate_scores=reservoir_scores[local],
-                    popularity_bin=context["popularity_bin"],
-                    forbidden_items=forbidden,
-                    controls_per_truth=controls_per_truth,
+                popularity_group = int(context["popularity_bin"][truth_item])
+                group_positions = reservoir_group_positions.get(
+                    popularity_group, np.empty(0, dtype=np.int64)
                 )
-                if not len(controls):
+                control_positions = group_positions[
+                    reservoir_allowed[group_positions]
+                ]
+                if not len(control_positions):
                     unmatched_no_control += 1
                     continue
-                matched_truths += 1
-                control_positions = np.asarray(
-                    [reservoir_position[int(item)] for item in controls], dtype=np.int64
+                order = np.lexsort(
+                    (
+                        reservoir[control_positions],
+                        np.abs(
+                            reservoir_scores[local, control_positions]
+                            - float(truth_score)
+                        ),
+                    )
                 )
+                control_positions = control_positions[order[:controls_per_truth]]
+                controls = reservoir[control_positions]
+                matched_truths += 1
                 control_scores = reservoir_scores[local, control_positions]
                 item_set = np.concatenate(
                     [np.asarray([truth_item], dtype=np.int64), controls]
@@ -373,6 +407,7 @@ def collect_matched_pair_rows(
                     finite = np.isfinite(difference)
                     difference = difference[finite]
                     gaps = score_gap[finite]
+                    normalized_gaps = gaps / score_scale
                     if not len(difference):
                         continue
                     tolerance = 1e-12
@@ -390,6 +425,12 @@ def collect_matched_pair_rows(
                             "control_wins": losses,
                             "score_gap_sum": float(gaps.sum()),
                             "score_gap_max": float(gaps.max()),
+                            "normalized_score_gap_sum": float(
+                                normalized_gaps.sum()
+                            ),
+                            "normalized_score_gap_max": float(
+                                normalized_gaps.max()
+                            ),
                         }
                     )
     return pd.DataFrame(rows), {
@@ -437,6 +478,13 @@ def summarize_pairs(rows: pd.DataFrame) -> pd.DataFrame:
                         frame.score_gap_sum.sum() / pairs
                     ),
                     "max_absolute_m1_score_gap": float(frame.score_gap_max.max()),
+                    "mean_m1_score_gap_in_user_sd": float(
+                        frame.normalized_score_gap_sum.sum() / pairs
+                    ),
+                    "max_m1_score_gap_in_user_sd": float(
+                        frame.normalized_score_gap_max.max()
+                    ),
+                    "same_popularity_bin_share": 1.0,
                 }
             )
     return pd.DataFrame(output)

@@ -107,6 +107,8 @@ def test_aggregate_pair_rows_counts_wins_ties_losses_and_match_quality():
             "control_wins": [0, 0, 1],
             "score_gap_sum": [0.02, 0.04, 0.10],
             "score_gap_max": [0.01, 0.02, 0.05],
+            "normalized_score_gap_sum": [0.2, 0.4, 1.0],
+            "normalized_score_gap_max": [0.1, 0.2, 0.5],
         }
     )
 
@@ -119,6 +121,8 @@ def test_aggregate_pair_rows_counts_wins_ties_losses_and_match_quality():
     assert overall.candidate_pair_count == 6
     assert np.isclose(overall.pair_balanced_win_rate, 4 / 6)
     assert np.isclose(overall.mean_absolute_m1_score_gap, 0.16 / 6)
+    assert np.isclose(overall.mean_m1_score_gap_in_user_sd, 1.6 / 6)
+    assert overall.same_popularity_bin_share == 1.0
 
 
 def test_bootstrap_uses_user_macro_contrasts():
@@ -141,6 +145,8 @@ def test_bootstrap_uses_user_macro_contrasts():
                     "control_wins": 10 - int(rate * 10),
                     "score_gap_sum": 0.1,
                     "score_gap_max": 0.01,
+                    "normalized_score_gap_sum": 0.2,
+                    "normalized_score_gap_max": 0.02,
                 }
             )
     report = diagnostic.bootstrap_signal_rates(
