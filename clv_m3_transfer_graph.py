@@ -203,8 +203,14 @@ def build_m3_transfer_graphs(
     beta_cap: float = DEFAULT_BETA_CAP,
     composition_beta_cap: float = DEFAULT_COMPOSITION_BETA_CAP,
     category_prior_strength: float = DEFAULT_CATEGORY_PRIOR_STRENGTH,
+    user_q_n: np.ndarray | None = None,
+    user_q_v: np.ndarray | None = None,
 ) -> M3TransferGraphWeights:
-    """Build matched N-transfer and V-contribution weights from train only."""
+    """Build matched N-transfer and V-contribution weights from train only.
+
+    ``user_q_n`` / ``user_q_v`` replace the builder's own customer percentiles
+    so every component in a shared screen uses one CLV definition.
+    """
     required = {"u_idx", "i_idx", "b_raw", "cat_idx", "t", "v"}
     missing = sorted(required.difference(train.columns))
     if missing:
@@ -250,6 +256,18 @@ def build_m3_transfer_graphs(
     q_n[user_ids] = _percentile(activity)
     mean_basket_value = user_stats["mean_basket_value"].to_numpy(np.float64)
     q_v[user_ids] = _percentile(mean_basket_value)
+    for name, override, target in (
+        ("user_q_n", user_q_n, q_n),
+        ("user_q_v", user_q_v, q_v),
+    ):
+        if override is None:
+            continue
+        override = np.asarray(override, dtype=np.float64)
+        if override.shape != (n_users,) or not np.isfinite(override).all():
+            raise ValueError(f"{name}는 길이 n_users의 유한한 배열이어야 합니다")
+        if np.any((override < 0.0) | (override > 1.0)):
+            raise ValueError(f"{name}는 [0,1] 백분위여야 합니다")
+        target[:] = override
     # A coherent decomposition must use the same N/V quantities for both the
     # total CLV level and the composition shares.  Ratios of independent
     # percentiles are not a decomposition of N*V.  In log space the stabilized

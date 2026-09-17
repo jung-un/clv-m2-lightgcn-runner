@@ -74,3 +74,23 @@ def test_transfer_graph_rejects_missing_category():
         build_m3_transfer_graphs(
             _train_rows().drop(columns="cat_idx"), n_users=2, n_items=3
         )
+
+
+def test_external_customer_percentiles_replace_the_builder_definition():
+    own = build_m3_transfer_graphs(_train_rows(), n_users=2, n_items=3)
+    swapped = build_m3_transfer_graphs(
+        _train_rows(),
+        n_users=2,
+        n_items=3,
+        user_q_n=np.array([0.1, 0.9]),
+        user_q_v=np.array([0.9, 0.1]),
+    )
+
+    np.testing.assert_allclose(swapped.q_v, [0.9, 0.1])
+    np.testing.assert_allclose(swapped.q_n, [0.1, 0.9])
+    np.testing.assert_array_equal(swapped.edge_users, own.edge_users)
+    assert swapped.v_weights.mean() == pytest.approx(1.0, abs=1e-6)
+    with pytest.raises(ValueError, match="user_q_v"):
+        build_m3_transfer_graphs(
+            _train_rows(), n_users=2, n_items=3, user_q_v=np.array([1.5, 0.1])
+        )
