@@ -31,6 +31,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -44,6 +45,7 @@ from clv_m3_transfer_graph import build_m3_transfer_graphs
 from clv_m5_n_conditioned_value_basis_model import M5NConditionedValueBasisLightGCN
 from clv_run_state import ProgressStore, RunIdentity, clone_state, file_sha256
 import lightgcn_clv_axis_specific_test10 as test10
+import lightgcn_clv_gatefree_lowdim as gatefree
 import lightgcn_clv_m4_clv_hard_negative as m4_helpers
 import lightgcn_clv_m5_k1_m4_improvement_screen as improvement
 import lightgcn_clv_moe as moe
@@ -211,7 +213,10 @@ def _config_hash(cfg: ComponentRecheckConfig, input_hash: str) -> str:
 
 def _prepare(cfg: ComponentRecheckConfig) -> dict:
     improvement_cfg = improvement.configure_improvement_screen(out_dir=cfg.out_dir)
-    prepared = improvement._prepare(improvement_cfg)
+    # M1 is retrained here under the same seeds, so the shared preparation's
+    # display-only lookup of an old seed-42 M1 result must not gate the run.
+    with mock.patch.object(gatefree, "_load_compatible_baseline", return_value=None):
+        prepared = improvement._prepare(improvement_cfg)
     data = prepared["data"]
     train = data["train"]
     missing = {"u_idx", "i_idx", "b_raw", "cat_idx", "t", "v"}.difference(train.columns)
