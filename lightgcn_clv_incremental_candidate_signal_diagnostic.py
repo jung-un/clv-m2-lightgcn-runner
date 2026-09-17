@@ -284,6 +284,16 @@ def _q_inputs(axes: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarra
     return q_n, q_v, q_c, valid
 
 
+def select_current_axes(dataset: str, prepared: dict, loader_axes: dict) -> dict:
+    """Use the axes used by the current H&M model, not its legacy diagnostic."""
+
+    if dataset == "hm":
+        if "axes" not in prepared:
+            raise KeyError("H&M prepared 결과에 현재 CLV axes가 없습니다")
+        return prepared["axes"]
+    return loader_axes
+
+
 @torch.no_grad()
 def collect_matched_pair_rows(
     *,
@@ -560,6 +570,7 @@ def run_incremental_candidate_signal_diagnostic(cfg=None) -> dict[str, str]:
     preflight = preflight_summary(cfg)
     print(json.dumps(preflight, ensure_ascii=False, indent=2))
     prepared, model, checkpoint, record, axes = relation._prepare_and_load(cfg)
+    axes = select_current_axes(cfg.dataset, prepared, axes)
     model.eval()
     user_embedding, item_embedding = model.propagate_pref()
     q_n, q_v, q_c, clv_valid = _q_inputs(axes)

@@ -162,3 +162,17 @@ def test_config_rejects_nonpositive_matching_parameters():
         diagnostic.configure_incremental_candidate_signal_diagnostic(
             "hm", candidate_pool_per_bin=0
         )
+
+
+def test_hm_uses_the_current_prepared_axes_instead_of_legacy_loader_axes():
+    prepared_axes = {"clv_proxy": np.array([1.0])}
+    legacy_axes = {"clv_proxy": np.array([99.0])}
+
+    selected = diagnostic.select_current_axes(
+        "hm", {"axes": prepared_axes}, legacy_axes
+    )
+
+    assert selected is prepared_axes
+    assert diagnostic.select_current_axes(
+        "dunnhumby", {"axes": prepared_axes}, legacy_axes
+    ) is legacy_axes
