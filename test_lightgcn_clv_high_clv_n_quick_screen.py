@@ -11,6 +11,7 @@ def test_fixed_quick_screen_contract_reuses_seed43_m1():
     assert cfg.seed == 43
     assert cfg.negative_count == 1
     assert cfg.epochs == 100
+    assert cfg.basis_bandwidth == 0.25
     assert cfg.reuse_exact_m1 is True
     assert screen.NEW_MODEL_IDS == (screen.M2_MODEL_ID, screen.M4_MODEL_ID)
 

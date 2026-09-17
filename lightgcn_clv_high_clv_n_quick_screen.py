@@ -42,6 +42,7 @@ class QuickScreenConfig(candidate.CandidateNVFitConfig):
     seed: int = 43
     rho: float = 0.05
     economic_dim: int = 3
+    basis_bandwidth: float = 0.25
     buyer_prior_mass: float = 10.0
     high_clv_percentile: float = 0.8
     reuse_exact_m1: bool = True
@@ -65,6 +66,7 @@ def validate_config(cfg: QuickScreenConfig) -> QuickScreenConfig:
         "dataset": "dunnhumby", "seed": 43, "time_cutoff": 690,
         "evaluation_days": 7, "epochs": 100, "id_dim": 64,
         "economic_dim": 3, "rho": 0.05, "positive_weight_lambda": 0.5,
+        "basis_bandwidth": 0.25,
         "n_layers": 2, "negative_count": 1, "input_days": 365,
         "buyer_prior_mass": 10.0, "high_clv_percentile": 0.8,
         "reuse_exact_m1": True,
