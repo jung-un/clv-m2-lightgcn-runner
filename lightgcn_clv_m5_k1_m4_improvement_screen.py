@@ -332,6 +332,23 @@ def _arm_paths(prepared: dict, spec: dict, cfg: M5K1ImprovementConfig) -> dict[s
     return {"checkpoint": root / f"{stem}.pt", "result": root / f"{stem}.json"}
 
 
+def run_labels(spec: dict) -> tuple[str, str]:
+    """Return progress-stage and reported split labels for an arm.
+
+    The training implementation is shared by Dunnhumby and H&M.  Keeping the
+    split in the arm specification prevents a resumed H&M run from being
+    recorded as the Dunnhumby development split.
+    """
+
+    split = str(spec.get("split", "historical_development_days_684_690"))
+    stage = (
+        "hm2y_development_train"
+        if split.startswith("hm2y_")
+        else "historical_development_train"
+    )
+    return stage, split
+
+
 def _train_arm(
     model,
     prepared: dict,
@@ -423,6 +440,7 @@ def _train_arm(
 
 def _run_arm(prepared: dict, cfg: M5K1ImprovementConfig, spec: dict) -> tuple[dict, object]:
     paths = _arm_paths(prepared, spec, cfg)
+    training_stage, split_label = run_labels(spec)
     # A spec may carry its own M2 assignment (an assignment control); otherwise
     # the observed one is used.
     model = screen._build_model(
@@ -447,7 +465,7 @@ def _run_arm(prepared: dict, cfg: M5K1ImprovementConfig, spec: dict) -> tuple[di
     store = ProgressStore(
         prepared["out_dir"] / "progress" / prepared["config_hash"],
         RunIdentity(
-            stage="historical_development_train",
+            stage=training_stage,
             model_id=spec["model_id"],
             seed=cfg.seed,
             config_hash=prepared["config_hash"],
@@ -483,7 +501,7 @@ def _run_arm(prepared: dict, cfg: M5K1ImprovementConfig, spec: dict) -> tuple[di
         "model_id": spec["model_id"],
         "role": spec["role"],
         "seed": cfg.seed,
-        "split": "historical_development_days_684_690",
+        "split": split_label,
         "final_epoch": cfg.epochs,
         "rho": spec["rho"],
         "improvement": spec["improvement"],
@@ -499,7 +517,7 @@ def _run_arm(prepared: dict, cfg: M5K1ImprovementConfig, spec: dict) -> tuple[di
         epoch=cfg.epochs,
         max_epoch=cfg.epochs,
         selection="none",
-        split="historical_development_days_684_690",
+        split=split_label,
         checkpoint_path=str(paths["checkpoint"]),
         result_path=str(paths["result"]),
     )
