@@ -31,7 +31,7 @@ import lightgcn_clv_fixed_segment_error_diagnostic as fixed
 import lightgcn_clv_v3 as v3
 
 
-CODE_VERSION = "clv-incremental-candidate-signal-diagnostic-v1"
+CODE_VERSION = "clv-incremental-candidate-signal-diagnostic-v2"
 N_SIGNAL = "n_purchaser_activity_fit"
 V_SIGNAL = "v_price_position_fit"
 NV_SIGNAL = "mean_n_v_candidate_fit"
@@ -39,6 +39,7 @@ QC_LEVEL = "q_c_user_level_constant"
 SIGNAL_ORDER = (N_SIGNAL, V_SIGNAL, NV_SIGNAL)
 BOOTSTRAP_SAMPLES = 2000
 BOOTSTRAP_SEED = 42
+DEFAULT_SCORE_GAP_CAPS = (0.25, 0.10)
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,7 @@ class IncrementalCandidateSignalConfig:
     candidate_pool_seed: int = 20260917
     bootstrap_samples: int = BOOTSTRAP_SAMPLES
     bootstrap_seed: int = BOOTSTRAP_SEED
+    score_gap_caps_in_user_sd: tuple[float, ...] = DEFAULT_SCORE_GAP_CAPS
 
 
 def configure_incremental_candidate_signal_diagnostic(
@@ -68,7 +70,7 @@ def configure_incremental_candidate_signal_diagnostic(
     values = asdict(base) | {
         "out_dir": (
             f"{v3.default_out_dir(dataset.lower())}"
-            "_clv_incremental_candidate_signal_diagnostic_v1"
+            "_clv_incremental_candidate_signal_diagnostic_v2"
         )
     }
     values.update(overrides)
@@ -86,6 +88,11 @@ def configure_incremental_candidate_signal_diagnostic(
     )
     if any(int(value) <= 0 for value in numeric):
         raise ValueError("배치·분위·후보·대조수·bootstrap 수는 양수여야 합니다")
+    caps = tuple(float(value) for value in cfg.score_gap_caps_in_user_sd)
+    if not caps or any(not np.isfinite(value) or value <= 0 for value in caps):
+        raise ValueError("M1 점수차 상한은 하나 이상의 양수 유한값이어야 합니다")
+    if len(set(caps)) != len(caps):
+        raise ValueError("M1 점수차 상한은 중복될 수 없습니다")
     return cfg
 
 
@@ -129,6 +136,21 @@ def preflight_summary(cfg: IncrementalCandidateSignalConfig) -> dict:
             "both datasets; this does not establish that M2, M3, or M4 can "
             "convert the signal into recommendation improvement"
         ),
+        "robustness_rule": {
+            "score_gap_caps_in_user_sd": [
+                float(value) for value in cfg.score_gap_caps_in_user_sd
+            ],
+            "overall_n_signal": (
+                "record the N signal as score-match robust only when its "
+                "user-macro interval remains above 0.5 under every score-gap "
+                "cap in both datasets"
+            ),
+            "high_clv_n_signal": (
+                "report the fixed high-CLV segment separately; an interval "
+                "above 0.5 in both datasets is descriptive segment robustness, "
+                "not an independent confirmatory test or a tuned hard gate"
+            ),
+        },
         "statistical_note": (
             "single-checkpoint development diagnostic; bootstrap describes "
             "the current evaluation users only, with no causal, significance, "
@@ -294,6 +316,35 @@ def select_current_axes(dataset: str, prepared: dict, loader_axes: dict) -> dict
     return loader_axes
 
 
+def _gap_suffix(cap: float) -> str:
+    return f"gap_le_{float(cap):g}".replace(".", "p")
+
+
+def _stat_columns(cap: float | None) -> dict[str, str]:
+    if cap is None:
+        return {
+            "pairs": "candidate_pair_count",
+            "wins": "truth_wins",
+            "ties": "ties",
+            "losses": "control_wins",
+            "gap_sum": "score_gap_sum",
+            "gap_max": "score_gap_max",
+            "normalized_gap_sum": "normalized_score_gap_sum",
+            "normalized_gap_max": "normalized_score_gap_max",
+        }
+    prefix = _gap_suffix(cap)
+    return {
+        "pairs": f"{prefix}_candidate_pair_count",
+        "wins": f"{prefix}_truth_wins",
+        "ties": f"{prefix}_ties",
+        "losses": f"{prefix}_control_wins",
+        "gap_sum": f"{prefix}_score_gap_sum",
+        "gap_max": f"{prefix}_score_gap_max",
+        "normalized_gap_sum": f"{prefix}_normalized_score_gap_sum",
+        "normalized_gap_max": f"{prefix}_normalized_score_gap_max",
+    }
+
+
 @torch.no_grad()
 def collect_matched_pair_rows(
     *,
@@ -308,6 +359,7 @@ def collect_matched_pair_rows(
     reservoir: np.ndarray,
     controls_per_truth: int,
     batch_size: int,
+    score_gap_caps_in_user_sd: tuple[float, ...] = DEFAULT_SCORE_GAP_CAPS,
 ) -> tuple[pd.DataFrame, dict]:
     users = np.asarray(prepared["cache"].users, dtype=np.int64)
     truth = prepared["cache"].gt
@@ -424,8 +476,7 @@ def collect_matched_pair_rows(
                     wins = int(np.sum(difference > tolerance))
                     losses = int(np.sum(difference < -tolerance))
                     ties = int(len(difference) - wins - losses)
-                    rows.append(
-                        {
+                    row = {
                             "user_idx": user,
                             "fixed_clv_segment": group["fixed_clv_segment"],
                             "signal": name,
@@ -442,7 +493,36 @@ def collect_matched_pair_rows(
                                 normalized_gaps.max()
                             ),
                         }
-                    )
+                    for cap in score_gap_caps_in_user_sd:
+                        columns = _stat_columns(float(cap))
+                        keep = normalized_gaps <= float(cap)
+                        kept_difference = difference[keep]
+                        kept_gaps = gaps[keep]
+                        kept_normalized_gaps = normalized_gaps[keep]
+                        kept_wins = int(np.sum(kept_difference > tolerance))
+                        kept_losses = int(np.sum(kept_difference < -tolerance))
+                        kept_ties = int(
+                            len(kept_difference) - kept_wins - kept_losses
+                        )
+                        row.update(
+                            {
+                                columns["pairs"]: int(len(kept_difference)),
+                                columns["wins"]: kept_wins,
+                                columns["ties"]: kept_ties,
+                                columns["losses"]: kept_losses,
+                                columns["gap_sum"]: float(kept_gaps.sum()),
+                                columns["gap_max"]: float(
+                                    kept_gaps.max(initial=0.0)
+                                ),
+                                columns["normalized_gap_sum"]: float(
+                                    kept_normalized_gaps.sum()
+                                ),
+                                columns["normalized_gap_max"]: float(
+                                    kept_normalized_gaps.max(initial=0.0)
+                                ),
+                            }
+                        )
+                    rows.append(row)
     return pd.DataFrame(rows), {
         "evaluation_users": int(len(users)),
         "truth_items": int(truth_total),
@@ -452,80 +532,91 @@ def collect_matched_pair_rows(
     }
 
 
-def summarize_pairs(rows: pd.DataFrame) -> pd.DataFrame:
+def summarize_pairs(
+    rows: pd.DataFrame,
+    *,
+    score_gap_caps_in_user_sd: tuple[float, ...] = DEFAULT_SCORE_GAP_CAPS,
+) -> pd.DataFrame:
     output = []
-    for signal in SIGNAL_ORDER:
-        selected_signal = rows[rows.signal.eq(signal)]
-        groups = [("overall", "전체", selected_signal)]
-        for segment in fixed.SEGMENT_ORDER:
-            groups.append(
-                (
-                    "fixed_clv_segment",
-                    segment,
-                    selected_signal[
-                        selected_signal.fixed_clv_segment.eq(segment)
-                    ],
+    for cap in (None, *score_gap_caps_in_user_sd):
+        columns = _stat_columns(cap)
+        cap_label = "all" if cap is None else f"{float(cap):g}"
+        for signal in SIGNAL_ORDER:
+            selected_signal = rows[rows.signal.eq(signal)]
+            groups = [("overall", "전체", selected_signal)]
+            for segment in fixed.SEGMENT_ORDER:
+                groups.append(
+                    (
+                        "fixed_clv_segment",
+                        segment,
+                        selected_signal[
+                            selected_signal.fixed_clv_segment.eq(segment)
+                        ],
+                    )
                 )
-            )
-        for group_type, group, frame in groups:
-            if frame.empty:
-                continue
-            pairs = int(frame.candidate_pair_count.sum())
-            output.append(
-                {
+            for group_type, group, frame in groups:
+                if frame.empty:
+                    continue
+                pairs = int(frame[columns["pairs"]].sum())
+                if pairs <= 0:
+                    continue
+                output.append({
                     "signal": signal,
+                    "m1_score_gap_cap_in_user_sd": cap_label,
                     "group_type": group_type,
                     "group": group,
-                    "n_users": int(frame.user_idx.nunique()),
+                    "n_users": int(
+                        frame.loc[frame[columns["pairs"]] > 0, "user_idx"].nunique()
+                    ),
                     "candidate_pair_count": pairs,
-                    "truth_wins": int(frame.truth_wins.sum()),
-                    "ties": int(frame.ties.sum()),
-                    "control_wins": int(frame.control_wins.sum()),
+                    "truth_wins": int(frame[columns["wins"]].sum()),
+                    "ties": int(frame[columns["ties"]].sum()),
+                    "control_wins": int(frame[columns["losses"]].sum()),
                     "pair_balanced_win_rate": float(
-                        (frame.truth_wins.sum() + 0.5 * frame.ties.sum()) / pairs
+                        (frame[columns["wins"]].sum()
+                         + 0.5 * frame[columns["ties"]].sum()) / pairs
                     ),
                     "mean_absolute_m1_score_gap": float(
-                        frame.score_gap_sum.sum() / pairs
+                        frame[columns["gap_sum"]].sum() / pairs
                     ),
-                    "max_absolute_m1_score_gap": float(frame.score_gap_max.max()),
+                    "max_absolute_m1_score_gap": float(
+                        frame[columns["gap_max"]].max()
+                    ),
                     "mean_m1_score_gap_in_user_sd": float(
-                        frame.normalized_score_gap_sum.sum() / pairs
+                        frame[columns["normalized_gap_sum"]].sum() / pairs
                     ),
                     "max_m1_score_gap_in_user_sd": float(
-                        frame.normalized_score_gap_max.max()
+                        frame[columns["normalized_gap_max"]].max()
                     ),
                     "same_popularity_bin_share": 1.0,
-                }
-            )
+                })
     return pd.DataFrame(output)
 
 
-def _per_user_rates(rows: pd.DataFrame) -> pd.DataFrame:
+def _per_user_rates(rows: pd.DataFrame, cap: float | None = None) -> pd.DataFrame:
+    columns = _stat_columns(cap)
     grouped = rows.groupby(["user_idx", "fixed_clv_segment", "signal"], sort=False)
-    frame = grouped[["candidate_pair_count", "truth_wins", "ties"]].sum()
+    frame = grouped[
+        [columns["pairs"], columns["wins"], columns["ties"]]
+    ].sum()
+    frame = frame[frame[columns["pairs"]] > 0].copy()
     frame["balanced_win_rate"] = (
-        frame.truth_wins + 0.5 * frame.ties
-    ) / frame.candidate_pair_count
+        frame[columns["wins"]] + 0.5 * frame[columns["ties"]]
+    ) / frame[columns["pairs"]]
     return frame.reset_index()
 
 
-def bootstrap_signal_rates(
-    rows: pd.DataFrame,
+def _bootstrap_group(
+    per_user: pd.DataFrame,
     *,
-    samples: int = BOOTSTRAP_SAMPLES,
-    seed: int = BOOTSTRAP_SEED,
+    samples: int,
+    seed: int,
 ) -> dict:
-    per_user = _per_user_rates(rows)
     pivot = per_user.pivot_table(
         index="user_idx", columns="signal", values="balanced_win_rate"
     ).dropna(subset=list(SIGNAL_ORDER))
     if pivot.empty:
-        raise RuntimeError("bootstrap에 사용할 공통 사용자 행이 없습니다")
-    segment = (
-        per_user.drop_duplicates("user_idx")
-        .set_index("user_idx")["fixed_clv_segment"]
-        .reindex(pivot.index)
-    )
+        return {"paired_users": 0, "signals": {}}
     values = pivot.loc[:, SIGNAL_ORDER].to_numpy(np.float64)
     rng = np.random.default_rng(seed)
     draws = np.empty((samples, len(SIGNAL_ORDER)), dtype=np.float64)
@@ -542,15 +633,68 @@ def bootstrap_signal_rates(
             "ci_high": float(high),
             "interval_above_0_5": bool(low > 0.5),
         }
+    return {"paired_users": int(len(pivot)), "signals": report}
+
+
+def bootstrap_signal_rates(
+    rows: pd.DataFrame,
+    *,
+    samples: int = BOOTSTRAP_SAMPLES,
+    seed: int = BOOTSTRAP_SEED,
+    score_gap_caps_in_user_sd: tuple[float, ...] = DEFAULT_SCORE_GAP_CAPS,
+) -> dict:
+    groups = {}
+    for cap_index, cap in enumerate((None, *score_gap_caps_in_user_sd)):
+        cap_label = "all" if cap is None else f"{float(cap):g}"
+        per_user = _per_user_rates(rows, cap)
+        cap_groups = {
+            "overall": _bootstrap_group(
+                per_user, samples=samples, seed=seed + cap_index * 100
+            )
+        }
+        for segment_index, segment in enumerate(fixed.SEGMENT_ORDER, start=1):
+            cap_groups[segment] = _bootstrap_group(
+                per_user[per_user.fixed_clv_segment.eq(segment)],
+                samples=samples,
+                seed=seed + cap_index * 100 + segment_index,
+            )
+        groups[cap_label] = cap_groups
+    overall = groups["all"]["overall"]
+    if not overall["signals"]:
+        raise RuntimeError("bootstrap에 사용할 공통 사용자 행이 없습니다")
+    all_per_user = _per_user_rates(rows, None)
     return {
         "bootstrap_samples": int(samples),
         "bootstrap_seed": int(seed),
-        "paired_users": int(len(pivot)),
+        "paired_users": int(overall["paired_users"]),
         "segment_counts": {
-            name: int((segment == name).sum()) for name in fixed.SEGMENT_ORDER
+            name: int(
+                all_per_user.loc[
+                    all_per_user.fixed_clv_segment.eq(name), "user_idx"
+                ].nunique()
+            )
+            for name in fixed.SEGMENT_ORDER
         },
-        "signals": report,
+        "signals": overall["signals"],
+        "groups": groups,
     }
+
+
+def bootstrap_report_frame(report: dict) -> pd.DataFrame:
+    rows = []
+    for cap, groups in report["groups"].items():
+        for group, payload in groups.items():
+            for signal, values in payload["signals"].items():
+                rows.append(
+                    {
+                        "m1_score_gap_cap_in_user_sd": cap,
+                        "group": group,
+                        "signal": signal,
+                        "paired_users": int(payload["paired_users"]),
+                        **values,
+                    }
+                )
+    return pd.DataFrame(rows)
 
 
 def _paths(cfg: IncrementalCandidateSignalConfig) -> dict[str, Path]:
@@ -560,6 +704,7 @@ def _paths(cfg: IncrementalCandidateSignalConfig) -> dict[str, Path]:
     return {
         "summary_csv": root / f"{stem}_summary.csv",
         "per_user_csv": root / f"{stem}_per_user.csv",
+        "bootstrap_csv": root / f"{stem}_bootstrap.csv",
         "json": root / f"{stem}_diagnostic.json",
     }
 
@@ -603,17 +748,25 @@ def run_incremental_candidate_signal_diagnostic(cfg=None) -> dict[str, str]:
         reservoir=reservoir,
         controls_per_truth=cfg.controls_per_truth,
         batch_size=cfg.eval_batch_size,
+        score_gap_caps_in_user_sd=cfg.score_gap_caps_in_user_sd,
     )
     if pair_rows.empty:
         raise RuntimeError("M1 점수·인기도 조건부 비교쌍이 없습니다")
-    summary = summarize_pairs(pair_rows)
+    summary = summarize_pairs(
+        pair_rows, score_gap_caps_in_user_sd=cfg.score_gap_caps_in_user_sd
+    )
     per_user = _per_user_rates(pair_rows)
     bootstrap = bootstrap_signal_rates(
-        pair_rows, samples=cfg.bootstrap_samples, seed=cfg.bootstrap_seed
+        pair_rows,
+        samples=cfg.bootstrap_samples,
+        seed=cfg.bootstrap_seed,
+        score_gap_caps_in_user_sd=cfg.score_gap_caps_in_user_sd,
     )
+    bootstrap_frame = bootstrap_report_frame(bootstrap)
     paths = _paths(cfg)
     test10._atomic_csv(paths["summary_csv"], summary)
     test10._atomic_csv(paths["per_user_csv"], per_user)
+    test10._atomic_csv(paths["bootstrap_csv"], bootstrap_frame)
     test10._atomic_json(
         paths["json"],
         {
@@ -649,9 +802,9 @@ def run_incremental_candidate_signal_diagnostic(cfg=None) -> dict[str, str]:
             "result_paths": {key: str(value) for key, value in paths.items()},
         },
     )
-    print("\n1) M1 점수·상품 인기도 조건부 후보 신호")
+    print("\n1) M1 점수·상품 인기도 조건부 후보 신호와 점수차 민감도")
     print(summary.to_string(index=False))
-    print("\n2) 사용자 단위 bootstrap")
+    print("\n2) 전체·CLV 구간·점수차 상한별 사용자 단위 bootstrap")
     print(json.dumps(bootstrap, ensure_ascii=False, indent=2))
     print("\n3) 매칭 진단")
     print(json.dumps(matching, ensure_ascii=False, indent=2))
