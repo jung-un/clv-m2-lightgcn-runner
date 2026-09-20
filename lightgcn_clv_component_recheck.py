@@ -60,10 +60,13 @@ M1_MODEL_ID = "m1_bpr_k1"
 M3_MODEL_ID = "m3_v_contribution_graph_bpr_k1"
 M2_MODEL_ID = "m2_nv_history_fit_bpr_k1"
 M4_MODEL_ID = "m4_complementary_weight_bpr_k1"
-MODEL_IDS = (M1_MODEL_ID, M3_MODEL_ID, M2_MODEL_ID, M4_MODEL_ID)
+M5_MODEL_ID = "m5_history_fit_plus_complementary_bpr_k1"
+MODEL_IDS = (M1_MODEL_ID, M3_MODEL_ID, M2_MODEL_ID, M4_MODEL_ID, M5_MODEL_ID)
 
 WEIGHTED_HIT_10 = "price_purchase_amount_weighted_hit@10"
 WEIGHTED_HIT_50 = "price_purchase_amount_weighted_hit@50"
+HIGH_CLV_RECALL_10 = "고CLV_recall@10"
+HIGH_CLV_NDCG_10 = "고CLV_ndcg@10"
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,8 @@ def arm_specifications() -> list[dict]:
          "kind": "history_fit", "graph": "binary", "weighted": False},
         {"model_id": M4_MODEL_ID, "role": "loss_top_rank_correction",
          "kind": "lightgcn", "graph": "binary", "weighted": True},
+        {"model_id": M5_MODEL_ID, "role": "representation_plus_loss_combination",
+         "kind": "history_fit", "graph": "binary", "weighted": True},
     ]
 
 
@@ -174,6 +179,11 @@ def preflight_summary(cfg: ComponentRecheckConfig) -> dict:
                 f"binary LightGCN with positive weights 1 + {cfg.m4_lambda}*q_C*"
                 "(1 - <RBF(q_V), RBF(item amount percentile)>), mean one"
             ),
+            M5_MODEL_ID: (
+                "the retained M2 representation trained with the retained M4 "
+                "positive weights; graph, negatives and every hyperparameter "
+                "stay at the values each part was screened with"
+            ),
         },
         "decision_rule": {
             M3_MODEL_ID: (
@@ -191,7 +201,20 @@ def preflight_summary(cfg: ComponentRecheckConfig) -> dict:
                 f"{cfg.min_positive_seeds}/5 positive seeds, and mean "
                 f"{WEIGHTED_HIT_10} >= {cfg.accuracy_guard} x M1"
             ),
-            "outcome": "components that pass enter the combination screen",
+            M5_MODEL_ID: (
+                "combination keeps each part's own role and loses nothing to "
+                f"either part: vs M2 {HIGH_CLV_RECALL_10} or {HIGH_CLV_NDCG_10} "
+                f"paired mean > 0 with at least {cfg.min_positive_seeds}/5 "
+                f"positive seeds; vs M4 recall@50 and {WEIGHTED_HIT_50} each "
+                f"paired mean > 0 with at least {cfg.min_positive_seeds}/5; vs M1 "
+                f"recall@10 and recall@50 paired means > 0; and mean ndcg@10, "
+                f"{WEIGHTED_HIT_50} and {HIGH_CLV_RECALL_10} each "
+                f">= {cfg.accuracy_guard} x the better of M2 and M4"
+            ),
+            "outcome": (
+                "components that pass enter the combination; a combination that "
+                "passes goes to a CLV attribution control, not to tuning"
+            ),
         },
         "limits": (
             "five development seeds on a repeatedly exposed split; intervals are "
@@ -326,6 +349,11 @@ def _arm_paths(prepared: dict, model_id: str, seed: int) -> dict[str, Path]:
 def _batch_loss(model, users, positives, negatives, batch_weights):
     """Plain BPR for every arm; history-fit models use their own leave-one-out loss."""
 
+    if batch_weights is not None and hasattr(model, "weighted_bpr_loss"):
+        loss, diagnostics = model.weighted_bpr_loss(
+            users, positives, negatives[:, 0], batch_weights
+        )
+        return loss, float(diagnostics["bpr"]), float(diagnostics["p_correct"])
     if batch_weights is None and hasattr(model, "bpr_loss"):
         loss, diagnostics = model.bpr_loss(users, positives, negatives[:, 0])
         return loss, float(diagnostics["bpr"]), float(diagnostics["p_correct"])
@@ -509,28 +537,34 @@ def component_reading(
 ) -> dict:
     """Apply each component's role-specific pre-registered rule."""
 
-    def paired_stat(model_id: str, metric: str) -> dict:
+    def paired_stat(model_id: str, metric: str, reference: str = M1_MODEL_ID) -> dict:
         row = paired_summary[
             paired_summary.model_id.eq(model_id)
-            & paired_summary.reference.eq(M1_MODEL_ID)
+            & paired_summary.reference.eq(reference)
             & paired_summary.metric.eq(metric)
         ]
         if len(row) != 1:
-            raise KeyError(f"{model_id}의 {metric} 대응 요약이 없습니다")
+            raise KeyError(f"{model_id} vs {reference}의 {metric} 대응 요약이 없습니다")
         return row.iloc[0].to_dict()
 
-    def ratio(model_id: str, metric: str) -> float:
-        def mean(model: str) -> float:
-            row = absolute_summary[
-                absolute_summary.model_id.eq(model) & absolute_summary.metric.eq(metric)
-            ]
-            return float(row.iloc[0]["mean"])
+    def mean_metric(model_id: str, metric: str) -> float:
+        row = absolute_summary[
+            absolute_summary.model_id.eq(model_id) & absolute_summary.metric.eq(metric)
+        ]
+        return float(row.iloc[0]["mean"])
 
-        return mean(model_id) / mean(M1_MODEL_ID)
+    def ratio(model_id: str, metric: str, reference: str = M1_MODEL_ID) -> float:
+        return mean_metric(model_id, metric) / mean_metric(reference, metric)
 
-    def consistent_gain(model_id: str, metric: str) -> bool:
-        stat = paired_stat(model_id, metric)
+    def consistent_gain(model_id: str, metric: str, reference: str = M1_MODEL_ID) -> bool:
+        stat = paired_stat(model_id, metric, reference)
         return bool(stat["mean"] > 0 and stat["positive_seed_count"] >= cfg.min_positive_seeds)
+
+    def keeps_up(metric: str) -> bool:
+        """The combination may not fall below either part on a shared metric."""
+
+        best = max(mean_metric(M2_MODEL_ID, metric), mean_metric(M4_MODEL_ID, metric))
+        return mean_metric(M5_MODEL_ID, metric) >= cfg.accuracy_guard * best
 
     m3 = {
         "value_gain": consistent_gain(M3_MODEL_ID, WEIGHTED_HIT_10),
@@ -549,11 +583,30 @@ def component_reading(
     components = {M3_MODEL_ID: m3, M2_MODEL_ID: m2, M4_MODEL_ID: m4}
     for checks in components.values():
         checks["retained"] = all(value for value in checks.values())
+    combination = {
+        "keeps_m4_role_over_m2": consistent_gain(
+            M5_MODEL_ID, HIGH_CLV_RECALL_10, M2_MODEL_ID
+        )
+        or consistent_gain(M5_MODEL_ID, HIGH_CLV_NDCG_10, M2_MODEL_ID),
+        "keeps_m2_role_over_m4": consistent_gain(M5_MODEL_ID, "recall@50", M4_MODEL_ID)
+        and consistent_gain(M5_MODEL_ID, WEIGHTED_HIT_50, M4_MODEL_ID),
+        "beats_m1_on_both_roles": consistent_gain(M5_MODEL_ID, "recall@10")
+        and consistent_gain(M5_MODEL_ID, "recall@50"),
+        "loses_nothing_to_the_parts": all(
+            keeps_up(metric)
+            for metric in ("ndcg@10", WEIGHTED_HIT_50, HIGH_CLV_RECALL_10)
+        ),
+    }
+    combination["retained"] = all(value for value in combination.values())
     return {
         "components": components,
         "combination_candidates": [
             model_id for model_id, checks in components.items() if checks["retained"]
         ],
+        "combination": combination,
+        "next_step": (
+            "CLV attribution control" if combination["retained"] else "no combination tuning"
+        ),
         "significance_claimed": False,
         "clv_attribution_tested": False,
     }
@@ -568,7 +621,10 @@ def _persist(prepared: dict, cfg: ComponentRecheckConfig, arms: list[dict]) -> p
          for metric in metric_columns]
     )
     paired_seed, paired_summary = paired.paired_tables(
-        absolute, arms, [(model_id, M1_MODEL_ID) for model_id in MODEL_IDS[1:]]
+        absolute,
+        arms,
+        [(model_id, M1_MODEL_ID) for model_id in MODEL_IDS[1:]]
+        + [(M5_MODEL_ID, M2_MODEL_ID), (M5_MODEL_ID, M4_MODEL_ID)],
     )
     reading = component_reading(absolute_summary, paired_summary, cfg)
 

@@ -49,10 +49,28 @@ def test_each_component_changes_exactly_one_intervention_point():
     assert changed(specs[recheck.M3_MODEL_ID]) == {"graph": True, "representation": False, "loss": False}
     assert changed(specs[recheck.M2_MODEL_ID]) == {"graph": False, "representation": True, "loss": False}
     assert changed(specs[recheck.M4_MODEL_ID]) == {"graph": False, "representation": False, "loss": True}
+    assert changed(specs[recheck.M5_MODEL_ID]) == {"graph": False, "representation": True, "loss": True}
+
+
+def test_appending_the_combination_arm_keeps_the_finished_seeds_cached(monkeypatch):
+    cfg = _cfg()
+    before = recheck._config_hash(cfg, "input-hash")
+
+    monkeypatch.setattr(recheck, "MODEL_IDS", recheck.MODEL_IDS + ("m6_future",))
+    assert recheck._config_hash(cfg, "input-hash") == before
+    assert recheck._config_hash(cfg, "other-input") != before
 
 
 def _arms(deltas: dict[str, dict[str, list[float]]]) -> list[dict]:
-    metrics = ("recall@10", "ndcg@10", "recall@50", recheck.WEIGHTED_HIT_10, recheck.WEIGHTED_HIT_50)
+    metrics = (
+        "recall@10",
+        "ndcg@10",
+        "recall@50",
+        recheck.WEIGHTED_HIT_10,
+        recheck.WEIGHTED_HIT_50,
+        recheck.HIGH_CLV_RECALL_10,
+        recheck.HIGH_CLV_NDCG_10,
+    )
     arms = []
     for index, seed in enumerate(recheck.SEEDS):
         base = {metric: 0.1 + 0.001 * index for metric in metrics}
@@ -76,7 +94,11 @@ def _reading(deltas):
          for metric in paired._metric_columns(absolute)]
     )
     _, paired_summary = paired.paired_tables(
-        absolute, arms, [(model_id, recheck.M1_MODEL_ID) for model_id in recheck.MODEL_IDS[1:]]
+        absolute,
+        arms,
+        [(model_id, recheck.M1_MODEL_ID) for model_id in recheck.MODEL_IDS[1:]]
+        + [(recheck.M5_MODEL_ID, recheck.M2_MODEL_ID),
+           (recheck.M5_MODEL_ID, recheck.M4_MODEL_ID)],
     )
     return recheck.component_reading(absolute_summary, paired_summary, cfg)
 
@@ -150,3 +172,60 @@ def test_history_fit_arm_uses_its_own_leave_one_out_bpr():
 
     assert torch.isclose(loss, expected)
     assert bpr == pytest.approx(diagnostics["bpr"])
+
+
+def _combination_reading(m2_deltas, m4_deltas, m5_deltas):
+    return _reading(
+        {
+            recheck.M2_MODEL_ID: m2_deltas,
+            recheck.M4_MODEL_ID: m4_deltas,
+            recheck.M5_MODEL_ID: m5_deltas,
+        }
+    )["combination"]
+
+
+def test_combination_passes_only_when_it_keeps_both_parts_roles():
+    up = [0.01] * 5
+    # M2 owns the deep list, M4 owns the high-CLV top of the list
+    m2 = {"recall@50": up, recheck.WEIGHTED_HIT_50: up}
+    m4 = {recheck.HIGH_CLV_RECALL_10: up, "recall@10": up}
+    both = {**m2, **m4, recheck.HIGH_CLV_NDCG_10: up}
+
+    passing = _combination_reading(m2, m4, {k: [v * 2 for v in d] for k, d in both.items()})
+    assert passing["retained"] is True
+
+    # combination that only reproduces M2 loses M4's high-CLV top-10 role
+    m2_only = _combination_reading(m2, m4, m2)
+    assert m2_only["keeps_m4_role_over_m2"] is False
+    assert m2_only["retained"] is False
+
+
+def test_combination_fails_when_it_falls_below_a_part():
+    up = [0.01] * 5
+    m2 = {"recall@50": up, recheck.WEIGHTED_HIT_50: up}
+    m4 = {recheck.HIGH_CLV_RECALL_10: up, "recall@10": up}
+    starved = {**m2, **m4, recheck.HIGH_CLV_NDCG_10: up, "ndcg@10": [-0.05] * 5}
+
+    reading = _combination_reading(m2, m4, {k: [v * 2 for v in d] for k, d in starved.items()})
+    assert reading["loses_nothing_to_the_parts"] is False
+    assert reading["retained"] is False
+
+
+def test_combination_arm_applies_the_m4_weights_to_the_m2_representation():
+    from test_clv_history_item_fit_model import _model
+
+    model = _model()
+    users = torch.tensor([0, 1])
+    positives = torch.tensor([0, 2])
+    negatives = torch.tensor([[1], [0]])
+    ones = torch.ones(2)
+
+    plain, _, _ = recheck._batch_loss(model, users, positives, negatives, None)
+    unit, _, _ = recheck._batch_loss(model, users, positives, negatives, ones)
+    skewed, _, _ = recheck._batch_loss(model, users, positives, negatives, torch.tensor([3.0, 0.0]))
+
+    assert torch.isclose(plain, unit)
+    assert not torch.isclose(plain, skewed)
+
+    with pytest.raises(ValueError):
+        model.bpr_loss(users, positives, negatives[:, 0], weights=ones)

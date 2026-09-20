@@ -521,9 +521,7 @@ class HistoryItemFitLightGCN(nn.Module):
         )
         return self.pref_reg * sum(table.pow(2).sum() for table in tables) / len(users)
 
-    def bpr_loss(self, users, positives, negatives, gate=None, lam=0.0, weights=None):
-        if weights is not None:
-            raise ValueError("M2 표현 실험에 M4 표본 가중치를 넣을 수 없습니다")
+    def _pair_scores(self, users, positives, negatives):
         user_id, item_id = self._id_embeddings()
         user_n, target_n, user_v, target_v = self._training_profiles(
             users, positives
@@ -538,13 +536,30 @@ class HistoryItemFitLightGCN(nn.Module):
             (user_n * target_n[negatives]).sum(1)
             + (user_v * target_v[negatives]).sum(1)
         )
-        bpr = -F.logsigmoid(positive_score - negative_score).mean()
+        return positive_score, negative_score
+
+    def _bpr(self, users, positives, negatives, weights, objective: str):
+        positive_score, negative_score = self._pair_scores(users, positives, negatives)
+        per_row = -F.logsigmoid(positive_score - negative_score)
+        bpr = per_row.mean() if weights is None else (weights * per_row).mean()
         loss = bpr + self.batch_l2(users, positives, negatives)
         return loss, {
             "bpr": float(bpr.detach()),
             "p_correct": float((positive_score > negative_score).float().mean().detach()),
-            "objective": "plain_bpr",
+            "objective": objective,
         }
+
+    def bpr_loss(self, users, positives, negatives, gate=None, lam=0.0, weights=None):
+        if weights is not None:
+            raise ValueError("M2 표현 실험에 M4 표본 가중치를 넣을 수 없습니다")
+        return self._bpr(users, positives, negatives, None, "plain_bpr")
+
+    def weighted_bpr_loss(self, users, positives, negatives, weights):
+        """M2 표현과 M4 양성 가중치를 함께 쓰는 결합 실험 전용 손실."""
+
+        if weights is None:
+            raise ValueError("결합 손실에는 행 가중치가 필요합니다")
+        return self._bpr(users, positives, negatives, weights, "row_weighted_bpr")
 
     @torch.no_grad()
     def representation_diagnostics(self) -> dict[str, float]:
