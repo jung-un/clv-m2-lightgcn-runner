@@ -26,6 +26,7 @@ import lightgcn_clv_m4_k1_assignment_control_multiseed as m4_multi
 import lightgcn_clv_m4_k1_assignment_control_screen as m4_single
 import lightgcn_clv_m5_economic_positive_weight as economic
 import lightgcn_clv_m5_k1_m4_improvement_screen as weighted_training
+import lightgcn_clv_m5_nv_economic_positive_weight as nv_economic
 import lightgcn_clv_moe as moe
 import lightgcn_clv_v3 as v3
 
@@ -157,10 +158,14 @@ def _config_hash(cfg, input_hash: str, revision: str) -> str:
 
 def _prepare(cfg: GradientIsolatedM4ComboConfig) -> dict:
     prepared = gi._prepare(cfg)
-    inputs = economic.build_economic_inputs(
+    # Reuse the exact train-only economic-input construction of the validated
+    # personalized M4.  The lower-level legacy builder does not create
+    # ``user_bin_fit``, which is required by the positive-row weights.
+    inputs = nv_economic.build_nv_economic_inputs(
         prepared["data"]["train"],
         n_users=prepared["data"]["n_users"],
         n_items=prepared["data"]["n_items"],
+        q_n=prepared["q_n"],
         q_v=prepared["q_v"],
         q_c=prepared["q_c"],
         clv_valid=prepared["clv_valid"],
@@ -203,6 +208,39 @@ def _arm_paths(prepared: dict, model_id: str, seed: int) -> dict[str, Path]:
     return {"checkpoint": root / f"{stem}.pt", "result": root / f"{stem}.json"}
 
 
+def _load_compatible_completed_arm(prepared: dict, cfg, *, model_id: str, weighted: bool):
+    """Reuse a completed arm across this bug-fix revision when its model is unchanged."""
+
+    candidates = []
+    pattern = f"arms/*/{model_id}_s{cfg.seed}.json"
+    for result_path in sorted(prepared["out_dir"].glob(pattern)):
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            checkpoint_path = Path(payload["checkpoint"])
+            checkpoint = economic.load_checkpoint_or_discard(checkpoint_path)
+        except (KeyError, OSError, json.JSONDecodeError):
+            continue
+        if checkpoint is None:
+            continue
+        if (
+            payload.get("model_id") != model_id
+            or payload.get("seed") != cfg.seed
+            or payload.get("final_epoch") != cfg.epochs
+            or bool(payload.get("m4_weighted")) != bool(weighted)
+            or checkpoint.get("model_id") != model_id
+            or checkpoint.get("input_hash") != prepared["input_hash"]
+            or checkpoint.get("config") != asdict(cfg)
+        ):
+            continue
+        candidates.append((result_path, payload, checkpoint))
+    if not candidates:
+        return None
+    hashes = {candidate[1].get("checkpoint_sha256") for candidate in candidates}
+    if len(candidates) > 1 and len(hashes) > 1:
+        raise RuntimeError(f"서로 다른 호환 완료 결과가 여러 개입니다: {pattern}")
+    return candidates[0]
+
+
 def _run_trained_arm(prepared: dict, cfg, *, model_id: str, role: str, weighted: bool):
     paths = _arm_paths(prepared, model_id, cfg.seed)
     model = _build_model(prepared, cfg)
@@ -213,6 +251,16 @@ def _run_trained_arm(prepared: dict, cfg, *, model_id: str, role: str, weighted:
         model.load_state_dict(checkpoint["state"], strict=True)
         model.eval()
         return json.loads(paths["result"].read_text(encoding="utf-8")), model
+
+    compatible = _load_compatible_completed_arm(
+        prepared, cfg, model_id=model_id, weighted=weighted
+    )
+    if compatible is not None:
+        result_path, payload, checkpoint = compatible
+        model.load_state_dict(checkpoint["state"], strict=True)
+        model.eval()
+        print(f"[reused compatible completed arm] {result_path}")
+        return payload, model
 
     spec = {"model_id": model_id, "role": role, "rho": cfg.rho,
             "improvement": "original" if weighted else None}

@@ -1,6 +1,46 @@
 import numpy as np
+import pandas as pd
 
 import lightgcn_clv_gradient_isolated_m4_k1_combo_screen as combo
+
+
+def test_prepare_builds_the_exact_m4_user_bin_fit(monkeypatch, tmp_path):
+    train = pd.DataFrame(
+        {
+            "u_idx": [0, 0, 1, 1, 2, 2, 3, 3],
+            "i_idx": [0, 1, 1, 2, 2, 3, 3, 0],
+            "cat_idx": [0, 0, 0, 1, 1, 1, 1, 0],
+            "v": [1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 1.0],
+        }
+    )
+    base = {
+        "data": {
+            "train": train,
+            "n_users": 4,
+            "n_items": 4,
+            "tr_u": train["u_idx"].to_numpy(np.int64),
+            "tr_i": train["i_idx"].to_numpy(np.int64),
+        },
+        "q_n": np.array([0.1, 0.4, 0.7, 1.0]),
+        "q_v": np.array([0.2, 0.5, 0.8, 1.0]),
+        "q_c": np.array([0.1, 0.3, 0.7, 1.0]),
+        "clv_valid": np.ones(4, dtype=bool),
+        "input_hash": "synthetic-input",
+        "revision": "synthetic-revision",
+    }
+    monkeypatch.setattr(combo.gi, "_prepare", lambda cfg: dict(base))
+    cfg = combo.configure_combo_screen(
+        out_dir=str(tmp_path / "out"),
+        baseline_result_dir=str(tmp_path / "baseline"),
+        reference_result_dir=str(tmp_path / "reference"),
+    )
+
+    prepared = combo._prepare(cfg)
+
+    assert prepared["user_bin_fit"].shape == (4, cfg.economic_bins)
+    weights, diagnostics = combo._weights(prepared, cfg, weighted=True)
+    assert weights.shape == (len(train),)
+    assert diagnostics["row_weight_cv"] > 0.0
 
 
 def test_combo_preflight_pins_seed43_k1_and_only_trains_new_arms():
