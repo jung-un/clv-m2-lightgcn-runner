@@ -233,3 +233,47 @@ def test_replication_colabs_pin_seed_and_reviewed_source(seed):
     assert source.count("run_hm2y_m4_assignment_screen(cfg)") == 1
     assert "마지막으로 완료된 epoch 다음" in source
     assert "rm -rf" not in source
+
+
+@pytest.mark.parametrize(
+    ("label", "model_id"),
+    [
+        ("m1", "m1_bpr_k1_hm2y_m4_assignment_control"),
+        ("actual", "m4_personalized_positive_weight_actual_qc_bpr_k1_hm2y"),
+        (
+            "shuffle",
+            "m4_personalized_positive_weight_degree_matched_qc_shuffle_bpr_k1_hm2y",
+        ),
+    ],
+)
+def test_seed44_parallel_colabs_keep_original_checkpoint_identity(label, model_id):
+    path = Path(
+        "clv_m4_personalized_positive_weight_k1_assignment_control_"
+        f"hm2y_seed44_{label}_parallel_colab.ipynb"
+    )
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "REVIEWED_SHA = '3188b01c360d54e78338eaebdf2a8ecb6a6d52d8'" in source
+    assert f"SELECTED_MODEL_ID = '{model_id}'" in source
+    assert "hm_screen._prepare(cfg)" in source
+    assert "hm_screen.training._run_arm" in source
+    assert "run_hm2y_m4_assignment_screen(cfg)" not in source
+    assert "rm -rf" not in source
+
+
+def test_seed44_parallel_aggregate_only_uses_completed_arm_cache():
+    path = Path(
+        "clv_m4_personalized_positive_weight_k1_assignment_control_"
+        "hm2y_seed44_parallel_aggregate_colab.ipynb"
+    )
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "REVIEWED_SHA = '3188b01c360d54e78338eaebdf2a8ecb6a6d52d8'" in source
+    assert source.count("run_hm2y_m4_assignment_screen(cfg)") == 1
+    assert "세 arm이 모두 완료된 뒤에만" in source
