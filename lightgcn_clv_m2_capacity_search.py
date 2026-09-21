@@ -70,6 +70,7 @@ CONDITIONS = (
 
 @dataclass(frozen=True)
 class CapacitySearchConfig:
+    conditions: tuple[str, ...] = tuple(c.name for c in CONDITIONS)
     seeds: tuple[int, ...] = (42,)
     epochs: int = 300
     eval_every: int = 25
@@ -95,6 +96,11 @@ def validate_config(cfg: CapacitySearchConfig) -> CapacitySearchConfig:
         raise ValueError("기존 100 epoch 지점이 평가 격자에 포함돼야 비교가 됩니다")
     if cfg.negative_count != 1:
         raise ValueError("K=1 기준 음성표본을 바꾸지 않습니다")
+    known = {c.name for c in CONDITIONS}
+    if not cfg.conditions or not set(cfg.conditions).issubset(known):
+        raise ValueError(f"조건 이름은 {sorted(known)} 안에서 골라야 합니다")
+    if CONDITIONS[0].name not in cfg.conditions:
+        raise ValueError("기준 조건이 빠지면 다른 조건을 비교할 대상이 없습니다")
     if not cfg.out_dir:
         raise ValueError("out_dir가 필요합니다")
     return cfg
@@ -111,7 +117,7 @@ def arm_specifications(cfg: CapacitySearchConfig) -> list[dict]:
     """One M2 arm per condition, and one M1 arm per distinct shared setting."""
 
     arms, seen = [], set()
-    for condition in CONDITIONS:
+    for condition in (c for c in CONDITIONS if c.name in cfg.conditions):
         shared = (condition.id_dim, condition.pref_reg)
         if shared not in seen:
             seen.add(shared)
@@ -155,7 +161,17 @@ def preflight_summary(cfg: CapacitySearchConfig) -> dict:
         "epochs": cfg.epochs,
         "evaluated_at_epochs": evaluation_epochs(cfg),
         "protocol_epoch": PROTOCOL_EPOCH,
-        "conditions": {c.name: asdict(c) for c in CONDITIONS},
+        "conditions": {c.name: asdict(c) for c in CONDITIONS if c.name in cfg.conditions},
+        "clv_entry_point": (
+            "q_N(u) and q_V(u), the customer's two CLV axis percentiles from the "
+            "last 365 training days, scale that customer's own purchase-history "
+            "block; the block enters the score during training and evaluation "
+            "alike, never as a post-hoc correction. q_C is not used (approved "
+            "2026-09-16). Training uses leave-one-out history profiles so the "
+            "positive item cannot see its own share; evaluation uses the full "
+            "history."
+        ),
+        "clv_score_share_recorded": True,
         "m1_retrained_per_shared_setting": True,
         "loss": {"negative_count": cfg.negative_count, "hard_negative": False},
         "reading": (
@@ -170,12 +186,14 @@ def preflight_summary(cfg: CapacitySearchConfig) -> dict:
 
 
 def _config_hash(cfg: CapacitySearchConfig, input_hash: str) -> str:
+    # The condition list and the seed list stay out of the hash so that running
+    # one condition first and adding the rest later reuses the finished curves.
     payload = {
         "code_version": CODE_VERSION,
         "protocol": {
             field: getattr(cfg, field)
             for field in asdict(cfg)
-            if field not in {"out_dir", "seeds"}
+            if field not in {"out_dir", "seeds", "conditions"}
         },
         "input_hash": input_hash,
     }
@@ -235,6 +253,32 @@ def _arm_paths(prepared: dict, spec: dict, seed: int) -> dict[str, Path]:
     root = prepared["out_dir"] / "arms" / prepared["config_hash"]
     stem = f"{spec['condition']}_{spec['model_id']}_s{seed}"
     return {"result": root / f"{stem}.json"}
+
+
+@torch.no_grad()
+def _clv_score_share(model, prepared: dict, rng: np.random.Generator) -> dict:
+    """How much of the score the CLV-scaled block actually carries.
+
+    The user and item vectors are ``[ID block | CLV-scaled block]``, so the dot
+    product splits exactly.  A share near zero means the intervention is
+    present in the code but not in the score.
+    """
+
+    data = prepared["data"]
+    sample = rng.choice(len(data["tr_u"]), size=min(4096, len(data["tr_u"])), replace=False)
+    users = torch.as_tensor(data["tr_u"][sample], dtype=torch.long, device=v3.DEVICE)
+    items = torch.as_tensor(data["tr_i"][sample], dtype=torch.long, device=v3.DEVICE)
+    user_vectors, item_vectors, *_ = model.embeddings()
+    cut = model.id_dim
+    id_part = (user_vectors[users, :cut] * item_vectors[items, :cut]).sum(dim=1)
+    clv_part = (user_vectors[users, cut:] * item_vectors[items, cut:]).sum(dim=1)
+    return {
+        "id_score_mean_abs": float(id_part.abs().mean()),
+        "clv_score_mean_abs": float(clv_part.abs().mean()),
+        "clv_score_share": float(
+            clv_part.abs().mean() / (id_part.abs().mean() + clv_part.abs().mean() + 1e-12)
+        ),
+    }
 
 
 @torch.no_grad()
@@ -298,6 +342,9 @@ def _train_curve(
         }
         if epoch in checkpoints:
             record["metrics"] = _evaluate(model, prepared)
+            record["score_split"] = _clv_score_share(
+                model, prepared, np.random.default_rng(seed)
+            )
             print(
                 f"  [{spec['condition']}/{spec['model_id']} s{seed}] ep {epoch:3d} | "
                 f"loss {record['loss']:.4f} | recall@10 {record['metrics']['recall@10']:.6f} | "
@@ -360,6 +407,7 @@ def curve_table(arms: list[dict]) -> pd.DataFrame:
                     "epoch": record["epoch"],
                     "loss": record["loss"],
                     "p_correct": record["p_correct"],
+                    **record.get("score_split", {}),
                     **record["metrics"],
                 }
             )

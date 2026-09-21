@@ -102,3 +102,17 @@ def test_shortlist_names_conditions_that_beat_the_baseline_gap():
 
     assert reading["conditions_closing_the_gap"] == ["wide"]
     assert reading["condition_selected"] is False
+
+
+def test_running_one_condition_first_keeps_the_others_reusable():
+    full = _cfg()
+    staged = _cfg(conditions=("baseline",))
+
+    assert search._config_hash(full, "input-hash") == search._config_hash(staged, "input-hash")
+    assert search._config_hash(full, "other-input") != search._config_hash(full, "input-hash")
+    assert [s["condition"] for s in search.arm_specifications(staged)] == ["baseline", "baseline"]
+
+    with pytest.raises(ValueError):
+        _cfg(conditions=("wide",))        # 기준 조건 없이 비교 불가
+    with pytest.raises(ValueError):
+        _cfg(conditions=("baseline", "unknown"))
