@@ -32,9 +32,11 @@ def test_m1_is_retrained_once_per_shared_setting_not_once_per_condition():
     m1 = [s for s in specs if s["model_id"] == search.M1_MODEL_ID]
     m2 = [s for s in specs if s["model_id"] == search.M2_MODEL_ID]
 
-    # four conditions, but baseline and strong_signal share 64 dims / L2 1e-3
-    assert len(m2) == len(search.CONDITIONS) == 4
-    assert {search.shared_baseline(s) for s in m1} == {(64, 1e-3), (128, 1e-3), (64, 1e-4)}
+    # five conditions, but three of them share the 64-dim / L2 1e-3 M1
+    assert len(m2) == len(search.CONDITIONS) == 5
+    assert {search.shared_baseline(s) for s in m1} == {
+        "dim64_l20.001", "dim128_l20.001", "dim64_l20.0001"
+    }
     assert len(m1) == 3
     # every M2 condition has an M1 trained under the same shared setting
     assert {search.shared_baseline(s) for s in m2} <= {search.shared_baseline(s) for s in m1}
@@ -45,18 +47,60 @@ def test_each_condition_changes_exactly_one_knob_from_the_baseline():
     for condition in search.CONDITIONS[1:]:
         changed = sum(
             getattr(condition, field) != getattr(baseline, field)
-            for field in ("id_dim", "pref_reg", "rho")
+            for field in ("id_dim", "pref_reg", "rho", "axis_dim")
         )
         assert changed == 1, condition.name
+        assert condition.hypothesis != baseline.hypothesis
 
 
-def _curve(m1_recall, m2_recall, condition="baseline", epochs=(100, 300)):
+def test_intervention_strength_is_not_reported_as_an_underfitting_test():
+    summary = search.preflight_summary(_cfg())
+
+    assert summary["not_an_underfitting_test"] == ["strong_signal"]
+    assert "intervention_strength" in summary["hypotheses"]
+
+
+def test_every_condition_reaches_the_comparison_table():
+    """A condition that only changes an M2-side knob shares M1 with the baseline."""
+
+    cfg = _cfg()
+    rows = []
+    for spec in search.arm_specifications(cfg):
+        rows.append(
+            {**{k: spec[k] for k in ("condition", "hypothesis", "shared_key",
+                                     "model_id", "id_dim", "axis_dim", "pref_reg", "rho")},
+             "seed": 42, "epoch": 100, "loss": 0.1, "p_correct": 0.9,
+             "recall@10": 0.010 if spec["model_id"] == search.M1_MODEL_ID else 0.011,
+             "ndcg@10": 0.02}
+        )
+    gap = search.gap_table(pd.DataFrame(rows))
+
+    assert set(gap.condition) == {c.name for c in search.CONDITIONS}
+    assert set(gap[gap.condition.eq("strong_signal")].shared_key) == {"dim64_l20.001"}
+
+
+def test_gap_table_refuses_to_silently_drop_an_unpaired_condition():
+    cfg = _cfg()
+    rows = [
+        {**{k: spec[k] for k in ("condition", "hypothesis", "shared_key",
+                                 "model_id", "id_dim", "axis_dim", "pref_reg", "rho")},
+         "seed": 42, "epoch": 100, "loss": 0.1, "p_correct": 0.9, "recall@10": 0.01}
+        for spec in search.arm_specifications(cfg)
+        if spec["model_id"] != search.M1_MODEL_ID          # M1 결과가 통째로 빠진 상황
+    ]
+    with pytest.raises(KeyError, match="M1"):
+        search.gap_table(pd.DataFrame(rows))
+
+
+def _curve(m1_recall, m2_recall, condition="baseline", epochs=(100, 300),
+           shared_key="dim64_l20.001"):
     rows = []
     for model_id, values in ((search.M1_MODEL_ID, m1_recall), (search.M2_MODEL_ID, m2_recall)):
         for epoch, value in zip(epochs, values):
             rows.append(
-                {"condition": condition, "model_id": model_id, "id_dim": 64,
-                 "pref_reg": 1e-3, "rho": 0.0, "seed": 42, "epoch": epoch,
+                {"condition": condition, "hypothesis": "training_budget",
+                 "shared_key": shared_key, "model_id": model_id, "id_dim": 64,
+                 "axis_dim": 4, "pref_reg": 1e-3, "rho": 0.0, "seed": 42, "epoch": epoch,
                  "loss": 0.1, "p_correct": 0.96,
                  "recall@10": value, "ndcg@10": value * 1.2}
             )
@@ -96,7 +140,8 @@ def test_reading_detects_a_peak_before_the_protocol_epoch():
 
 def test_shortlist_names_conditions_that_beat_the_baseline_gap():
     baseline = _curve([0.010, 0.012], [0.009, 0.0095])
-    wide = _curve([0.010, 0.012], [0.009, 0.014], condition="wide")
+    wide = _curve([0.010, 0.012], [0.009, 0.014], condition="wide",
+                  shared_key="dim128_l20.001")
     curve = pd.concat([baseline, wide], ignore_index=True)
     reading = search.search_reading(curve, search.gap_table(curve), _cfg())
 

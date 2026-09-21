@@ -55,16 +55,25 @@ M2_MODEL_ID = "m2_nv_history_fit_bpr_k1"
 @dataclass(frozen=True)
 class Condition:
     name: str
+    hypothesis: str
     id_dim: int
     pref_reg: float
     rho: float
+    axis_dim: int
+
+    @property
+    def shared_key(self) -> str:
+        """M1 depends only on the settings it shares; it has no CLV block."""
+
+        return f"dim{self.id_dim}_l2{self.pref_reg:g}"
 
 
 CONDITIONS = (
-    Condition("baseline", 64, 1e-3, 0.05),
-    Condition("wide", 128, 1e-3, 0.05),
-    Condition("light_l2", 64, 1e-4, 0.05),
-    Condition("strong_signal", 64, 1e-3, 0.10),
+    Condition("baseline", "training_budget", 64, 1e-3, 0.05, 4),
+    Condition("wide", "id_capacity", 128, 1e-3, 0.05, 4),
+    Condition("axis_wide", "clv_block_capacity", 64, 1e-3, 0.05, 8),
+    Condition("light_l2", "regularization", 64, 1e-4, 0.05, 4),
+    Condition("strong_signal", "intervention_strength", 64, 1e-3, 0.10, 4),
 )
 
 
@@ -77,7 +86,6 @@ class CapacitySearchConfig:
     batch_size: int = 8192
     lr: float = 5e-4
     n_layers: int = 2
-    axis_dim: int = 4
     negative_count: int = 1
     out_dir: str = ""
 
@@ -118,32 +126,37 @@ def arm_specifications(cfg: CapacitySearchConfig) -> list[dict]:
 
     arms, seen = [], set()
     for condition in (c for c in CONDITIONS if c.name in cfg.conditions):
-        shared = (condition.id_dim, condition.pref_reg)
-        if shared not in seen:
-            seen.add(shared)
+        if condition.shared_key not in seen:
+            seen.add(condition.shared_key)
             arms.append(
                 {
                     "model_id": M1_MODEL_ID,
                     "condition": condition.name,
+                    "hypothesis": condition.hypothesis,
+                    "shared_key": condition.shared_key,
                     "id_dim": condition.id_dim,
                     "pref_reg": condition.pref_reg,
                     "rho": 0.0,
+                    "axis_dim": 0,
                 }
             )
         arms.append(
             {
                 "model_id": M2_MODEL_ID,
                 "condition": condition.name,
+                "hypothesis": condition.hypothesis,
+                "shared_key": condition.shared_key,
                 "id_dim": condition.id_dim,
                 "pref_reg": condition.pref_reg,
                 "rho": condition.rho,
+                "axis_dim": condition.axis_dim,
             }
         )
     return arms
 
 
-def shared_baseline(spec: dict) -> tuple[int, float]:
-    return (spec["id_dim"], spec["pref_reg"])
+def shared_baseline(spec: dict) -> str:
+    return spec["shared_key"]
 
 
 def preflight_summary(cfg: CapacitySearchConfig) -> dict:
@@ -162,6 +175,14 @@ def preflight_summary(cfg: CapacitySearchConfig) -> dict:
         "evaluated_at_epochs": evaluation_epochs(cfg),
         "protocol_epoch": PROTOCOL_EPOCH,
         "conditions": {c.name: asdict(c) for c in CONDITIONS if c.name in cfg.conditions},
+        "hypotheses": sorted(
+            {c.hypothesis for c in CONDITIONS if c.name in cfg.conditions}
+        ),
+        "not_an_underfitting_test": [
+            c.name
+            for c in CONDITIONS
+            if c.name in cfg.conditions and c.hypothesis == "intervention_strength"
+        ],
         "clv_entry_point": (
             "q_N(u) and q_V(u), the customer's two CLV axis percentiles from the "
             "last 365 training days, scale that customer's own purchase-history "
@@ -224,7 +245,7 @@ def _build_model(prepared: dict, cfg: CapacitySearchConfig, spec: dict, seed: in
             value_valid=valid,
             adj=data["adj"],
             id_dim=spec["id_dim"],
-            axis_dim=cfg.axis_dim,
+            axis_dim=spec["axis_dim"],
             n_layers=cfg.n_layers,
             rho=spec["rho"],
             pref_reg=spec["pref_reg"],
@@ -256,28 +277,46 @@ def _arm_paths(prepared: dict, spec: dict, seed: int) -> dict[str, Path]:
 
 
 @torch.no_grad()
-def _clv_score_share(model, prepared: dict, rng: np.random.Generator) -> dict:
-    """How much of the score the CLV-scaled block actually carries.
+def _clv_score_share(model, prepared: dict, cfg: CapacitySearchConfig) -> dict:
+    """How much of the score the CLV-scaled block carries where it decides.
 
-    The user and item vectors are ``[ID block | CLV-scaled block]``, so the dot
-    product splits exactly.  A share near zero means the intervention is
-    present in the code but not in the score.
+    Measured on the items the model actually recommends: evaluation customers,
+    their own training items masked out exactly as in evaluation, the top ten
+    taken from the full catalogue.  Scoring training positives instead would
+    flatter the block, because a customer's history profile contains that very
+    item and would meet its own target vector.
     """
 
-    data = prepared["data"]
-    sample = rng.choice(len(data["tr_u"]), size=min(4096, len(data["tr_u"])), replace=False)
-    users = torch.as_tensor(data["tr_u"][sample], dtype=torch.long, device=v3.DEVICE)
-    items = torch.as_tensor(data["tr_i"][sample], dtype=torch.long, device=v3.DEVICE)
+    cache, data = prepared["cache"], prepared["data"]
+    csr_ptr, csr_items = data["csr_ptr"], data["csr_items"]
+    rng = np.random.default_rng(0)
+    sample = cache.users[
+        rng.choice(len(cache.users), size=min(256, len(cache.users)), replace=False)
+    ]
     user_vectors, item_vectors, *_ = model.embeddings()
     cut = model.id_dim
-    id_part = (user_vectors[users, :cut] * item_vectors[items, :cut]).sum(dim=1)
-    clv_part = (user_vectors[users, cut:] * item_vectors[items, cut:]).sum(dim=1)
+    rows = torch.as_tensor(sample, dtype=torch.long, device=v3.DEVICE)
+    scores = user_vectors[rows] @ item_vectors.T
+    for offset, user in enumerate(sample):
+        lo, hi = csr_ptr[user], csr_ptr[user + 1]
+        if hi > lo:
+            scores[offset, csr_items[lo:hi]] = -1e9
+    top = scores.topk(10, dim=1).indices
+    picked_users = rows[:, None].expand_as(top).reshape(-1)
+    picked_items = top.reshape(-1)
+    id_part = (
+        user_vectors[picked_users, :cut] * item_vectors[picked_items, :cut]
+    ).sum(dim=1)
+    clv_part = (
+        user_vectors[picked_users, cut:] * item_vectors[picked_items, cut:]
+    ).sum(dim=1)
     return {
         "id_score_mean_abs": float(id_part.abs().mean()),
         "clv_score_mean_abs": float(clv_part.abs().mean()),
         "clv_score_share": float(
             clv_part.abs().mean() / (id_part.abs().mean() + clv_part.abs().mean() + 1e-12)
         ),
+        "clv_score_measured_on": "top10_of_evaluation_users",
     }
 
 
@@ -342,9 +381,7 @@ def _train_curve(
         }
         if epoch in checkpoints:
             record["metrics"] = _evaluate(model, prepared)
-            record["score_split"] = _clv_score_share(
-                model, prepared, np.random.default_rng(seed)
-            )
+            record["score_split"] = _clv_score_share(model, prepared, cfg)
             print(
                 f"  [{spec['condition']}/{spec['model_id']} s{seed}] ep {epoch:3d} | "
                 f"loss {record['loss']:.4f} | recall@10 {record['metrics']['recall@10']:.6f} | "
@@ -399,15 +436,19 @@ def curve_table(arms: list[dict]) -> pd.DataFrame:
             rows.append(
                 {
                     "condition": arm["condition"],
+                    "hypothesis": arm["hypothesis"],
+                    "shared_key": arm["shared_key"],
                     "model_id": arm["model_id"],
                     "id_dim": arm["id_dim"],
+                    "axis_dim": arm["axis_dim"],
                     "pref_reg": arm["pref_reg"],
                     "rho": arm["rho"],
                     "seed": arm["seed"],
                     "epoch": record["epoch"],
                     "loss": record["loss"],
                     "p_correct": record["p_correct"],
-                    **record.get("score_split", {}),
+                    **{k: v for k, v in record.get("score_split", {}).items()
+                       if k != "clv_score_measured_on"},
                     **record["metrics"],
                 }
             )
@@ -415,22 +456,39 @@ def curve_table(arms: list[dict]) -> pd.DataFrame:
 
 
 def gap_table(curve: pd.DataFrame) -> pd.DataFrame:
-    """M2 minus its own condition's M1, at every evaluated epoch."""
+    """M2 minus the M1 trained under the same shared setting, at every epoch.
+
+    M1 is trained once per shared setting, not once per condition, so the pair
+    is found by ``shared_key``.  Matching on the condition name instead would
+    silently drop every condition that only changes an M2-side knob.
+    """
 
     metrics = [c for c in curve.columns if "@" in c]
+    baselines = curve[curve.model_id.eq(M1_MODEL_ID)].set_index(
+        ["shared_key", "seed", "epoch"]
+    )
     rows = []
-    for (condition, seed, epoch), group in curve.groupby(
-        ["condition", "seed", "epoch"], sort=False
-    ):
-        m2 = group[group.model_id.eq(M2_MODEL_ID)]
-        m1 = group[group.model_id.eq(M1_MODEL_ID)]
-        if len(m2) != 1 or len(m1) != 1:
-            continue
-        row = {"condition": condition, "seed": seed, "epoch": epoch}
+    for _, arm in curve[curve.model_id.eq(M2_MODEL_ID)].iterrows():
+        key = (arm["shared_key"], arm["seed"], arm["epoch"])
+        if key not in baselines.index:
+            raise KeyError(
+                f"{arm['condition']}에 대응하는 M1({arm['shared_key']}, seed {arm['seed']}, "
+                f"epoch {arm['epoch']}) 결과가 없습니다"
+            )
+        reference = baselines.loc[key]
+        if isinstance(reference, pd.DataFrame):
+            reference = reference.iloc[0]
+        row = {
+            "condition": arm["condition"],
+            "hypothesis": arm["hypothesis"],
+            "shared_key": arm["shared_key"],
+            "seed": arm["seed"],
+            "epoch": arm["epoch"],
+        }
         for metric in metrics:
-            base = float(m1.iloc[0][metric])
-            row[metric] = float(m2.iloc[0][metric]) - base
-            row[f"{metric}_ratio"] = float(m2.iloc[0][metric]) / base if base else np.nan
+            base, value = float(reference[metric]), float(arm[metric])
+            row[metric] = value - base
+            row[f"{metric}_ratio"] = value / base if base else np.nan
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -440,7 +498,8 @@ def search_reading(curve: pd.DataFrame, gap: pd.DataFrame, cfg: CapacitySearchCo
         row = frame[frame.epoch.eq(epoch)]
         return float(row.iloc[0][metric]) if len(row) else float("nan")
 
-    baseline_m1 = curve[curve.condition.eq("baseline") & curve.model_id.eq(M1_MODEL_ID)]
+    baseline_key = CONDITIONS[0].shared_key
+    baseline_m1 = curve[curve.shared_key.eq(baseline_key) & curve.model_id.eq(M1_MODEL_ID)]
     peak_epoch = int(baseline_m1.loc[baseline_m1["recall@10"].idxmax(), "epoch"])
     baseline_gap = gap[gap.condition.eq("baseline")]
     reading = {
