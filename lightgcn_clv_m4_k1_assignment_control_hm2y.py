@@ -458,6 +458,50 @@ def run_hm2y_m4_assignment_screen(
     return frame
 
 
+def run_hm2y_m4_assignment_arm(
+    cfg: M4K1AssignmentHm2yConfig,
+    selected_model_id: str,
+) -> dict:
+    """Train or resume exactly one arm without changing its checkpoint identity.
+
+    The selected arm uses the same config hash and arm path as the original
+    three-arm runner.  This makes it safe to run the three arms in separate
+    Colab runtimes and aggregate them later with
+    :func:`run_hm2y_m4_assignment_screen`.
+    """
+
+    cfg = validate_config(cfg)
+    if selected_model_id not in MODEL_IDS:
+        raise ValueError(
+            f"selected_model_id는 {MODEL_IDS} 중 하나여야 합니다"
+        )
+    summary = preflight_summary(cfg)
+    summary["parallel_execution"] = {
+        "selected_model_id": selected_model_id,
+        "checkpoint_identity_unchanged": True,
+        "aggregate_after_all_arms": "run_hm2y_m4_assignment_screen(cfg)",
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    prepared = _prepare(cfg)
+    spec = next(
+        spec
+        for spec in arm_specifications(prepared)
+        if spec["model_id"] == selected_model_id
+    )
+    print(
+        f"\n===== {spec['model_id']} | seed {cfg.seed} | "
+        f"K={cfg.negative_count} | fixed {cfg.epochs} epochs | "
+        "parallel single-arm ====="
+    )
+    arm, _ = training._run_arm(arm_prepared(prepared, spec), cfg, spec)
+    arm["m4_assignment"] = spec["m4_assignment"]
+    print(
+        "\n선택 arm 완료. 세 arm이 모두 완료되면 "
+        "run_hm2y_m4_assignment_screen(cfg)로 집계하세요."
+    )
+    return arm
+
+
 if __name__ == "__main__":
     print(
         json.dumps(

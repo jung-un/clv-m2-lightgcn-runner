@@ -187,6 +187,14 @@ def test_training_metadata_uses_the_hm_split_label():
     assert split == hm.SPLIT_LABEL
 
 
+def test_single_arm_runner_rejects_unknown_model_before_preparation(tmp_path):
+    hm = _hm()
+    cfg = _cfg(tmp_path)
+
+    with pytest.raises(ValueError, match="selected_model_id"):
+        hm.run_hm2y_m4_assignment_arm(cfg, "unknown_arm")
+
+
 def test_colab_pins_reviewed_source_and_explains_epoch_resume():
     path = Path(
         "clv_m4_personalized_positive_weight_k1_assignment_control_"
