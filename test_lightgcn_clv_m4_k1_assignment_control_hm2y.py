@@ -206,3 +206,22 @@ def test_colab_pins_reviewed_source_and_explains_epoch_resume():
     assert "summary['checkpointing']['save_after_each_completed_epoch'] is True" in source
     assert "마지막으로 완료된 epoch 다음" in source
     assert "rm -rf" not in source
+
+
+@pytest.mark.parametrize("seed", [43, 44])
+def test_replication_colabs_pin_seed_and_reviewed_source(seed):
+    path = Path(
+        "clv_m4_personalized_positive_weight_k1_assignment_control_"
+        f"hm2y_seed{seed}_colab.ipynb"
+    )
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+
+    assert "REVIEWED_SHA = '3188b01c360d54e78338eaebdf2a8ecb6a6d52d8'" in source
+    assert f"seed={seed}, shuffle_seed={seed}" in source
+    assert "summary['staged_replication']['seeds'] == [42, 43, 44]" in source
+    assert source.count("run_hm2y_m4_assignment_screen(cfg)") == 1
+    assert "마지막으로 완료된 epoch 다음" in source
+    assert "rm -rf" not in source
