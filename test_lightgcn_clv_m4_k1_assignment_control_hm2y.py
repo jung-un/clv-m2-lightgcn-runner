@@ -39,6 +39,34 @@ def test_contract_is_hm_validation_only_three_arm_k1(tmp_path):
     assert summary["checkpointing"]["atomic_replace"] is True
 
 
+@pytest.mark.parametrize("seed", [43, 44])
+def test_frozen_replication_allows_only_prespecified_followup_seeds(tmp_path, seed):
+    hm = _hm()
+    cfg = hm.configure_hm2y_m4_assignment_screen(
+        out_dir=str(tmp_path / "results"), seed=seed, shuffle_seed=seed
+    )
+    summary = hm.preflight_summary(cfg)
+
+    assert cfg.seed == seed
+    assert cfg.shuffle_seed == seed
+    assert summary["staged_replication"]["seeds"] == [42, 43, 44]
+    assert summary["staged_replication"]["pass_rule"] == (
+        "at least 2 of 3 seeds pass the frozen single-seed attribution rule"
+    )
+
+
+def test_replication_rejects_unregistered_or_mismatched_shuffle_seed(tmp_path):
+    hm = _hm()
+    with pytest.raises(ValueError, match="seed"):
+        hm.configure_hm2y_m4_assignment_screen(
+            out_dir=str(tmp_path / "results"), seed=45, shuffle_seed=45
+        )
+    with pytest.raises(ValueError, match="shuffle_seed"):
+        hm.configure_hm2y_m4_assignment_screen(
+            out_dir=str(tmp_path / "results"), seed=43, shuffle_seed=42
+        )
+
+
 @pytest.mark.parametrize(
     ("override", "value"),
     [

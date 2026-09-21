@@ -42,6 +42,7 @@ MODEL_IDS = (M1_MODEL_ID, M4_ACTUAL_MODEL_ID, M4_SHUFFLED_MODEL_ID)
 ECONOMIC_METRICS = hm_base.ECONOMIC_METRICS
 ACCURACY_METRICS = hm_base.ACCURACY_METRICS
 ACCURACY_GUARD = 0.99
+REPLICATION_SEEDS = (42, 43, 44)
 
 
 @dataclass(frozen=True)
@@ -64,7 +65,6 @@ def configure_hm2y_m4_assignment_screen(**overrides) -> M4K1AssignmentHm2yConfig
 def validate_config(cfg: M4K1AssignmentHm2yConfig) -> M4K1AssignmentHm2yConfig:
     fixed = {
         "dataset": "hm",
-        "seed": 42,
         "epochs": 100,
         "id_dim": 64,
         "n_layers": 2,
@@ -75,12 +75,15 @@ def validate_config(cfg: M4K1AssignmentHm2yConfig) -> M4K1AssignmentHm2yConfig:
         "shrinkage_strength": 10.0,
         "positive_weight_lambda": 0.5,
         "shuffle_degree_bins": 10,
-        "shuffle_seed": 42,
         "include_shuffle": True,
     }
     for key, expected in fixed.items():
         if getattr(cfg, key) != expected:
             raise ValueError(f"H&M M4 K=1 screen은 {key}={expected!r}이어야 합니다")
+    if cfg.seed not in REPLICATION_SEEDS:
+        raise ValueError(f"H&M M4 K=1 replication seed는 {REPLICATION_SEEDS} 중 하나여야 합니다")
+    if cfg.shuffle_seed != cfg.seed:
+        raise ValueError("shuffle_seed는 해당 학습 seed와 같아야 합니다")
     if cfg.lr <= 0 or cfg.pref_reg < 0 or not cfg.out_dir:
         raise ValueError("H&M M4 K=1 screen의 학습 설정 또는 out_dir가 잘못됐습니다")
     return cfg
@@ -128,6 +131,16 @@ def preflight_summary(cfg: M4K1AssignmentHm2yConfig) -> dict:
             "accuracy_guard": "all six accuracy metrics of actual M4 >= 99% of M1",
             "evaluable": "actual and shuffled M4 change at least one Top-10 set",
             "intervention": "both M4 row-weight coefficients of variation are positive",
+        },
+        "staged_replication": {
+            "seeds": list(REPLICATION_SEEDS),
+            "completed_seed": 42,
+            "new_parallel_seeds": [43, 44],
+            "pass_rule": (
+                "at least 2 of 3 seeds pass the frozen single-seed attribution rule"
+            ),
+            "next_if_pass": "extend the unchanged H&M protocol to five total seeds",
+            "next_if_nonpass": "stop without extending to five or ten seeds",
         },
         "fixed": {
             "new_item_task": True,
