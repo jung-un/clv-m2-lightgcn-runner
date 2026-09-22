@@ -51,11 +51,12 @@ def config_hash(code_version: str, cfg, input_hash: str, revision: str) -> str:
 
 
 def configure_base(cfg) -> dict:
+    seed = int(getattr(cfg, "seed", 42))
     configured = v3.configure_run(
         "hm",
         out_dir=cfg.out_dir,
         ARCH="pref_only",
-        SEED_LIST=[42],
+        SEED_LIST=[seed],
         WINDOW_DAYS=None,
         TRAIN_ON_VAL=False,
         EVAL_TEST=False,
@@ -65,7 +66,7 @@ def configure_base(cfg) -> dict:
         NEG_MODE="uniform",
         MIN_USER_INTER=1,
         MIN_ITEM_INTER=1,
-        DIM=64,
+        DIM=cfg.id_dim,
         N_LAYERS=2,
         BATCH_SIZE=cfg.batch_size,
         LR=cfg.lr,
@@ -86,7 +87,7 @@ def configure_base(cfg) -> dict:
         "NEG_MODE": "uniform",
         "MIN_USER_INTER": 1,
         "MIN_ITEM_INTER": 1,
-        "EPOCHS": 100,
+        "EPOCHS": cfg.epochs,
     }
     for key, expected in required.items():
         if base[key] != expected:
@@ -288,7 +289,7 @@ def progress_store(prepared: dict, cfg, model_id: str, arm_hash: str) -> Progres
         RunIdentity(
             stage="hm2y_validation_fixed_epoch_train",
             model_id=model_id,
-            seed=42,
+            seed=int(getattr(cfg, "seed", 42)),
             config_hash=arm_hash,
             source_revision=prepared["revision"],
             input_hash=prepared["input_hash"],
@@ -298,7 +299,7 @@ def progress_store(prepared: dict, cfg, model_id: str, arm_hash: str) -> Progres
 
 def train_plain_bpr(model, prepared: dict, cfg, model_id: str, store) -> dict:
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=0.0)
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(int(getattr(cfg, "seed", 42)))
     restored = restore_compact(store, model, optimizer, rng)
     start_epoch = 1 if restored is None else int(restored["epoch"]) + 1
     history = [] if restored is None else list(restored.get("history", []))
