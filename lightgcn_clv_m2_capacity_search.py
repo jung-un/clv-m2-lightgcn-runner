@@ -580,9 +580,22 @@ def run_capacity_search(cfg: CapacitySearchConfig | None = None) -> pd.DataFrame
     print("\nM2 - M1 (같은 조건, 같은 시드):")
     print(gap[["condition", "seed", "epoch", "recall@10", "ndcg@10"]].to_string(index=False))
     print("\n판독:", json.dumps(reading, ensure_ascii=False, indent=2))
-    curve.attrs.update(gap=gap, reading=reading,
-                       result_paths={k: str(v) for k, v in paths.items()})
+    # Only display-safe values go into attrs.  A DataFrame stored here makes
+    # pandas raise "truth value of a DataFrame is ambiguous" as soon as the
+    # curve is displayed, because a wide frame is truncated by concatenating
+    # its halves and pandas then compares the two attrs dictionaries.
+    curve.attrs.update(
+        reading=reading,
+        result_paths={name: str(path) for name, path in paths.items()},
+        gap_records=gap.to_dict("records"),
+    )
     return curve
+
+
+def gap_frame(curve: pd.DataFrame) -> pd.DataFrame:
+    """The M2 - M1 table that belongs to a curve returned by the runner."""
+
+    return pd.DataFrame(curve.attrs["gap_records"])
 
 
 if __name__ == "__main__":

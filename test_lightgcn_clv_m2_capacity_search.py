@@ -176,3 +176,22 @@ def test_single_nonbaseline_condition_uses_itself_as_learning_curve_reference():
     reading = search.search_reading(curve, search.gap_table(curve), light_l2)
 
     assert reading["reference_condition"] == "light_l2"
+
+
+def test_curve_attrs_stay_displayable():
+    """A DataFrame in attrs breaks display() for any frame wider than 20 columns."""
+
+    curve = _curve([0.010, 0.012], [0.009, 0.013])
+    gap = search.gap_table(curve)
+    curve.attrs.update(
+        reading={"ok": True}, result_paths={"json": "/tmp/x.json"},
+        gap_records=gap.to_dict("records"),
+    )
+
+    assert not any(isinstance(value, pd.DataFrame) for value in curve.attrs.values())
+    assert list(search.gap_frame(curve).epoch) == list(gap.epoch)
+
+    wide = pd.concat([curve] + [curve[["recall@10"]].rename(columns={"recall@10": f"c{i}"})
+                                for i in range(30)], axis=1)
+    wide.attrs = dict(curve.attrs)
+    wide.to_string()          # pandas truncates here; a DataFrame in attrs would raise
