@@ -46,24 +46,30 @@ def build_personal_history_weights(
 ) -> PersonalHistoryWeights:
     """Build train-only, within-user N/V item-history shares.
 
-    N share is the number of distinct baskets containing an item divided by
-    the sum of those counts over the user's history.  V share is the item's
-    non-negative purchase amount divided by the user's total purchase amount.
-    Neither value contains a global item-repeat or item-popularity feature.
+    N share is the number of distinct purchase occasions containing an item
+    divided by the sum of those counts over the user's history.  An occasion
+    is ``b_raw`` when the dataset has a basket identifier, otherwise the
+    customer's purchase date ``t`` (the project's H&M convention).  V share
+    is the item's non-negative purchase amount divided by the user's total
+    purchase amount.  Neither value contains a global item-repeat or
+    item-popularity feature.
     """
-    required = {"u_idx", "i_idx", "b_raw", "v"}
+    required = {"u_idx", "i_idx", "v"}
     missing = required.difference(train.columns)
     if missing:
         raise ValueError(f"개인 구매이력 가중치 입력 열 누락: {sorted(missing)}")
+    occasion_col = "b_raw" if "b_raw" in train.columns else "t"
+    if occasion_col not in train.columns:
+        raise ValueError("개인 구매이력에는 b_raw 또는 구매일 t가 필요합니다")
     if n_users <= 0 or n_items <= 0:
         raise ValueError("n_users와 n_items는 양수여야 합니다")
 
-    frame = train.loc[:, ["u_idx", "i_idx", "b_raw", "v"]].copy()
+    frame = train.loc[:, ["u_idx", "i_idx", occasion_col, "v"]].copy()
     frame["positive_value"] = frame["v"].clip(lower=0.0)
     pairs = (
         frame.groupby(["u_idx", "i_idx"], sort=True)
         .agg(
-            basket_count=("b_raw", "nunique"),
+            basket_count=(occasion_col, "nunique"),
             purchase_amount=("positive_value", "sum"),
         )
         .reset_index()

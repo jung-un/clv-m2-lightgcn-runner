@@ -90,6 +90,32 @@ def test_personal_history_weights_are_normalized_within_each_user():
     assert history.diagnostics["value_row_sum_max_error"] < 1e-7
 
 
+def test_personal_history_weights_use_customer_date_when_basket_id_is_absent():
+    frame = pd.DataFrame(
+        [
+            {"u_idx": 0, "i_idx": 0, "t": pd.Timestamp("2020-01-01"), "v": 10.0},
+            {"u_idx": 0, "i_idx": 0, "t": pd.Timestamp("2020-01-02"), "v": 20.0},
+            {"u_idx": 0, "i_idx": 1, "t": pd.Timestamp("2020-01-02"), "v": 70.0},
+        ]
+    )
+
+    history = build_personal_history_weights(frame, n_users=1, n_items=2)
+    by_item = {
+        int(item): (float(n), float(v))
+        for item, n, v in zip(
+            history.items,
+            history.activity_share,
+            history.value_share,
+            strict=True,
+        )
+    }
+
+    assert by_item[0][0] == pytest.approx(2 / 3)
+    assert by_item[1][0] == pytest.approx(1 / 3)
+    assert by_item[0][1] == pytest.approx(0.3)
+    assert by_item[1][1] == pytest.approx(0.7)
+
+
 def test_temporal_decay_emphasizes_recent_items_and_renormalizes_each_user():
     frame = pd.DataFrame(
         [
