@@ -47,7 +47,7 @@ def test_hm2y_colab_is_pinned_and_runs_once():
     notebook = json.loads(Path("clv_m2_training_budget_hm2y_seed43_colab.ipynb").read_text())
     source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"]
                        if cell.get("cell_type") == "code")
-    assert "git checkout" in source
+    assert "'checkout', SOURCE_COMMIT" in source
     assert "configure_hm2y_training_budget" in source
     assert source.count("run_hm2y_training_budget(cfg)") == 1
     assert "EVAL_TEST" not in source
