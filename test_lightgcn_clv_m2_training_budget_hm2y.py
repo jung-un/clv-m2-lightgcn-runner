@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import pytest
 
 import lightgcn_clv_m2_training_budget_hm2y as budget
@@ -41,6 +42,18 @@ def test_gap_table_pairs_same_epoch_and_keeps_high_clv_metrics():
     assert gap.loc[0, "recall@10"] == pytest.approx(0.01)
     assert gap.loc[0, "recall@10_ratio"] == pytest.approx(1.1)
     assert gap.loc[0, "고CLV_price_purchase_amount_weighted_hit@10"] == pytest.approx(0.02)
+
+
+def test_centered_hm_item_price_is_restored_to_finite_percentile():
+    prepared = {
+        "item_economic": np.array([[-1.0, 0.2], [0.0, -0.1], [1.0, 0.4]], np.float32),
+        "item_economic_valid": np.array([True, False, True]),
+    }
+
+    price = budget._item_price_percentile(prepared)
+
+    np.testing.assert_allclose(price, np.array([0.0, 0.0, 1.0], np.float32))
+    assert np.isfinite(price).all()
 
 
 def test_hm2y_colab_is_pinned_and_runs_once():

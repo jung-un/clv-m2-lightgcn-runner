@@ -131,6 +131,20 @@ def arm_specifications() -> list[dict]:
     ]
 
 
+def _item_price_percentile(prepared: dict) -> np.ndarray:
+    """Restore the first centred H&M economic feature to its [0,1] percentile."""
+
+    centred = np.asarray(prepared["item_economic"], dtype=np.float32)[:, 0]
+    valid = np.asarray(prepared["item_economic_valid"], dtype=bool)
+    if centred.shape != valid.shape:
+        raise ValueError("H&M 상품 가격 위치와 valid mask shape이 다릅니다")
+    percentile = np.clip((centred + 1.0) / 2.0, 0.0, 1.0)
+    percentile[~valid] = 0.0
+    if not np.isfinite(percentile).all():
+        raise ValueError("H&M 상품 가격 백분위에 비유한 값이 있습니다")
+    return percentile.astype(np.float32)
+
+
 def _build_model(prepared: dict, cfg: HMM2TrainingBudgetConfig, spec: dict):
     data = prepared["data"]
     valid = np.asarray(prepared["clv_valid"], dtype=bool)
@@ -150,7 +164,7 @@ def _build_model(prepared: dict, cfg: HMM2TrainingBudgetConfig, spec: dict):
             n_users=data["n_users"], n_items=data["n_items"],
             user_q_n=prepared["q_n"], user_q_v=prepared["q_v"],
             user_q_c=prepared["q_c"], user_clv_valid=valid,
-            item_price_percentile=prepared["item_economic"][:, 0],
+            item_price_percentile=_item_price_percentile(prepared),
             item_price_valid=prepared["item_economic_valid"], adj=data["adj"],
             id_dim=cfg.id_dim, rho=0.0, n_layers=cfg.n_layers,
             pref_reg=cfg.pref_reg, economic_propagation=False,
