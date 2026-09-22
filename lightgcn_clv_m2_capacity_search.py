@@ -107,8 +107,10 @@ def validate_config(cfg: CapacitySearchConfig) -> CapacitySearchConfig:
     known = {c.name for c in CONDITIONS}
     if not cfg.conditions or not set(cfg.conditions).issubset(known):
         raise ValueError(f"조건 이름은 {sorted(known)} 안에서 골라야 합니다")
-    if CONDITIONS[0].name not in cfg.conditions:
-        raise ValueError("기준 조건이 빠지면 다른 조건을 비교할 대상이 없습니다")
+    if CONDITIONS[0].name not in cfg.conditions and len(cfg.conditions) != 1:
+        raise ValueError(
+            "기준 조건 없이 실행할 때는 matched M1·M2 한 조건만 독립 실행할 수 있습니다"
+        )
     if not cfg.out_dir:
         raise ValueError("out_dir가 필요합니다")
     return cfg
@@ -502,23 +504,28 @@ def search_reading(curve: pd.DataFrame, gap: pd.DataFrame, cfg: CapacitySearchCo
         row = frame[frame.epoch.eq(epoch)]
         return float(row.iloc[0][metric]) if len(row) else float("nan")
 
-    baseline_key = CONDITIONS[0].shared_key
-    baseline_m1 = curve[curve.shared_key.eq(baseline_key) & curve.model_id.eq(M1_MODEL_ID)]
-    peak_epoch = int(baseline_m1.loc[baseline_m1["recall@10"].idxmax(), "epoch"])
-    baseline_gap = gap[gap.condition.eq("baseline")]
+    reference_condition = "baseline" if "baseline" in cfg.conditions else cfg.conditions[0]
+    condition_by_name = {condition.name: condition for condition in CONDITIONS}
+    reference_key = condition_by_name[reference_condition].shared_key
+    reference_m1 = curve[
+        curve.shared_key.eq(reference_key) & curve.model_id.eq(M1_MODEL_ID)
+    ]
+    peak_epoch = int(reference_m1.loc[reference_m1["recall@10"].idxmax(), "epoch"])
+    reference_gap = gap[gap.condition.eq(reference_condition)]
     reading = {
+        "reference_condition": reference_condition,
         "m1_peak_epoch": peak_epoch,
         "m1_still_improving_after_protocol_epoch": peak_epoch > PROTOCOL_EPOCH,
-        "m1_recall10_at_protocol_epoch": at(baseline_m1, PROTOCOL_EPOCH, "recall@10"),
-        "m1_recall10_at_end": at(baseline_m1, cfg.epochs, "recall@10"),
-        "m2_gap_at_protocol_epoch": at(baseline_gap, PROTOCOL_EPOCH, "recall@10"),
-        "m2_gap_at_end": at(baseline_gap, cfg.epochs, "recall@10"),
+        "m1_recall10_at_protocol_epoch": at(reference_m1, PROTOCOL_EPOCH, "recall@10"),
+        "m1_recall10_at_end": at(reference_m1, cfg.epochs, "recall@10"),
+        "m2_gap_at_protocol_epoch": at(reference_gap, PROTOCOL_EPOCH, "recall@10"),
+        "m2_gap_at_end": at(reference_gap, cfg.epochs, "recall@10"),
         "conditions_closing_the_gap": sorted(
             {
                 str(condition)
                 for condition in gap.condition.unique()
                 if at(gap[gap.condition.eq(condition)], cfg.epochs, "recall@10")
-                > at(baseline_gap, PROTOCOL_EPOCH, "recall@10")
+                > at(reference_gap, PROTOCOL_EPOCH, "recall@10")
             }
         ),
         "condition_selected": False,

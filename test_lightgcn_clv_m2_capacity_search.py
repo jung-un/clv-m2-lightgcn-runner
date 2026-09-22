@@ -157,7 +157,22 @@ def test_running_one_condition_first_keeps_the_others_reusable():
     assert search._config_hash(full, "other-input") != search._config_hash(full, "input-hash")
     assert [s["condition"] for s in search.arm_specifications(staged)] == ["baseline", "baseline"]
 
-    with pytest.raises(ValueError):
-        _cfg(conditions=("wide",))        # 기준 조건 없이 비교 불가
+    light_l2 = _cfg(conditions=("light_l2",))
+    assert [s["condition"] for s in search.arm_specifications(light_l2)] == [
+        "light_l2", "light_l2"
+    ]
     with pytest.raises(ValueError):
         _cfg(conditions=("baseline", "unknown"))
+    with pytest.raises(ValueError):
+        _cfg(conditions=("wide", "light_l2"))
+
+
+def test_single_nonbaseline_condition_uses_itself_as_learning_curve_reference():
+    light_l2 = _cfg(conditions=("light_l2",))
+    curve = _curve(
+        [0.010, 0.012], [0.009, 0.013],
+        condition="light_l2", shared_key="dim64_l20.0001"
+    )
+    reading = search.search_reading(curve, search.gap_table(curve), light_l2)
+
+    assert reading["reference_condition"] == "light_l2"
