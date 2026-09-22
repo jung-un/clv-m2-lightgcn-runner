@@ -187,8 +187,10 @@ def preflight_summary(cfg: CapacitySearchConfig) -> dict:
             "q_N(u) and q_V(u), the customer's two CLV axis percentiles from the "
             "last 365 training days, scale that customer's own purchase-history "
             "block; the block enters the score during training and evaluation "
-            "alike, never as a post-hoc correction. q_C is not used (approved "
-            "2026-09-16). Training uses leave-one-out history profiles so the "
+            "alike, never as a post-hoc correction. This is explicitly a CLV-"
+            "component M2: q_C is not used, so it must not be described as a full "
+            "historical-CLV-level model. Training uses leave-one-out history "
+            "profiles so the "
             "positive item cannot see its own share; evaluation uses the full "
             "history."
         ),
@@ -382,6 +384,7 @@ def _train_curve(
         if epoch in checkpoints:
             record["metrics"] = _evaluate(model, prepared)
             record["score_split"] = _clv_score_share(model, prepared, cfg)
+            record["gradient_diagnostics"] = model.training_gradient_diagnostics()
             print(
                 f"  [{spec['condition']}/{spec['model_id']} s{seed}] ep {epoch:3d} | "
                 f"loss {record['loss']:.4f} | recall@10 {record['metrics']['recall@10']:.6f} | "
@@ -449,6 +452,7 @@ def curve_table(arms: list[dict]) -> pd.DataFrame:
                     "p_correct": record["p_correct"],
                     **{k: v for k, v in record.get("score_split", {}).items()
                        if k != "clv_score_measured_on"},
+                    **record.get("gradient_diagnostics", {}),
                     **record["metrics"],
                 }
             )
