@@ -55,6 +55,16 @@ def test_baseline_budget_requires_explicit_permission_before_any_fit(monkeypatch
         m.run(cfg, prepared=prepared)
 
 
+def test_seed44_m5_only_schedule_preserves_protocol():
+    m=module()
+    cfg=m.configure(seeds=(44,), include_m2=False)
+    assert [s['model_id'] for s in m.specs(cfg)] == ['m5_linear_nv']
+    assert [s['role'] for s in m.anchor_specs(cfg)] == ['M1','M4']
+    assert m.preflight(cfg)['new_fits'] == 1
+    assert m.preflight(cfg)['selection'] == m.preflight(m.configure())['selection']
+    assert m.strength_cfg(cfg).rhos == (0.05,)
+
+
 def test_curve_reuse_never_uses_later_rebound_and_checks_input_hash(tmp_path):
     import json
     m=module()

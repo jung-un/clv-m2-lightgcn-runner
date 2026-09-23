@@ -31,6 +31,7 @@ class Config(base.StrengthConfig):
     patience_start: int = 100
     patience: int = 4
     include_controls: bool = False
+    include_m2: bool = True
 
 
 def configure(**overrides):
@@ -52,11 +53,14 @@ def validate(cfg):
 
 
 def specs(cfg):
-    return [s for s in fixed.new_specs() if cfg.include_controls or s['condition'] == 'nv']
+    return [s for s in fixed.new_specs()
+            if (cfg.include_controls or s['condition'] == 'nv')
+            and (cfg.include_m2 or s['role'] == 'M5')]
 
 
 def anchor_specs(cfg):
-    return [s for s in base.arm_specifications(strength_cfg(cfg)) if s['role'] in ('M1','M4','M2')]
+    roles = ('M1','M4','M2') if cfg.include_m2 else ('M1','M4')
+    return [s for s in base.arm_specifications(strength_cfg(cfg)) if s['role'] in roles]
 
 
 def replay(curve, cfg, *, require_complete=True):
