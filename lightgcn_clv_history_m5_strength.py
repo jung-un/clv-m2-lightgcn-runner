@@ -89,8 +89,8 @@ def validate_config(cfg):
     if (not cfg.rhos or len(set(cfg.rhos)) != len(cfg.rhos)
             or any(r not in (0.025, 0.05, 0.1) for r in cfg.rhos)):
         raise ValueError("rho 후보는 0.025/0.05/0.10의 중복 없는 부분집합입니다")
-    if not cfg.seeds or len(set(cfg.seeds)) != len(cfg.seeds) or any(s not in (42, 43, 44) for s in cfg.seeds):
-        raise ValueError("seed는 42/43/44의 중복 없는 부분집합입니다")
+    if not cfg.seeds or len(set(cfg.seeds)) != len(cfg.seeds) or any(s not in (42, 43, 44, 45) for s in cfg.seeds):
+        raise ValueError("seed는 42/43/44/45의 중복 없는 부분집합입니다")
     if not cfg.out_dir or cfg.batch_size <= 0:
         raise ValueError("결과 경로와 양수 batch_size가 필요합니다")
     if cfg.dataset == "dunnhumby" and cfg.batch_size != 8192:

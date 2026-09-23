@@ -55,9 +55,10 @@ def test_baseline_budget_requires_explicit_permission_before_any_fit(monkeypatch
         m.run(cfg, prepared=prepared)
 
 
-def test_seed44_m5_only_schedule_preserves_protocol():
+@pytest.mark.parametrize('seed', [44, 45])
+def test_replication_m5_only_schedule_preserves_protocol(seed):
     m=module()
-    cfg=m.configure(seeds=(44,), include_m2=False)
+    cfg=m.configure(seeds=(seed,), include_m2=False)
     assert [s['model_id'] for s in m.specs(cfg)] == ['m5_linear_nv']
     assert [s['role'] for s in m.anchor_specs(cfg)] == ['M1','M4']
     assert m.preflight(cfg)['new_fits'] == 1
