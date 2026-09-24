@@ -1,4 +1,4 @@
-"""Original M4 versus original M4 + linear N/V; no implicit formula repair."""
+"""Original M4 formula on valid rows versus the same formula plus linear N/V."""
 from dataclasses import asdict, replace
 from pathlib import Path
 import json
@@ -12,9 +12,9 @@ from clv_run_state import ProgressStore, RunIdentity, file_sha256
 
 es = prior.es
 base = prior.base
-VERSION = 'linear-nv-original-m4-seed43-development-v1'
-M4 = 'm4_original_es'
-M5 = 'm5_linear_nv_original_es'
+VERSION = 'linear-nv-original-m4-validity-masked-seed43-development-v2'
+M4 = 'm4_original_validity_masked_es'
+M5 = 'm5_linear_nv_original_validity_masked_es'
 
 
 def configure(out_dir):
@@ -30,18 +30,27 @@ def specs():
 
 
 def audit_weights(prep, cfg):
-    """Report existing formulas verbatim; never repair/mask training weights here."""
+    """Preserve original M4 on valid rows; set raw weight=1 on invalid rows."""
     u = np.asarray(prep['data']['tr_u'], dtype=np.int64)
     i = np.asarray(prep['data']['tr_i'], dtype=np.int64)
     masks = dict(clv=np.asarray(prep['clv_valid'], bool)[u],
                  user_economic=np.asarray(prep['user_economic_valid'], bool)[u],
                  item_economic=np.asarray(prep['item_economic_valid'], bool)[i])
     valid = np.logical_and.reduce(list(masks.values()))
+    legacy_weights, legacy_meta = base.weights_module.row_weights(prep, cfg, 'original')
+    legacy_raw = legacy_weights * legacy_meta['train_mean_raw_weight']
+    corrected_raw = np.where(valid, legacy_raw, 1.0)
+    corrected_mean = float(corrected_raw.mean())
+    original_weights = corrected_raw / corrected_mean
     rows = []
-    original_weights = original_meta = None
-    for mode in ('original', 'complementary'):
-        weights, meta = base.weights_module.row_weights(prep, cfg, mode)
-        raw = weights * meta['train_mean_raw_weight']
+    for mode in ('original_legacy', 'original_validity_masked', 'complementary_legacy'):
+        if mode == 'original_legacy':
+            weights, raw = legacy_weights, legacy_raw
+        elif mode == 'original_validity_masked':
+            weights, raw = original_weights, corrected_raw
+        else:
+            weights, meta = base.weights_module.row_weights(prep, cfg, 'complementary')
+            raw = weights * meta['train_mean_raw_weight']
         if not np.isfinite(weights).all() or np.any(weights <= 0):
             raise ValueError('Invalid M4 weights; no training permitted')
         groups = {'all': np.ones(len(u), bool), 'all_inputs_valid': valid,
@@ -54,15 +63,20 @@ def audit_weights(prep, cfg):
                 rows_with_extra=int(np.count_nonzero(raw[mask] > 1 + 1e-10)),
                 normalized_weight_share=float(weights[mask].sum()/weights.sum()),
                 mean_raw=float(raw[mask].mean()) if mask.any() else None))
-        if mode == 'original':
-            original_weights, original_meta = weights, meta
     frame = pd.DataFrame(rows)
-    bad = frame[(frame['mode']=='original') & (frame['group']=='any_input_invalid')]
-    safe = int(bad.iloc[0].rows_with_extra) == 0
-    return frame, original_weights, dict(original_meta,
+    legacy_bad = frame[(frame['mode']=='original_legacy') & (frame['group']=='any_input_invalid')].iloc[0]
+    corrected_bad = frame[(frame['mode']=='original_validity_masked') & (frame['group']=='any_input_invalid')].iloc[0]
+    safe = int(corrected_bad.rows_with_extra) == 0
+    return frame, original_weights, dict(legacy_meta,
+        train_mean_raw_weight=corrected_mean,
+        row_weight_std=float(original_weights.std()),
+        row_weight_cv=float(original_weights.std()/original_weights.mean()),
         original_invalid_extra_absent=safe,
+        legacy_invalid_extra_rows=int(legacy_bad.rows_with_extra),
+        legacy_invalid_extra_sum=float(legacy_bad.raw_extra_sum),
+        legacy_train_mean_raw_weight=float(legacy_meta['train_mean_raw_weight']),
         invalid_item_negative_bin_rows=int(np.count_nonzero(np.asarray(prep['item_bin'])[i] < 0)),
-        policy='preserve original formula; block training if invalid rows receive raw extra weight',
+        policy='valid rows: legacy original raw formula; any invalid CLV/user/item input: raw=1; normalize all training rows once',
         note='Groups overlap. Weight mass is not gradient mass or performance attribution.')
 
 
@@ -81,7 +95,8 @@ def prepare(report_path, out_dir):
                 source_report_sha256=file_sha256(report_path), screen_config=asdict(cfg),
                 m4_weights=weights, m4_diagnostics=diagnostic)
     print('진단만 완료. M1/보완 M4/기존 M5 재사용. 새 원형 M4/M5는 각각 최대300 epoch.', flush=True)
-    print('학습 가능:', diagnostic['original_invalid_extra_absent'], flush=True)
+    print('무효 입력의 기존 추가가중 행:', diagnostic['legacy_invalid_extra_rows'], flush=True)
+    print('수정 수식의 무효 입력 추가가중 없음:', diagnostic['original_invalid_extra_absent'], flush=True)
     return cfg, prep, audit
 
 
@@ -143,7 +158,7 @@ def run(cfg, prep):
     anchors = prior.verified_anchors(prep['source_report'], prior.configure(cfg.out_dir), prep)
     _, weights, diagnostic = audit_weights(prep, cfg)
     if not diagnostic['original_invalid_extra_absent']:
-        raise RuntimeError('원형 M4의 무효 입력에 추가 가중치가 있습니다. 감사 ZIP을 먼저 확인하세요. 수식 수정/새 학습을 하지 않았습니다.')
+        raise RuntimeError('수정 수식에서 무효 입력에 추가 가중치가 남아 있습니다. 학습 중단.')
     if not np.array_equal(weights, prep['m4_weights']):
         raise ValueError('Prepared weights changed')
     arms = list(anchors)

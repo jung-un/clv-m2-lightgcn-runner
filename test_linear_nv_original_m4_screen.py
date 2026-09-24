@@ -16,7 +16,7 @@ def inputs():
     return p
 
 
-def test_original_formula_and_invalid_last_bin_audit():
+def test_original_formula_keeps_valid_rows_and_neutralizes_invalid_last_bin():
     p=inputs(); cfg=m.configure('unused')
     frame,w,meta=m.audit_weights(p,cfg)
     u=p['data']['tr_u'];i=p['data']['tr_i']
@@ -24,18 +24,27 @@ def test_original_formula_and_invalid_last_bin_audit():
     np.testing.assert_allclose(w,raw/raw.mean())
     assert meta['original_invalid_extra_absent']
     p['item_economic_valid'][0]=False;p['item_bin'][0]=-1
-    _,_,meta=m.audit_weights(p,cfg)
+    frame,w,meta=m.audit_weights(p,cfg)
     assert meta['invalid_item_negative_bin_rows']>0
-    assert not meta['original_invalid_extra_absent']
+    invalid = ~p['item_economic_valid'][i]
+    corrected_raw = w * meta['train_mean_raw_weight']
+    np.testing.assert_array_equal(corrected_raw[invalid],np.ones(invalid.sum()))
+    np.testing.assert_allclose(corrected_raw[~invalid],raw[~invalid])
+    assert meta['legacy_invalid_extra_rows']>0
+    assert meta['original_invalid_extra_absent']
+    assert 'original_legacy' in set(frame['mode'])
+    assert 'original_validity_masked' in set(frame['mode'])
 
 
-def test_invalid_blocks_before_build(tmp_path,monkeypatch):
+def test_modified_weights_rejected_before_build(tmp_path,monkeypatch):
     p=inputs();cfg=m.configure(str(tmp_path))
     p.update(screen_config=asdict(cfg),source_report='synthetic')
     p['item_economic_valid'][0]=False;p['item_bin'][0]=-1
+    _,p['m4_weights'],p['m4_diagnostics']=m.audit_weights(p,cfg)
+    p['m4_weights']=np.ones_like(p['m4_weights'])
     monkeypatch.setattr(m.prior,'verified_anchors',lambda *a:[])
     monkeypatch.setattr(m.base,'_build_model',lambda *a:pytest.fail('must not build'))
-    with pytest.raises(RuntimeError,match='무효 입력'):
+    with pytest.raises(ValueError,match='Prepared weights changed'):
         m.run(cfg,p)
 
 
@@ -49,6 +58,8 @@ def test_same_linear_model_and_short_training(tmp_path,monkeypatch):
     from clv_run_state import ProgressStore,RunIdentity
     torch.set_num_threads(1);monkeypatch.setattr(m.base.v3,'DEVICE','cpu')
     p=inputs();cfg=m.configure(str(tmp_path))
+    p['item_economic_valid'][0]=False
+    p['item_bin'][0]=-1
     old=m.es.fixed._build(p,m.es.strength_cfg(m.prior.configure(str(tmp_path))),m.specs()[1],43)
     new=m.es.fixed._build(p,m.es.strength_cfg(cfg),m.specs()[1],43)
     for a,b in zip(old.parameters(),new.parameters()):
@@ -58,6 +69,8 @@ def test_same_linear_model_and_short_training(tmp_path,monkeypatch):
     metrics={k:1. for k in (*m.base.ACCURACY,*m.es.fixed.PRIMARY)}
     monkeypatch.setattr(m.base.capacity,'_evaluate',lambda *a:metrics)
     _,p['m4_weights'],p['m4_diagnostics']=m.audit_weights(p,cfg)
+    assert p['m4_diagnostics']['legacy_invalid_extra_rows']>0
+    assert p['m4_diagnostics']['original_invalid_extra_absent']
     arms=[]
     for spec in m.specs():
         root=tmp_path/spec['model_id'];root.mkdir()
