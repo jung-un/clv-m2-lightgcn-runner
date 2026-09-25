@@ -32,7 +32,7 @@ def test_schema_syntax_and_read_only_commit_pin():
         if cell.cell_type == 'code':
             compile(cell.source, f'notebook/{cell.id}', 'exec')
     source = next(cell.source for cell in notebook.cells if cell.get('id') == 'setup')
-    assert "SOURCE_COMMIT = 'cea61be1f7844a5bcf98fd0ea7d8a94945a0b9d5'" in source
+    assert "SOURCE_COMMIT = '70c771c8d25220e147eff359d1e04f13fd31da6f'" in source
     assert Path('clv_m4_m5_top10_movement_diagnostic.py').is_file()
     assert all('screen.run(' not in cell.source for cell in notebook.cells)
 
