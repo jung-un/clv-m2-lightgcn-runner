@@ -67,3 +67,49 @@ def test_source_config_accepts_same_reuse_folder_names_under_colab_root(tmp_path
     monkeypatch.setattr(diagnostic.screen, '_selected_arm', lambda *args: None)
     verified, _ = diagnostic._verify_report(path)
     assert verified['config']['reuse_dirs'] == actual['reuse_dirs']
+
+
+def test_identity_allows_output_location_only_but_not_model_or_input_change():
+    stored = dict(input_hash='data123', spec=dict(rho=.05),
+                  source_hashes={'model.py': 'source123'},
+                  config=dict(out_dir='/content/drive/original',
+                              reuse_dirs=['/content/drive/a', '/content/drive/b'],
+                              pref_reg=.001))
+    expected = dict(input_hash='data123', spec=dict(rho=.05),
+                    source_hashes={'model.py': 'source123'},
+                    config=dict(out_dir='/content/drive/diagnostic',
+                                reuse_dirs=['/Users/jungun/a', '/Users/jungun/b'],
+                                pref_reg=.001))
+    assert diagnostic._same_identity_except_result_location(stored, expected)
+    expected['input_hash'] = 'different'
+    assert not diagnostic._same_identity_except_result_location(stored, expected)
+
+
+def test_checkpoint_loading_uses_the_original_model_builder(tmp_path, monkeypatch):
+    path = tmp_path / 'selected.pt'
+    path.write_bytes(b'checkpoint')
+    calls = []
+
+    class Model:
+        def load_state_dict(self, state, strict):
+            assert state == {'weight': 1} and strict
+
+        def eval(self):
+            return self
+
+    monkeypatch.setattr(diagnostic, 'file_sha256', lambda _: 'digest')
+    monkeypatch.setattr(diagnostic.torch, 'load',
+                        lambda *a, **kw: dict(epoch=25, model_state={'weight': 1}))
+    monkeypatch.setattr(diagnostic.screen.base, '_build_model',
+                        lambda *a: calls.append('id') or Model())
+    monkeypatch.setattr(diagnostic.screen.es.fixed, '_build',
+                        lambda *a: calls.append('linear') or Model())
+    arm = dict(checkpoint=str(path), checkpoint_sha256='digest',
+               identity={'input_hash': 'data'}, selected_epoch=25, model_id='m4')
+    cfg = diagnostic.screen.configure(str(tmp_path / 'out'))
+    prepared = {'input_hash': 'data'}
+    diagnostic._load_model(prepared, cfg, arm,
+                           {'model_id': diagnostic.screen.lambda025.MODEL_ID})
+    diagnostic._load_model(prepared, cfg, arm,
+                           {'model_id': diagnostic.screen.MODEL_ID})
+    assert calls == ['id', 'linear']

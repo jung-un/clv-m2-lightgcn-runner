@@ -61,7 +61,11 @@ def _load_model(prepared: dict, cfg, arm: dict, spec: dict):
         raise ValueError(f"Selected checkpoint missing/changed: {arm['model_id']}")
     if arm.get("identity", {}).get("input_hash") != prepared["input_hash"]:
         raise ValueError(f"Input hash mismatch: {arm['model_id']}")
-    model = screen.es.fixed._build(prepared, screen.es.strength_cfg(cfg), spec, 43)
+    # Match the original training dispatch: M4 is the ID/value-basis backbone;
+    # only the linear-N/V M5 uses the affine history class.
+    builder = (screen.es.fixed._build if "linear" in spec["model_id"]
+               else screen.base._build_model)
+    model = builder(prepared, screen.es.strength_cfg(cfg), spec, 43)
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if state.get("epoch") != arm["selected_epoch"] or "model_state" not in state:
         raise ValueError(f"Selected checkpoint epoch/state mismatch: {arm['model_id']}")
@@ -159,6 +163,16 @@ def _verify_new_item_truth(prepared):
             raise ValueError("Train pair appears in held-out truth")
 
 
+def _same_identity_except_result_location(stored: dict, expected: dict) -> bool:
+    """The diagnostic writes elsewhere; no model/input/source field may differ."""
+    stored, expected = json.loads(json.dumps(stored)), json.loads(json.dumps(expected))
+    for identity in (stored, expected):
+        config = identity.get("config", {})
+        config.pop("out_dir", None)
+        config["reuse_dirs"] = [Path(p).name for p in config.get("reuse_dirs", [])]
+    return stored == expected
+
+
 def _metric_readback(prepared, top, arm):
     v3, cache, data = screen.base.v3, prepared["cache"], prepared["data"]
     meta = prepared["meta"]
@@ -218,7 +232,8 @@ def run(report_path: str | Path, out_dir: str | Path) -> dict:
         raise ValueError("Development-only/new-item protocol mismatch")
     _verify_new_item_truth(prepared)
     arms = {model_id: _one_arm(report, model_id) for model_id in MODEL_IDS}
-    if arms[screen.MODEL_ID].get("identity") != screen.identity(prepared, cfg):
+    if not _same_identity_except_result_location(
+            arms[screen.MODEL_ID].get("identity", {}), screen.identity(prepared, cfg)):
         raise ValueError("M5 source identity differs from prepared input/code")
     tops, readbacks = {}, {}
     for model_id, spec in ((screen.lambda025.MODEL_ID, screen.lambda025.spec()),
@@ -241,6 +256,12 @@ def run(report_path: str | Path, out_dir: str | Path) -> dict:
                       - arms[screen.lambda025.MODEL_ID]["metrics"]["price_purchase_amount_weighted_hit@10"])
     if not np.isclose(overall.weighted_net, reported_delta, atol=1e-6, rtol=1e-5):
         raise ValueError("Top-10 truth movements do not reconcile to reported weighted-hit delta")
+    for segment in ("저CLV", "중CLV", "고CLV"):
+        key = f"{segment}_revenue@10"  # Legacy stored key: weighted hit.
+        expected = arms[screen.MODEL_ID]["metrics"][key] - arms[screen.lambda025.MODEL_ID]["metrics"][key]
+        measured = summary.set_index("segment").loc[segment, "weighted_net"]
+        if not np.isclose(measured, expected, atol=1e-6, rtol=1e-5):
+            raise ValueError(f"Top-10 weighted-hit movement mismatch in {segment}")
     root = out_dir / "top10_movement_diagnostic"
     paths = {name: str(root / f"{name}.csv") for name in ("truth_movements", "user_movements", "summary")}
     paths["diagnostic"] = str(root / "diagnostic.json")
