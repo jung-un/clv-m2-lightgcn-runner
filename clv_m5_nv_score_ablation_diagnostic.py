@@ -5,6 +5,8 @@ checkpoint. It is neither M1 nor a deployable/retrained ablation arm.
 """
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 from pathlib import Path
 
@@ -129,7 +131,15 @@ def run(report_path: str | Path, out_dir: str | Path) -> dict:
     """Load exactly one selected development checkpoint; never train or select."""
     report_path, out_dir = Path(report_path), Path(out_dir)
     report, _ = movement._verify_report(report_path)
-    cfg, prepared, _ = movement.screen.prepare(report["source_report"], out_dir)
+    # The reused training runner prints "one new M5 training arm" during data
+    # preparation. Filter that inherited instruction: this audit never trains.
+    preparation_log = StringIO()
+    with redirect_stdout(preparation_log):
+        cfg, prepared, _ = movement.screen.prepare(report["source_report"], out_dir)
+    for line in preparation_log.getvalue().splitlines():
+        if "새 학습은 lambda=.25 M5 하나만" not in line:
+            print(line, flush=True)
+    print("[진단] 선택 M5 체크포인트만 읽습니다. 새 학습은 하지 않습니다.", flush=True)
     movement.screen.verified_anchors(report["source_report"], cfg, prepared)
     if (set(prepared["data"]["splits"]) != {"test"}
             or prepared["base_cfg"].get("EVAL_HOLDOUT")
