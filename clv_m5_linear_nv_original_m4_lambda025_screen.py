@@ -51,7 +51,8 @@ def verified_anchors(report_path, cfg, prep=None):
     report = json.loads(path.read_text())
     source_cfg = lambda025.configure(report.get('config', {}).get('out_dir', 'source'))
     actual = report.get('config', {})
-    expected = asdict(source_cfg)
+    expected = json.loads(json.dumps(asdict(source_cfg)))
+    proposed = json.loads(json.dumps(asdict(cfg)))
     if (report.get('code_version') != lambda025.VERSION
             or report.get('final_test') is not False or report.get('holdout') is not False
             or report.get('selection') != es.preflight(lambda025.previous.prior.configure(cfg.out_dir))['selection']
@@ -59,7 +60,7 @@ def verified_anchors(report_path, cfg, prep=None):
             != {k: v for k, v in expected.items() if k != 'reuse_dirs'}
             or [Path(p).name for p in actual.get('reuse_dirs', [])]
             != [Path(p).name for p in expected['reuse_dirs']]
-            or {k: v for k, v in asdict(cfg).items() if k != 'out_dir'}
+            or {k: v for k, v in proposed.items() if k != 'out_dir'}
             != {k: v for k, v in expected.items() if k != 'out_dir'}
             or report.get('source_report_sha256') != lambda025.SOURCE_REPORT_SHA):
         raise ValueError('Lambda=.25 source protocol/configuration mismatch')

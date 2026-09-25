@@ -27,6 +27,31 @@ def test_missing_exact_lambda025_report_stops_before_data_loading(tmp_path, monk
         screen.prepare(tmp_path/'missing.json', tmp_path/'output')
 
 
+def test_real_json_config_lists_match_python_tuple_settings(tmp_path, monkeypatch):
+    old_report = tmp_path/'old.json'
+    old_report.write_text(json.dumps({'arms': [dict(model_id=screen.OLD_M5, seed=43,
+        identity=dict(version=screen.lambda025.previous.VERSION))]}))
+    source_cfg = screen.configure(str(tmp_path/'source'))
+    source_report = tmp_path/'lambda025.json'
+    source_report.write_text(json.dumps(dict(
+        code_version=screen.lambda025.VERSION,
+        config=json.loads(json.dumps(asdict(source_cfg))),
+        selection=screen.es.preflight(screen.lambda025.previous.prior.configure('source'))['selection'],
+        final_test=False, holdout=False,
+        source_report=str(old_report),
+        source_report_sha256=screen.lambda025.SOURCE_REPORT_SHA,
+        arms=[dict(model_id=screen.lambda025.MODEL_ID, seed=43,
+                   identity=dict(version=screen.lambda025.VERSION,
+                                 baseline_report_sha256=screen.lambda025.SOURCE_REPORT_SHA))])))
+    monkeypatch.setattr(screen, 'file_sha256', lambda _: screen.SOURCE_REPORT_SHA)
+    monkeypatch.setattr(screen.lambda025, 'verified_anchors',
+                        lambda *_: [dict(model_id='m1'), dict(model_id=screen.lambda025.OLD_MODEL_ID)])
+    monkeypatch.setattr(screen, '_selected_arm', lambda *_: None)
+    anchors = screen.verified_anchors(source_report, screen.configure(str(tmp_path/'new')))
+    assert [arm['model_id'] for arm in anchors] == [
+        'm1', screen.lambda025.OLD_MODEL_ID, screen.OLD_M5, screen.lambda025.MODEL_ID]
+
+
 def test_runner_trains_one_joint_m5_and_saves_all_reference_comparisons(tmp_path, monkeypatch):
     torch.set_num_threads(1)
     monkeypatch.setattr(screen.base.v3, 'DEVICE', 'cpu')
