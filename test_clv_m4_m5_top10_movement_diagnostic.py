@@ -1,5 +1,8 @@
 import numpy as np
 import pytest
+from dataclasses import asdict
+import json
+from pathlib import Path
 
 import clv_m4_m5_top10_movement_diagnostic as diagnostic
 
@@ -46,3 +49,21 @@ def test_unapproved_result_file_is_rejected_before_loading(tmp_path):
     fake.write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="missing/changed"):
         diagnostic.run(fake, tmp_path / "out")
+
+
+def test_source_config_accepts_same_reuse_folder_names_under_colab_root(tmp_path, monkeypatch):
+    cfg = diagnostic.screen.configure(str(tmp_path / "source"))
+    actual = json.loads(json.dumps(asdict(cfg)))
+    actual["reuse_dirs"] = [str(Path('/content/drive/MyDrive/논문/data') / Path(p).name)
+                            for p in actual["reuse_dirs"]]
+    report = dict(code_version=diagnostic.screen.VERSION, config=actual,
+        source_report_sha256=diagnostic.screen.SOURCE_REPORT_SHA,
+        final_test=False, holdout=False,
+        arms=[dict(model_id="m1", seed=43, checkpoint=None),
+              *[dict(model_id=mid, seed=43) for mid in diagnostic.MODEL_IDS]])
+    path = tmp_path / 'result.json'
+    path.write_text(json.dumps(report), encoding='utf-8')
+    monkeypatch.setattr(diagnostic, 'file_sha256', lambda _: diagnostic.SOURCE_RESULT_SHA256)
+    monkeypatch.setattr(diagnostic.screen, '_selected_arm', lambda *args: None)
+    verified, _ = diagnostic._verify_report(path)
+    assert verified['config']['reuse_dirs'] == actual['reuse_dirs']

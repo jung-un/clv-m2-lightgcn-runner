@@ -37,10 +37,15 @@ def _verify_report(path: Path) -> tuple[dict, object]:
         raise ValueError("Exact completed M5 report is missing/changed; no model loaded")
     report = json.loads(path.read_text(encoding="utf-8"))
     source_cfg = screen.configure(report["config"]["out_dir"])
+    expected = json.loads(json.dumps(asdict(source_cfg)))
+    actual = report["config"]
     if (report.get("code_version") != screen.VERSION
             or report.get("final_test") is not False
             or report.get("holdout") is not False
-            or report.get("config") != json.loads(json.dumps(asdict(source_cfg)))
+            or {k: v for k, v in actual.items() if k != "reuse_dirs"}
+            != {k: v for k, v in expected.items() if k != "reuse_dirs"}
+            or [Path(p).name for p in actual.get("reuse_dirs", [])]
+            != [Path(p).name for p in expected["reuse_dirs"]]
             or report.get("source_report_sha256") != screen.SOURCE_REPORT_SHA):
         raise ValueError("Source report protocol/configuration mismatch")
     if _one_arm(report, "m1").get("checkpoint") is not None:
