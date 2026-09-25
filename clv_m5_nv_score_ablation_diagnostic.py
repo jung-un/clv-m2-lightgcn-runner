@@ -107,9 +107,17 @@ def _metric_rows(prepared: dict, tops: dict[str, np.ndarray]) -> pd.DataFrame:
                     rows.append(dict(component=component, segment=segment, cutoff=k,
                         metric=("price_purchase_amount_weighted_hit" if metric == "revenue" else metric),
                         value=float(values[subset].mean()), n_users=int(subset.sum())))
-                if segment == "전체":
+                exposure = np.bincount(top[subset, :k].ravel(), minlength=data["n_items"])
+                exposure_metrics = {"coverage": float((exposure > 0).sum() / data["n_items"]),
+                                    "gini": v3._gini(exposure),
+                                    **v3.exposure_stats(exposure, data["n_items"])}
+                for metric, value in exposure_metrics.items():
                     rows.append(dict(component=component, segment=segment, cutoff=k,
-                        metric="coverage", value=float(np.unique(top[:, :k]).size / data["n_items"]),
+                        metric=metric, value=float(value), n_users=int(subset.sum())))
+                if k == 10:
+                    rows.append(dict(component=component, segment=segment, cutoff=k,
+                        metric="user_value_tendency_recommended_price_alignment",
+                        value=v3._spearman(cache.uclv[subset], measures[k]["arp"][subset]),
                         n_users=int(subset.sum())))
     return pd.DataFrame(rows)
 
