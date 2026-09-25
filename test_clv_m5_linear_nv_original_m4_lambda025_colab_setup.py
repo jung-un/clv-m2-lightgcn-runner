@@ -32,7 +32,7 @@ def test_notebook_schema_code_and_pinned_commit():
         if cell.cell_type == 'code':
             compile(cell.source, f"notebook/{cell.id}", 'exec')
     source = next(cell.source for cell in notebook.cells if cell.get('id') == 'setup')
-    assert "SOURCE_COMMIT = 'dcca25015e0481133b65a26abfe53d81ce160bb3'" in source
+    assert "SOURCE_COMMIT = '1697af8f980dd9000740b2beaca7ef28d26f94fd'" in source
     assert 'clv_m5_linear_nv_original_m4_lambda025_screen' in source
     assert Path('clv_m5_linear_nv_original_m4_lambda025_screen.py').is_file()
 
