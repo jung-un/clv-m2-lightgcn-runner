@@ -459,7 +459,11 @@ def difference_table(curve: pd.DataFrame, reported_epochs: list[int]) -> pd.Data
                 if (model_id, seed, epoch) not in index.index:
                     continue
                 if (reference, seed, epoch) not in index.index:
-                    continue
+                    # 참조가 없으면 조용히 빠져 seed 수가 줄어든다 — 용량탐색에서 같은
+                    # 형태의 누락이 비교표를 왜곡했으므로 여기서는 멈춘다
+                    raise KeyError(
+                        f"{model_id} seed {seed} epoch {epoch}의 참조 {reference} 결과가 없습니다"
+                    )
                 left, right = index.loc[(model_id, seed, epoch)], index.loc[(reference, seed, epoch)]
                 row = {"model_id": model_id, "reference": reference, "seed": seed, "epoch": epoch}
                 for metric in metrics:

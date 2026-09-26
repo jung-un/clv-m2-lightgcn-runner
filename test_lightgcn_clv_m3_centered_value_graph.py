@@ -214,3 +214,15 @@ def test_reading_separates_the_activity_axis_contribution():
     # 활동축을 더하면 오히려 낮아지는 합성 사례
     assert reading["activity_axis_contribution"]["epoch_300"]["positive_seeds"] == 0
     assert reading["arm_selected"] is False
+
+
+def test_difference_table_refuses_to_drop_a_seed_whose_baseline_is_missing():
+    """A missing M1 curve must stop the table, not quietly shrink the seed count."""
+
+    arms = [_curve_payload(42, graph.ARM_VALUE, [0.0105, 0.0126], arm="value_only", gamma=0.0)]
+    complete = graph.curve_table(
+        arms, {42: _curve_payload(42, graph.M1_MODEL_ID, [0.010, 0.012])["curve"]})
+    assert len(graph.difference_table(complete, [100, 300])) == 2
+
+    with pytest.raises(KeyError, match=graph.M1_MODEL_ID):
+        graph.difference_table(graph.curve_table(arms, {}), [100, 300])
