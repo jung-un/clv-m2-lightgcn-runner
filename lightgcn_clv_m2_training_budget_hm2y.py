@@ -184,7 +184,7 @@ def _arm_path(prepared: dict, spec: dict) -> Path:
 
 @torch.no_grad()
 def _score_share(model, prepared: dict) -> dict:
-    if not isinstance(model, HistoryItemFitLightGCN):
+    if not isinstance(model, HistoryItemFitLightGCN) and not getattr(model, 'supports_clv_score_split', False):
         return {"id_score_mean_abs": float("nan"), "clv_score_mean_abs": 0.0,
                 "clv_score_share": 0.0}
     cache, data = prepared["cache"], prepared["data"]
@@ -204,9 +204,16 @@ def _score_share(model, prepared: dict) -> dict:
     id_part = (users[picked_users, :cut] * items[picked_items, :cut]).sum(1)
     clv_part = (users[picked_users, cut:] * items[picked_items, cut:]).sum(1)
     denominator = id_part.abs().mean() + clv_part.abs().mean() + 1e-12
-    return {"id_score_mean_abs": float(id_part.abs().mean()),
+    result = {"id_score_mean_abs": float(id_part.abs().mean()),
             "clv_score_mean_abs": float(clv_part.abs().mean()),
             "clv_score_share": float(clv_part.abs().mean() / denominator)}
+    if getattr(model, 'supports_clv_score_split', False):
+        for axis, start in (('n', cut), ('v', cut+model.axis_dim)):
+            part = (users[picked_users, start:start+model.axis_dim] *
+                    items[picked_items, start:start+model.axis_dim]).sum(1)
+            result[axis+'_top10_score_mean_abs'] = float(part.abs().mean())
+            result[axis+'_top10_score_std'] = float(part.std(unbiased=False))
+    return result
 
 
 def _train_curve(model, prepared, cfg, spec, store) -> list[dict]:
