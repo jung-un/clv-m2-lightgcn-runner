@@ -10,8 +10,37 @@ import pandas as pd
 import torch
 
 import clv_shared_nv_feature_screen as screen
-from clv_shared_nv_feature_model import build_features
+from clv_shared_nv_feature_model import SharedNVLightGCN, build_features
 from test_linear_nv_original_m4_screen import inputs
+
+
+def test_shared_l2_is_independent_of_batch_replication():
+    torch.manual_seed(43)
+    frame = pd.DataFrame(dict(u_idx=[0, 0, 1, 1], i_idx=[0, 1, 1, 2], up=[1., 2., 3., 4.]))
+    features = build_features(frame, n_users=2, n_items=5,
+        q_n=np.array([.2, .8]), q_v=np.array([.3, .7]), valid=np.ones(2, bool))
+    adj = torch.sparse_coo_tensor(torch.empty((2, 0), dtype=torch.long), torch.empty(0), (7, 7))
+    model = SharedNVLightGCN(n_users=2, n_items=5, features=features, adj=adj)
+    u, p, n = (torch.tensor(a) for a in ([0, 1], [1, 1], [3, 4]))
+
+    def probe(repeats):
+        users, positives, negatives = (a.repeat(repeats) for a in (u, p, n))
+        model.zero_grad()
+        penalty = model.batch_l2(users, positives, negatives)
+        penalty.backward()
+        gradients = {name: parameter.grad.clone() for name, parameter in model.named_parameters()}
+        pos, neg = model._pair_scores(users, positives, negatives)
+        return penalty.detach(), gradients, torch.nn.functional.softplus(neg-pos).mean().detach()
+
+    original, duplicated = probe(1), probe(2)
+    torch.testing.assert_close(original[2], duplicated[2])  # Mean BPR is unchanged.
+    for name in original[1]:
+        torch.testing.assert_close(original[1][name], duplicated[1][name], msg=name)
+    torch.testing.assert_close(original[0], duplicated[0])
+    expected = model.pref_reg * (sum(t.square().sum() for t in
+        (model.E_u(u), model.E_i(p), model.E_i(n)))/len(u)
+        + sum(w.square().sum() for w in model.encoders.parameters()))
+    torch.testing.assert_close(original[0], expected.detach())
 
 
 def test_shared_features_joint_training_resume_and_readout():
@@ -85,6 +114,9 @@ def test_shared_features_joint_training_resume_and_readout():
             paths = screen.run(cfg, prep)
             report = json.loads(Path(paths['json']).read_text())
             assert report['reading']['complete'] and not report['final_test'] and not report['holdout']
+            assert report['code_version'] == screen.VERSION
+            assert report['regularization']['shared_nv_coefficient'] == cfg.pref_reg
+            assert report['arms'][2]['diagnostics']['shared_nv_l2_coefficient'] == cfg.pref_reg
             assert report['arms'][2]['training']['resumed_from_epoch'] == 1
             assert report['arms'][3]['training']['resumed_from_epoch'] == 0
             assert not report['reading'][screen.M5]['both_economic_at10_above_m4']
@@ -94,8 +126,17 @@ def test_shared_features_joint_training_resume_and_readout():
             with patch.object(screen.es, '_train', side_effect=AssertionError('unexpected training')):
                 screen.run(cfg, prep)
         with patch.object(screen.base, '_prepare', side_effect=AssertionError('unexpected data load')):
+            # An existing v1 report cannot be overwritten by the correction.
+            report['code_version'] = 'shared-nv-feature-m2-m5-seed43-development-v1'
+            Path(paths['json']).write_text(json.dumps(report))
             try:
                 screen.prepare(Path(folder)/'missing.json', folder)
+            except ValueError as exc:
+                assert 'another experiment version' in str(exc)
+            else:
+                raise AssertionError('Old output directory accepted')
+            try:
+                screen.prepare(Path(folder)/'missing.json', Path(folder)/'unused')
             except ValueError:
                 pass
             else:
@@ -103,5 +144,6 @@ def test_shared_features_joint_training_resume_and_readout():
 
 
 if __name__ == '__main__':
+    test_shared_l2_is_independent_of_batch_replication()
     test_shared_features_joint_training_resume_and_readout()
     print('Shared N/V CPU smoke passed')

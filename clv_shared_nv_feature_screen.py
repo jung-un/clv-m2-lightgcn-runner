@@ -1,4 +1,4 @@
-"""Two new fits only: shared N/V M2 and M5, exact seed43 M1/M4 reuse."""
+"""Shared N/V L2 normalization correction only; exact seed43 M1/M4 reuse."""
 from dataclasses import asdict
 import hashlib
 import json
@@ -12,8 +12,8 @@ import clv_m5_linear_nv_original_m4_lambda025_screen as prior
 from clv_run_state import ProgressStore, RunIdentity, file_sha256
 from clv_shared_nv_feature_model import SharedNVLightGCN, build_features
 
-VERSION = 'shared-nv-feature-m2-m5-seed43-development-v1'
-M2, M5 = 'm2_shared_nv_features_es', 'm5_shared_nv_original_masked_lambda025_es'
+VERSION = 'shared-nv-feature-m2-m5-shared-l2-seed43-development-v2'
+M2, M5 = 'm2_shared_nv_features_shared_l2_es', 'm5_shared_nv_original_masked_lambda025_shared_l2_es'
 M4 = prior.lambda025.MODEL_ID
 base, es = prior.base, prior.es
 configure = prior.configure
@@ -39,6 +39,9 @@ def prepare(report_path, out_dir, *, alpha_n=.05, alpha_v=.05):
     if not all(np.isfinite(x) and 0 < x <= .1 for x in (alpha_n, alpha_v)):
         raise ValueError('Both N/V strengths must be in (0,.1]; zero is not an improvement')
     cfg = configure(str(out_dir))
+    existing = Path(out_dir)/'reports/result.json'
+    if existing.is_file() and json.loads(existing.read_text()).get('code_version') != VERSION:
+        raise ValueError('Output contains another experiment version; choose a new directory')
     prior.verified_anchors(report_path, cfg)  # No data load/training if reuse fails.
     prep = base._prepare(es.strength_cfg(cfg))
     audit, weights, diagnostic = prior.lambda025.previous.audit_weights(prep, cfg)
@@ -60,6 +63,7 @@ def prepare(report_path, out_dir, *, alpha_n=.05, alpha_v=.05):
     base.capacity.test10._atomic_csv(root/'m4_validity_audit.csv', audit)
     base.capacity.test10._atomic_json(root/'feature_diagnostic.json', features['diagnostics'])
     print('준비만 완료. M1·수정 원형 M4(λ=.25) 재사용; 새 학습 M2·M5 각 1개, seed43.', flush=True)
+    print('v2 변경: 공유 N/V L2를 배치 크기로 나누지 않음. ID L2·N/V 구조·M4는 유지.', flush=True)
     print(json.dumps(dict(settings=settings, features=features['diagnostics'],
         max_epochs=cfg.epochs, final_test=False, holdout=False), ensure_ascii=False, indent=2))
     return cfg, prep, audit
@@ -120,6 +124,9 @@ def save(arms, cfg, prep):
         code_version=VERSION, config=asdict(cfg), feature_settings=prep['feature_settings'],
         new_arms=specs(prep['feature_settings']),
         config_note='legacy config fields are retained for exact baseline reuse; new_arms and feature_settings define the new representation',
+        regularization=dict(id_coefficient=cfg.pref_reg, shared_nv_coefficient=cfg.pref_reg,
+            formula='pref_reg * (sampled_ID_squared_sum / batch_size + shared_NV_squared_sum)',
+            change_from_v1='Only shared NV L2 normalization: previously divided by batch_size'),
         feature_diagnostics=prep['features']['diagnostics'], features_sha256=prep['features_sha256'],
         selection=es.preflight(prior.lambda025.previous.prior.configure(cfg.out_dir))['selection'],
         primary='overall weighted hit@10 and weighted NDCG@10; M5 vs M4 and M1',

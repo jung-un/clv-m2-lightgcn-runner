@@ -154,9 +154,9 @@ class SharedNVLightGCN(nn.Module):
 
     def batch_l2(self, users, positives, negatives):
         tables = [self.E_u(users), self.E_i(positives), self.E_i(negatives)]
-        # Shared matrices counted ONCE, never once per user/item occurrence.
-        return self.pref_reg*(sum(t.square().sum() for t in tables) +
-                              sum(p.square().sum() for p in self.encoders.parameters()))/len(users)
+        # Average sampled ID rows; shared matrices are global, not batch samples.
+        return self.pref_reg*(sum(t.square().sum() for t in tables)/len(users) +
+                              sum(p.square().sum() for p in self.encoders.parameters()))
 
     def _bpr(self, users, positives, negatives, weights=None):
         pos, neg = self._pair_scores(users, positives, negatives)
@@ -182,7 +182,10 @@ class SharedNVLightGCN(nn.Module):
     @torch.no_grad()
     def representation_diagnostics(self):
         result = dict(alpha_n=self.alpha_n, alpha_v=self.alpha_v,
-                      shared_nv_parameters=sum(p.numel() for p in self.encoders.parameters()))
+                      shared_nv_parameters=sum(p.numel() for p in self.encoders.parameters()),
+                      shared_nv_l2_coefficient=self.pref_reg,
+                      shared_nv_l2_penalty=float(self.pref_reg*sum(
+                          p.square().sum() for p in self.encoders.parameters())))
         for name, encoder in self.encoders.items():
             values = encoder(getattr(self, name+'_input'))
             result[name+'_mean_norm'] = float(values.norm(dim=1).mean())
