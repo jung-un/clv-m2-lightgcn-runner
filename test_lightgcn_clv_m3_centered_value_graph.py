@@ -226,3 +226,34 @@ def test_difference_table_refuses_to_drop_a_seed_whose_baseline_is_missing():
 
     with pytest.raises(KeyError, match=graph.M1_MODEL_ID):
         graph.difference_table(graph.curve_table(arms, {}), [100, 300])
+
+
+def test_only_the_named_seeds_get_a_new_baseline(monkeypatch):
+    """The capacity search ran seed 42 only; the rest need explicit permission."""
+
+    trained = []
+    monkeypatch.setattr(graph.capacity, "_prepare", lambda cfg: {"cfg": cfg})
+    monkeypatch.setattr(graph.capacity, "_run_arm",
+                        lambda prepared, cfg, spec, seed: trained.append((spec["model_id"], seed)))
+
+    assert graph.train_missing_baselines(_cfg(seeds=(42, 43, 44))) == []
+    assert trained == []
+
+    allowed = _cfg(seeds=(42, 43, 44), allow_baseline_training=("43:m1", "44:m1"))
+    assert graph.train_missing_baselines(allowed) == [43, 44]
+    assert trained == [(graph.M1_MODEL_ID, 43), (graph.M1_MODEL_ID, 44)]
+
+    # 허용 목록에 있어도 이번 실행 seed가 아니면 학습하지 않는다
+    trained.clear()
+    assert graph.train_missing_baselines(
+        _cfg(seeds=(42,), allow_baseline_training=("43:m1",))) == []
+    assert trained == []
+
+
+def test_a_baseline_trained_under_another_setting_is_refused(monkeypatch):
+    monkeypatch.setattr(graph.capacity, "_prepare", lambda cfg: {"cfg": cfg})
+    monkeypatch.setattr(graph.capacity, "_run_arm",
+                        lambda prepared, cfg, spec, seed: None)
+    with pytest.raises(RuntimeError, match="id_dim"):
+        graph.train_missing_baselines(
+            _cfg(seeds=(43,), id_dim=128, allow_baseline_training=("43:m1",)))

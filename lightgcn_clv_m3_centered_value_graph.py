@@ -392,6 +392,40 @@ def load_baseline_curves(cfg: CenteredGraphConfig) -> dict[int, list[dict]]:
     return curves
 
 
+def train_missing_baselines(cfg: CenteredGraphConfig) -> list[int]:
+    """Fill in M1 curves for the seeds the user explicitly allowed, and only those.
+
+    The capacity search only ran seed 42, so seeds 43 and 44 have no M1 curve to
+    compare against.  Training them here goes through the capacity search's own
+    M1 path, with its config hash, file name and protocol, so the new curves are
+    the same object as the existing one rather than a re-implementation.  Seeds
+    that are not named in allow_baseline_training are never trained.
+    """
+
+    allowed = {seed for seed in cfg.seeds if f"{seed}:m1" in cfg.allow_baseline_training}
+    if not allowed:
+        return []
+    baseline = capacity.CONDITIONS[0]
+    if (baseline.id_dim, baseline.pref_reg) != (cfg.id_dim, cfg.pref_reg):
+        raise RuntimeError(
+            f"용량탐색 baseline 설정(id_dim {baseline.id_dim}, L2 {baseline.pref_reg})이 "
+            f"이번 M3 설정(id_dim {cfg.id_dim}, L2 {cfg.pref_reg})과 다릅니다"
+        )
+    m1_cfg = capacity.configure_capacity_search(
+        conditions=(baseline.name,), seeds=tuple(sorted(allowed)),
+        epochs=cfg.epochs, eval_every=cfg.eval_every, batch_size=cfg.batch_size,
+        lr=cfg.lr, n_layers=cfg.n_layers, negative_count=cfg.negative_count,
+        out_dir=cfg.m1_result_dir,
+    )
+    spec = next(s for s in capacity.arm_specifications(m1_cfg)
+                if s["model_id"] == M1_MODEL_ID)
+    prepared = capacity._prepare(m1_cfg)
+    for seed in sorted(allowed):
+        print(f"\n===== {M1_MODEL_ID} | seed {seed} | {cfg.epochs} epoch (허용된 baseline 학습) =====")
+        capacity._run_arm(prepared, m1_cfg, spec, seed)
+    return sorted(allowed)
+
+
 def _arm_paths(prepared: dict, model_id: str, seed: int) -> dict[str, Path]:
     root = prepared["out_dir"] / "arms" / prepared["config_hash"]
     return {"result": root / f"{model_id}_s{seed}.json"}
@@ -521,6 +555,9 @@ def centered_graph_reading(difference: pd.DataFrame, cfg: CenteredGraphConfig) -
 def run_centered_graph(cfg: CenteredGraphConfig | None = None) -> pd.DataFrame:
     cfg = validate_config(cfg or configure_centered_graph())
     print(json.dumps(preflight_summary(cfg), ensure_ascii=False, indent=2))
+    trained = train_missing_baselines(cfg)
+    if trained:
+        print(f"\n명시적으로 허용된 M1 학습 seed: {trained}")
     baselines = load_baseline_curves(cfg)
     prepared = _prepare(cfg)
 
