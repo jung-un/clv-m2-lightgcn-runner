@@ -335,6 +335,16 @@ def _evaluate(model, prepared: dict) -> dict:
     return test10._public_metrics(metrics)
 
 
+def run_label(spec: dict, seed: int) -> str:
+    """Name a run in the log. The M3 graph runner shares this loop and its
+    specs carry `arm` instead of `condition`."""
+
+    name = spec.get("condition") or spec.get("arm")
+    if not name:
+        raise KeyError("spec에 condition도 arm도 없습니다")
+    return f"{name}/{spec['model_id']} s{seed}"
+
+
 def _train_curve(
     model, prepared: dict, cfg: CapacitySearchConfig, spec: dict, seed: int,
     store: ProgressStore,
@@ -348,11 +358,12 @@ def _train_curve(
     rng = np.random.default_rng(seed)
     checkpoints = set(evaluation_epochs(cfg))
 
+    label = run_label(spec, seed)
     restored = store.restore_epoch(model, optimizer, rng)
     start_epoch = 1 if restored is None else int(restored["next_epoch"])
     curve = list(restored.get("history", [])) if restored else []
     if restored is not None:
-        print(f"  [{spec['condition']}/{spec['model_id']} s{seed}] epoch {start_epoch - 1} 재개")
+        print(f"  [{label}] epoch {start_epoch - 1} 재개")
     store.mark_stage("running", epoch=start_epoch - 1, max_epoch=cfg.epochs, selection="none")
 
     started = time.time()
@@ -388,7 +399,7 @@ def _train_curve(
             record["score_split"] = _clv_score_share(model, prepared, cfg)
             record["gradient_diagnostics"] = model.training_gradient_diagnostics()
             print(
-                f"  [{spec['condition']}/{spec['model_id']} s{seed}] ep {epoch:3d} | "
+                f"  [{label}] ep {epoch:3d} | "
                 f"loss {record['loss']:.4f} | recall@10 {record['metrics']['recall@10']:.6f} | "
                 f"ndcg@10 {record['metrics']['ndcg@10']:.6f}"
             )

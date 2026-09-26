@@ -392,6 +392,34 @@ def load_baseline_curves(cfg: CenteredGraphConfig) -> dict[int, list[dict]]:
     return curves
 
 
+def clear_stale_progress(prepared: dict) -> list[str]:
+    """Drop resume files that a different code revision wrote.
+
+    The resume identity includes the source revision and refuses to load across
+    it, which is right — a checkpoint from other code is not this run's state.
+    But that refusal raises, so a stale file would block the next run instead of
+    letting it start over.  Only unfinished resume state is removed; finished
+    result files are left alone.
+    """
+
+    root = Path(prepared["out_dir"]) / "progress" / prepared["config_hash"]
+    dropped = []
+    for stage_path in sorted((root / "stages").glob("centered_graph_dev_*.json")):
+        if stage_path.name.endswith(".completed.json"):
+            continue
+        payload = json.loads(stage_path.read_text(encoding="utf-8"))
+        if payload.get("source_revision") == prepared["revision"]:
+            continue
+        resume = root / "resume" / f"{stage_path.stem}_latest.pt"
+        for path in (resume, stage_path):
+            path.unlink(missing_ok=True)
+        dropped.append(
+            f"{stage_path.stem} (epoch {payload.get('epoch')}, "
+            f"revision {str(payload.get('source_revision'))[:12]})"
+        )
+    return dropped
+
+
 def train_missing_baselines(cfg: CenteredGraphConfig) -> list[int]:
     """Fill in M1 curves for the seeds the user explicitly allowed, and only those.
 
@@ -435,8 +463,11 @@ def _run_arm(prepared: dict, cfg: CenteredGraphConfig, spec: dict, graph: dict,
              seed: int) -> dict:
     paths = _arm_paths(prepared, spec["model_id"], seed)
     if paths["result"].exists():
-        print(f"  [cached] {spec['model_id']} s{seed} 곡선 재사용")
-        return json.loads(paths["result"].read_text(encoding="utf-8"))
+        payload = json.loads(paths["result"].read_text(encoding="utf-8"))
+        other = payload.get("source_revision") != prepared["revision"]
+        print(f"  [cached] {spec['model_id']} s{seed} 곡선 재사용"
+              + (f" — 다른 커밋 {str(payload.get('source_revision'))[:12]}에서 나온 결과다" if other else ""))
+        return payload
 
     model = _build_model(prepared, cfg, graph, seed)
     store = ProgressStore(
@@ -560,6 +591,11 @@ def run_centered_graph(cfg: CenteredGraphConfig | None = None) -> pd.DataFrame:
         print(f"\n명시적으로 허용된 M1 학습 seed: {trained}")
     baselines = load_baseline_curves(cfg)
     prepared = _prepare(cfg)
+    stale = clear_stale_progress(prepared)
+    if stale:
+        print("\n다른 커밋이 남긴 재개파일을 지우고 해당 arm은 처음부터 학습한다:")
+        for item in stale:
+            print("  -", item)
 
     graphs = {}
     for spec in arm_specifications():
@@ -589,6 +625,11 @@ def run_centered_graph(cfg: CenteredGraphConfig | None = None) -> pd.DataFrame:
         "code_version": CODE_VERSION, "config": asdict(cfg),
         "preflight": preflight_summary(cfg), "source_revision": prepared["revision"],
         "edge_audits": {key: value["audit"] for key, value in graphs.items()},
+        "reused_from_other_revision": sorted(
+            f"{arm['model_id']}_s{arm['seed']}" for arm in arms
+            if arm.get("source_revision") != prepared["revision"]
+        ),
+        "dropped_stale_progress": stale,
         "betas": {key: value["beta"] for key, value in graphs.items()},
         "curve": curve.to_dict("records"), "difference": difference.to_dict("records"),
         "reading": reading,

@@ -195,3 +195,17 @@ def test_curve_attrs_stay_displayable():
                                 for i in range(30)], axis=1)
     wide.attrs = dict(curve.attrs)
     wide.to_string()          # pandas truncates here; a DataFrame in attrs would raise
+
+
+def test_the_log_label_works_for_both_runners_that_share_this_loop():
+    """The M3 graph runner reuses _train_curve and its specs carry `arm`."""
+
+    m2 = next(s for s in search.arm_specifications(_cfg())
+              if s["model_id"] == search.M2_MODEL_ID)
+    assert search.run_label(m2, 42) == f"baseline/{search.M2_MODEL_ID} s42"
+
+    m3_spec = {"model_id": "m3_centered_value_graph_bpr_k1", "arm": "value_only"}
+    assert search.run_label(m3_spec, 43) == "value_only/m3_centered_value_graph_bpr_k1 s43"
+
+    with pytest.raises(KeyError):
+        search.run_label({"model_id": "x"}, 42)

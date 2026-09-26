@@ -257,3 +257,29 @@ def test_a_baseline_trained_under_another_setting_is_refused(monkeypatch):
     with pytest.raises(RuntimeError, match="id_dim"):
         graph.train_missing_baselines(
             _cfg(seeds=(43,), id_dim=128, allow_baseline_training=("43:m1",)))
+
+
+def test_resume_files_from_another_revision_are_dropped_not_left_to_raise(tmp_path):
+    """Resume refuses to load across revisions by raising, so stale files must go."""
+
+    prepared = {"out_dir": tmp_path, "config_hash": "abc", "revision": "new"}
+    stages = tmp_path / "progress" / "abc" / "stages"
+    resume = tmp_path / "progress" / "abc" / "resume"
+    stages.mkdir(parents=True)
+    resume.mkdir(parents=True)
+    keep = "centered_graph_dev_m3_centered_value_graph_bpr_k1_s42"
+    drop = "centered_graph_dev_m3_centered_value_activity_graph_bpr_k1_s42"
+    done = "centered_graph_dev_m3_centered_value_graph_bpr_k1_s43.completed"
+    for name, revision in ((keep, "new"), (drop, "old"), (done, "old")):
+        (stages / f"{name}.json").write_text(
+            json.dumps({"source_revision": revision, "epoch": 25}))
+        (resume / f"{name}_latest.pt").write_bytes(b"x")
+
+    dropped = graph.clear_stale_progress(prepared)
+
+    assert len(dropped) == 1 and drop in dropped[0] and "epoch 25" in dropped[0]
+    assert not (stages / f"{drop}.json").exists()
+    assert not (resume / f"{drop}_latest.pt").exists()
+    # 같은 커밋 것과 이미 끝난 것은 건드리지 않는다
+    assert (stages / f"{keep}.json").exists() and (resume / f"{keep}_latest.pt").exists()
+    assert (stages / f"{done}.json").exists()
