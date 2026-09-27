@@ -58,7 +58,8 @@ class CenteredGraphHMConfig:
     max_popularity_correlation: float = 0.20
     # 한 arm에 20시간이 걸리므로 나눠 실행할 수 있게 둔다. arm 목록은 run hash에서
     # 제외하므로 나중에 나머지 arm을 더해도 끝난 arm은 그대로 재사용된다.
-    arms: tuple[str, ...] = ("value_only", "value_and_activity")
+    # 논문의 주 모형은 CLV 두 축을 함께 쓰는 value_and_activity이므로 그것을 먼저 둔다.
+    arms: tuple[str, ...] = ("value_and_activity", "value_only")
     m1_result_dir: str = ""
     allow_baseline_training: bool = False
     eval_test: bool = False
@@ -97,11 +98,11 @@ def arm_specifications(cfg: CenteredGraphHMConfig | None = None) -> list[dict]:
 
 
 _ALL_ARMS = [
-        {"model_id": ARM_VALUE, "arm": "value_only", "gamma": 0.0, "kind": "m3",
-         "question": "가치축만으로 전파를 바꾸면 H&M에서도 M1을 넘는가"},
-        {"model_id": ARM_VALUE_ACTIVITY, "arm": "value_and_activity", "gamma": 1.0,
-         "kind": "m3",
-         "question": "반복구매가 적은 H&M에서 반복거래축은 얼마나 기여하는가"},
+    {"model_id": ARM_VALUE_ACTIVITY, "arm": "value_and_activity", "gamma": 1.0,
+     "kind": "m3",
+     "question": "CLV 두 축(N·V)을 함께 넣어 전파를 바꾸면 H&M에서 M1을 넘는가"},
+    {"model_id": ARM_VALUE, "arm": "value_only", "gamma": 0.0, "kind": "m3",
+     "question": "그 성과가 가치축에서 오는지 반복거래축에서 오는지 나누기 위한 분해"},
 ]
 
 
@@ -244,6 +245,26 @@ def _build_model(prepared: dict, cfg: CenteredGraphHMConfig, arm_graph: dict):
 
 BASELINE_PROTOCOL = ("seed", "id_dim", "pref_reg", "batch_size", "lr",
                      "negative_count", "epochs", "window_days", "input_days")
+ALIGNMENT_METRIC = "user_value_tendency_recommended_price_alignment"
+
+
+def _baseline_record(record: dict) -> dict | None:
+    """Normalise one M1 curve record.
+
+    The budget run's top-level file stores its comparison table, so the metrics are
+    flattened next to the identifiers and the diagnostics; its per-arm files keep
+    them nested under "metrics". Accept both and keep the reported metrics only —
+    everything scored at a cut-off, plus the value-tendency alignment.
+    """
+
+    if "metrics" in record:
+        metrics = dict(record["metrics"])
+    else:
+        metrics = {key: value for key, value in record.items()
+                   if "@" in key or key == ALIGNMENT_METRIC}
+    if not metrics:
+        return None
+    return {"epoch": record["epoch"], "loss": record.get("loss"), "metrics": metrics}
 
 
 def load_baseline_curve(cfg: CenteredGraphHMConfig) -> list[dict]:
@@ -257,8 +278,10 @@ def load_baseline_curve(cfg: CenteredGraphHMConfig) -> list[dict]:
             continue
         if tuple(config.get("evaluation_epochs") or ()) != tuple(cfg.evaluation_epochs):
             continue
-        curve = [record for record in payload.get("curve", [])
-                 if record.get("model_id") == M1_MODEL_ID]
+        curve = [normalised for normalised in
+                 (_baseline_record(record) for record in payload.get("curve", [])
+                  if record.get("model_id") == M1_MODEL_ID)
+                 if normalised is not None]
         evaluated = sorted(record["epoch"] for record in curve)
         if evaluated != sorted(cfg.evaluation_epochs):
             continue

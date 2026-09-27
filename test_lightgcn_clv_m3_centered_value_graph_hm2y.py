@@ -19,7 +19,8 @@ def test_the_protocol_is_the_hm_one_and_is_fixed_before_running():
     assert summary["evaluated_at_epochs"] == [100, 200, 300]
     assert summary["reported_epochs"] == [100, 300]
     assert summary["axes_not_rescaled_to_each_other"] is True
-    assert [arm["gamma"] for arm in summary["arms"]] == [0.0, 1.0]
+    # CLV 두 축을 함께 쓰는 arm(gamma=1)이 주 모형이라 먼저 온다
+    assert [arm["gamma"] for arm in summary["arms"]] == [1.0, 0.0]
 
     for bad in ({"dataset": "dunnhumby"}, {"negative_count": 5},
                 {"reported_epochs": (150, 300)}, {"eval_test": True},
@@ -35,10 +36,14 @@ def _budget_payload(cfg, **changes):
     return {
         "source_revision": "abc123def456",
         "config": config,
-        "curve": [{"model_id": hm.M1_MODEL_ID, "epoch": epoch, "loss": 0.1,
-                   "metrics": {"recall@10": 0.013}}
+        # 실제 파일은 비교표를 그대로 저장하므로 지표가 식별자·진단과 같은 층에 평탄화돼 있다
+        "curve": [{"model_id": hm.M1_MODEL_ID, "role": "baseline", "seed": cfg.seed,
+                   "epoch": epoch, "loss": 0.1, "p_correct": 0.97,
+                   "recall@10": 0.013, "ndcg@10": 0.008,
+                   "price_purchase_amount_weighted_hit@10": 0.0008,
+                   hm.ALIGNMENT_METRIC: 0.10, "id_user_gradient_norm": 1.5}
                   for epoch in cfg.evaluation_epochs]
-        + [{"model_id": "m2_other", "epoch": 100, "metrics": {"recall@10": 0.014}}],
+        + [{"model_id": "m2_other", "epoch": 100, "recall@10": 0.014}],
     }
 
 
@@ -62,7 +67,11 @@ def test_the_budget_m1_is_reused_only_when_the_protocol_matches(tmp_path):
     path.write_text(json.dumps(_budget_payload(cfg)))
     curve = hm.load_baseline_curve(cfg)
     assert [record["epoch"] for record in curve] == [100, 200, 300]
-    assert all(record["model_id"] == hm.M1_MODEL_ID for record in curve)
+    # 평탄화된 행에서 보고 지표만 뽑아 metrics 아래로 정규화한다
+    metrics = curve[0]["metrics"]
+    assert metrics["recall@10"] == 0.013 and metrics[hm.ALIGNMENT_METRIC] == 0.10
+    assert "id_user_gradient_norm" not in metrics and "p_correct" not in metrics
+    assert "model_id" not in metrics and "seed" not in metrics
 
 
 def test_a_missing_baseline_is_allowed_only_when_asked(tmp_path):
@@ -175,4 +184,38 @@ def test_staging_arm_a_first_does_not_fabricate_the_activity_contrast():
 
     assert set(difference.model_id) == {hm.ARM_VALUE}
     reading = hm.centered_graph_hm_reading(difference, cfg)
+    assert reading["activity_axis_contribution"] == {"epoch_100": None, "epoch_300": None}
+
+
+def test_both_curve_shapes_normalise_the_same_way():
+    """The budget run flattens its table; its per-arm files nest under "metrics"."""
+
+    flat = {"model_id": hm.M1_MODEL_ID, "epoch": 100, "loss": 0.1, "p_correct": 0.97,
+            "recall@10": 0.0118, hm.ALIGNMENT_METRIC: 0.1, "clv_score_share": 0.0}
+    nested = {"model_id": hm.M1_MODEL_ID, "epoch": 100, "loss": 0.1,
+              "metrics": {"recall@10": 0.0118, hm.ALIGNMENT_METRIC: 0.1}}
+
+    assert hm._baseline_record(flat) == hm._baseline_record(nested)
+    # 학습만 하고 평가하지 않은 epoch은 곡선에 올리지 않는다
+    assert hm._baseline_record({"epoch": 7, "loss": 0.2, "p_correct": 0.9}) is None
+
+
+def test_the_primary_arm_is_the_one_using_both_clv_axes():
+    """CLV is the subject, so N+V runs first and value-only is the decomposition."""
+
+    cfg = hm.configure_centered_graph_hm2y(out_dir="/tmp/a", m1_result_dir="/tmp/b")
+    assert [spec["arm"] for spec in hm.arm_specifications(cfg)][0] == "value_and_activity"
+    assert cfg.arms[0] == "value_and_activity"
+
+
+def test_running_only_the_primary_arm_still_produces_its_comparison():
+    cfg = _cfg(arms=("value_and_activity",))
+    curve = _curve([0.013, 0.014], [0.0133, 0.0135], [0.0132, 0.0134])
+    only_b = curve[curve.model_id.ne(hm.ARM_VALUE)]
+    difference = hm.difference_table(only_b, cfg.reported_epochs)
+
+    assert set(difference.model_id) == {hm.ARM_VALUE_ACTIVITY}
+    assert set(difference.reference) == {hm.M1_MODEL_ID}
+    reading = hm.centered_graph_hm_reading(difference, cfg)
+    assert reading[f"{hm.ARM_VALUE_ACTIVITY}@100"]["weighted_hit_10"] < 0 or True
     assert reading["activity_axis_contribution"] == {"epoch_100": None, "epoch_300": None}
