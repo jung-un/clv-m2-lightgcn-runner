@@ -1,4 +1,4 @@
-"""Shared N/V L2 normalization correction only; exact seed43 M1/M4 reuse."""
+"""N/V-conditioned ID representation; exact seed43 M1/M4 reuse, two new arms."""
 from dataclasses import asdict
 import hashlib
 import json
@@ -10,19 +10,20 @@ import torch
 
 import clv_m5_linear_nv_original_m4_lambda025_screen as prior
 from clv_run_state import ProgressStore, RunIdentity, file_sha256
-from clv_shared_nv_feature_model import SharedNVLightGCN, build_features
+from clv_shared_nv_feature_model import NVModulatedLightGCN, build_features
 
-VERSION = 'shared-nv-feature-m2-m5-shared-l2-seed43-development-v2'
-M2, M5 = 'm2_shared_nv_features_shared_l2_es', 'm5_shared_nv_original_masked_lambda025_shared_l2_es'
+VERSION = 'nv-modulated-id-m2-m5-seed43-development-v3'
+M2, M5 = 'm2_nv_modulated_id_es', 'm5_nv_modulated_id_original_masked_lambda025_es'
 M4 = prior.lambda025.MODEL_ID
 base, es = prior.base, prior.es
 configure = prior.configure
 
 
 def specs(settings=None):
-    settings = settings or dict(alpha_n=.05, alpha_v=.05)
-    return [dict(model_id=mid, role=role, kind='shared_nv_features', graph='binary',
-                 weighted=role == 'M5', alpha_n=settings['alpha_n'], alpha_v=settings['alpha_v'])
+    settings = settings or dict(eta_n=.05, eta_v=.05, shared_l2=.001)
+    return [dict(model_id=mid, role=role, kind='nv_modulated_id', graph='binary',
+                 weighted=role == 'M5', eta_n=settings['eta_n'], eta_v=settings['eta_v'],
+                 shared_l2=settings['shared_l2'])
             for mid, role in ((M2, 'M2'), (M5, 'M5'))]
 
 
@@ -35,9 +36,11 @@ def feature_hash(features):
     return digest.hexdigest()
 
 
-def prepare(report_path, out_dir, *, alpha_n=.05, alpha_v=.05):
-    if not all(np.isfinite(x) and 0 < x <= .1 for x in (alpha_n, alpha_v)):
+def prepare(report_path, out_dir, *, eta_n=.05, eta_v=.05, shared_l2=.001):
+    if not all(np.isfinite(x) and 0 < x <= .1 for x in (eta_n, eta_v)):
         raise ValueError('Both N/V strengths must be in (0,.1]; zero is not an improvement')
+    if not np.isfinite(shared_l2) or shared_l2 <= 0:
+        raise ValueError('Positive finite shared L2 required for this screen')
     cfg = configure(str(out_dir))
     existing = Path(out_dir)/'reports/result.json'
     if existing.is_file() and json.loads(existing.read_text()).get('code_version') != VERSION:
@@ -53,7 +56,7 @@ def prepare(report_path, out_dir, *, alpha_n=.05, alpha_v=.05):
         shrinkage=cfg.shrinkage_strength, bandwidth=cfg.basis_bandwidth)
     if not np.array_equal(features['keys'], np.asarray(data['pos_key'])):
         raise ValueError('Feature training pairs differ from the binary graph')
-    settings = dict(alpha_n=float(alpha_n), alpha_v=float(alpha_v),
+    settings = dict(eta_n=float(eta_n), eta_v=float(eta_v), shared_l2=float(shared_l2),
                     shrinkage=cfg.shrinkage_strength, bandwidth=cfg.basis_bandwidth)
     prep.update(anchors=[a for a in anchors if a['model_id'] in ('m1', M4)],
         source_report=str(report_path), source_report_sha256=prior.SOURCE_REPORT_SHA,
@@ -63,7 +66,7 @@ def prepare(report_path, out_dir, *, alpha_n=.05, alpha_v=.05):
     base.capacity.test10._atomic_csv(root/'m4_validity_audit.csv', audit)
     base.capacity.test10._atomic_json(root/'feature_diagnostic.json', features['diagnostics'])
     print('준비만 완료. M1·수정 원형 M4(λ=.25) 재사용; 새 학습 M2·M5 각 1개, seed43.', flush=True)
-    print('v2 변경: 공유 N/V L2를 배치 크기로 나누지 않음. ID L2·N/V 구조·M4는 유지.', flush=True)
+    print('v3: N/V로 ID 표현을 조절. 초기 N/V 행렬은 0; 실제 강도·규제는 아래 settings 참조.', flush=True)
     print(json.dumps(dict(settings=settings, features=features['diagnostics'],
         max_epochs=cfg.epochs, final_test=False, holdout=False), ensure_ascii=False, indent=2))
     return cfg, prep, audit
@@ -72,10 +75,43 @@ def prepare(report_path, out_dir, *, alpha_n=.05, alpha_v=.05):
 def _build(prep, cfg):
     base.v3.set_seed(43)
     d, settings = prep['data'], prep['feature_settings']
-    return SharedNVLightGCN(n_users=d['n_users'], n_items=d['n_items'],
+    return NVModulatedLightGCN(n_users=d['n_users'], n_items=d['n_items'],
         features=prep['features'], adj=d['adj'], id_dim=cfg.id_dim,
-        axis_dim=cfg.history_axis_dim, n_layers=cfg.n_layers, pref_reg=cfg.pref_reg,
-        alpha_n=settings['alpha_n'], alpha_v=settings['alpha_v']).to(base.v3.DEVICE)
+        n_layers=cfg.n_layers, pref_reg=cfg.pref_reg, shared_l2=settings['shared_l2'],
+        eta_n=settings['eta_n'], eta_v=settings['eta_v']).to(base.v3.DEVICE)
+
+
+def diagnose(model, prep, cfg, spec, epoch):
+    """Fixed TRAIN probe; no optimizer step, evaluation labels, or training RNG consumed."""
+    d = prep['data']
+    rng = np.random.default_rng(4301)
+    ix = rng.choice(len(d['tr_u']), min(8192, len(d['tr_u'])), replace=False)
+    negatives = base.components.m4_helpers.sample_uniform_negative_matrix(
+        d['tr_u'][ix], d['tr_i'][ix], d['n_items'], d['pos_key'], rng, k=1).reshape(-1)
+    u, p, n = [torch.as_tensor(a, device=base.v3.DEVICE, dtype=torch.long)
+               for a in (d['tr_u'][ix], d['tr_i'][ix], negatives)]
+    pos, neg = model._pair_components(u, p, n)
+    rows = torch.nn.functional.softplus(sum(neg.values())-sum(pos.values()))
+    if spec['weighted']:
+        rows = rows*torch.as_tensor(prep['m4_weights'][ix], device=rows.device, dtype=rows.dtype)
+    parameters = [layer.weight for layer in model.encoders.values()]
+    gradients = torch.autograd.grad(rows.mean(), parameters)
+    penalties = torch.autograd.grad(model.batch_l2(u, p, n), parameters)
+    result = {**model.representation_diagnostics(), **model.training_gradient_diagnostics(),
+              'probe_rows': len(ix), 'probe_bpr': float(rows.detach().mean())}
+    for name, gradient, penalty in zip(model.encoders, gradients, penalties):
+        result[name+'_bpr_gradient_norm'] = float(gradient.detach().double().norm())
+        result[name+'_l2_gradient_norm'] = float(penalty.detach().double().norm())
+    for name in pos:
+        gap = (pos[name]-neg[name]).detach().double()
+        result[name+'_pair_gap_mean_abs'] = float(gap.abs().mean())
+        result[name+'_pair_gap_std'] = float(gap.std(unbiased=False))
+    finite = all(np.isfinite(value) for value in result.values() if value is not None)
+    suffix = '_bpr_gradient_norm' if epoch == 0 else '_modulation_mean_abs'
+    result['nv_activity_ok'] = bool(finite and all(result[name+suffix] > 0 for name in model.encoders))
+    print(f"[N/V probe ep{epoch}] active={result['nv_activity_ok']} | "
+          f"N gap={result['n_pair_gap_mean_abs']:.3g} V gap={result['v_pair_gap_mean_abs']:.3g}", flush=True)
+    return result
 
 
 def identity(prep, cfg, spec):
@@ -112,8 +148,8 @@ def save(arms, cfg, prep):
         reading[M5]['both_economic_at10_above_m4'] = all(metrics[M5][k] > metrics[M4][k] for k in es.fixed.PRIMARY)
     curve = pd.DataFrame([dict(seed=43, model_id=a['model_id'], epoch=r['epoch'], **r['metrics'])
                           for a in arms for r in a['curve']])
-    diagnostics = pd.DataFrame([dict(model_id=a['model_id'], epoch=r['epoch'], **r.get('diagnostics', {}))
-                                for a in arms for r in a['curve']])
+    diagnostics = pd.DataFrame([dict(model_id=a['model_id'], epoch=r['epoch'], **r['diagnostics'])
+        for a in arms for r in a.get('training', {}).get('history', a['curve']) if 'diagnostics' in r])
     paths, root = {}, Path(cfg.out_dir)/'reports'
     for name, frame in (('absolute', absolute), ('comparison', pd.DataFrame(rows)),
                         ('curve', curve), ('diagnostics', diagnostics)):
@@ -124,14 +160,19 @@ def save(arms, cfg, prep):
         code_version=VERSION, config=asdict(cfg), feature_settings=prep['feature_settings'],
         new_arms=specs(prep['feature_settings']),
         config_note='legacy config fields are retained for exact baseline reuse; new_arms and feature_settings define the new representation',
-        regularization=dict(id_coefficient=cfg.pref_reg, shared_nv_coefficient=cfg.pref_reg,
-            formula='pref_reg * (sampled_ID_squared_sum / batch_size + shared_NV_squared_sum)',
-            change_from_v1='Only shared NV L2 normalization: previously divided by batch_size'),
+        regularization=dict(id_coefficient=cfg.pref_reg, shared_nv_coefficient=prep['feature_settings']['shared_l2'],
+            formula='pref_reg * sampled_ID_squared_sum / batch_size + shared_l2 * shared_NV_squared_sum'),
+        representation=dict(formula='z_tilde = z * (1 + eta_N*tanh(A_N phi_N) + eta_V*tanh(A_V phi_V)); score = user_tilde dot item_tilde',
+            initialization='four A matrices zero; ID matched random initialization, all jointly trained',
+            shared_parameters=12*cfg.id_dim, prior_alpha_not_equivalent_to_eta=True),
+        probe=dict(epochs=[0, 1, 5, 10, 'every evaluation'], source='8192 fixed TRAIN pairs at most, seed4301',
+            interpretation='N/V/cross terms partition training pair score gaps; not Top-10 contributions or CLV attribution',
+            abort='nonfinite diagnostic, zero initial BPR gradient, or zero N/V modulation at later probe'),
         feature_diagnostics=prep['features']['diagnostics'], features_sha256=prep['features_sha256'],
         selection=es.preflight(prior.lambda025.previous.prior.configure(cfg.out_dir))['selection'],
         primary='overall weighted hit@10 and weighted NDCG@10; M5 vs M4 and M1',
         guard='six overall Recall/NDCG metrics each >= .99 * M1',
-        m2='both fixed historical q_N/q_V -> trainable shared representations; no q_C, no economic propagation',
+        m2='both fixed historical q_N/q_V condition propagated ID representations; no q_C, no economic propagation',
         m4='validity-masked original, lambda=.25; all-train-row mean normalization',
         reading=reading, arms=arms, final_test=False, holdout=False,
         source_report=prep['source_report'], source_report_sha256=prep['source_report_sha256'],
@@ -167,8 +208,8 @@ def run(cfg, prep):
             store = ProgressStore(root/'progress', RunIdentity(VERSION, spec['model_id'], 43,
                 key, 'content:'+base._digest(ident['source_hashes']), prep['input_hash']))
             model = _build(prep, cfg)
-            result = es._train(model, prep, cfg, spec, 43, store, root)
-            arm = dict(**spec, seed=43, identity=ident, origin='trained_shared_nv_joint', **result)
+            result = es._train(model, prep, cfg, spec, 43, store, root, diagnose=diagnose)
+            arm = dict(**spec, seed=43, identity=ident, origin='trained_nv_modulated_id_joint', **result)
             base.capacity.test10._atomic_json(path, arm)
             store.mark_complete(epoch=result['stopped_epoch'], max_epoch=cfg.epochs,
                 best_epoch=result['selected_epoch'], result_path=str(path), checkpoint_path=result['checkpoint'])

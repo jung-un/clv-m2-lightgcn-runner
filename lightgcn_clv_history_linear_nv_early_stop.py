@@ -217,7 +217,7 @@ def prepare(cfg):
     return prepared
 
 
-def _train(model, prepared, cfg, spec, seed, store, root):
+def _train(model, prepared, cfg, spec, seed, store, root, *, diagnose=None):
     data = prepared['data']
     tr_u, tr_i = data['tr_u'],data['tr_i']
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
@@ -227,6 +227,8 @@ def _train(model, prepared, cfg, spec, seed, store, root):
         torch.load(store.latest_checkpoint, map_location='cpu', weights_only=False)
     state = store.restore_epoch(model,optimizer,rng)
     history = list(state.get('history',[])) if state else []
+    if diagnose is not None and any(r.get('diagnostics', {}).get('nv_activity_ok') is False for r in history):
+        raise RuntimeError('Saved N/V activity check failed; inspect the probe before resuming')
     start = int(state['next_epoch']) if state else 1
     prior_wall = float(state.get('wall_clock_sec',0)) if state else 0.
     selection = replay(history,cfg,require_complete=False)
@@ -234,6 +236,11 @@ def _train(model, prepared, cfg, spec, seed, store, root):
     weights = torch.as_tensor(prepared['m4_weights'],device=base.v3.DEVICE,dtype=torch.float32) if spec['weighted'] else None
     stopped = start-1
     if not selection['complete']:
+        if diagnose is not None and start == 1:
+            initial = diagnose(model, prepared, cfg, spec, 0)
+            base.capacity.test10._atomic_json(root/'probe_epoch0.json', initial)
+            if not initial['nv_activity_ok']:
+                raise RuntimeError('Initial N/V BPR gradient check failed; no training started')
         for epoch in range(start,cfg.epochs+1):
             model.train()
             epoch_start = time.time()
@@ -258,8 +265,12 @@ def _train(model, prepared, cfg, spec, seed, store, root):
                           p_correct=totals[2]/batches,epoch_sec=time.time()-epoch_start)
             if epoch % cfg.eval_every == 0:
                 record['metrics'] = base.capacity._evaluate(model,prepared)
-                record['diagnostics'] = {**model.representation_diagnostics(),
-                    **model.training_gradient_diagnostics(), **base.hm_budget._score_share(model,prepared)}
+                if diagnose is None:
+                    record['diagnostics'] = {**model.representation_diagnostics(),
+                        **model.training_gradient_diagnostics(), **base.hm_budget._score_share(model,prepared)}
+            if diagnose is not None and (epoch in (1,5,10) or 'metrics' in record):
+                record['diagnostics'] = diagnose(model, prepared, cfg, spec, epoch)
+                base.capacity.test10._atomic_json(root/f'probe_epoch{epoch}.json', record['diagnostics'])
             history.append(record)
             selection = replay(history,cfg,require_complete=False)
             if selection['selected_epoch'] == epoch:
@@ -268,6 +279,8 @@ def _train(model, prepared, cfg, spec, seed, store, root):
                 wall_clock_sec=prior_wall+time.time()-started,selection=MONITOR,
                 best_epoch=selection['selected_epoch'] or 0,waits=selection['waits'])
             stopped=epoch
+            if record.get('diagnostics', {}).get('nv_activity_ok') is False:
+                raise RuntimeError('N/V activity check failed. Checkpoint and probe saved; no further training')
             print(f"[{spec['model_id']} s{seed}] ep {epoch}/{cfg.epochs} | loss {record['loss']:.4f} | {record['epoch_sec']:.0f}s"
                   + (f" | {MONITOR}={record['metrics'][MONITOR]:.6f} | wait {selection['waits']}/{cfg.patience}" if 'metrics' in record else ''),flush=True)
             if selection['complete']:

@@ -195,3 +195,73 @@ class SharedNVLightGCN(nn.Module):
     def training_gradient_diagnostics(self):
         return {name+'_last_batch_gradient_norm': float(layer.weight.grad.norm())
                 if layer.weight.grad is not None else None for name, layer in self.encoders.items()}
+
+
+class NVModulatedLightGCN(SharedNVLightGCN):
+    """N/V condition propagated ID coordinates before the joint recommendation dot product.
+
+    z_tilde = z * (1 + eta_N*tanh(A_N phi_N) + eta_V*tanh(A_V phi_V)).
+    A starts at zero, not z: the initial score matches M1/M4 but BPR can update A.
+    """
+    supports_clv_score_split = False  # No concatenated score blocks to slice.
+
+    def __init__(self, *, eta_n=.05, eta_v=.05, shared_l2=.001, id_dim=64, **kwargs):
+        if not all(np.isfinite(x) and x > 0 for x in (eta_n, eta_v)) or eta_n+eta_v >= 1:
+            raise ValueError('Both N/V strengths must be positive with sum < 1')
+        if not np.isfinite(shared_l2) or shared_l2 < 0:
+            raise ValueError('Shared L2 must be finite and nonnegative')
+        super().__init__(id_dim=id_dim, axis_dim=id_dim, alpha_n=eta_n, alpha_v=eta_v, **kwargs)
+        self.eta_n, self.eta_v, self.shared_l2 = eta_n, eta_v, shared_l2
+        for layer in self.encoders.values():
+            nn.init.zeros_(layer.weight)
+
+    def _modulation(self, name, values):
+        eta = self.eta_n if name.endswith('_n') else self.eta_v
+        return eta*torch.tanh(self.encoders[name](values))
+
+    def embeddings(self, need_value=True):
+        uid, iid = self._id_embeddings()
+        outputs = []
+        for side, z in (('user', uid), ('item', iid)):
+            gate = 1 + sum(self._modulation(side+'_'+axis, getattr(self, side+'_'+axis+'_input'))
+                           for axis in ('n', 'v'))
+            outputs.append(z*gate)
+        return *outputs, uid.new_zeros((self.n_users, 1)), iid.new_zeros((self.n_items, 1))
+
+    def _pair_components(self, users, positives, negatives):
+        uid, iid = self._id_embeddings()
+        keys = users*self.n_items+positives
+        positions = torch.searchsorted(self.pair_keys, keys).clamp(max=len(self.pair_keys)-1)
+        if not torch.equal(self.pair_keys[positions], keys):
+            raise ValueError('Positive absent from training pairs')
+        un, uv = [self._modulation('user_'+axis, getattr(self, 'user_'+axis+'_input')[users])
+                  for axis in ('n', 'v')]
+        components = []
+        for items, prefix, indices in ((positives, 'loo', positions), (negatives, 'item', negatives)):
+            inn, inv = [self._modulation('item_'+axis, getattr(self, prefix+'_'+axis+'_input')[indices])
+                        for axis in ('n', 'v')]
+            product = uid[users]*iid[items]
+            components.append(dict(id=product.sum(1), n=(product*(un+inn+un*inn)).sum(1),
+                v=(product*(uv+inv+uv*inv)).sum(1), cross=(product*(un*inv+uv*inn)).sum(1)))
+        return components
+
+    def _pair_scores(self, users, positives, negatives):
+        return tuple(sum(parts.values()) for parts in self._pair_components(users, positives, negatives))
+
+    def batch_l2(self, users, positives, negatives):
+        return (self.pref_reg*sum(t.square().sum() for t in
+                (self.E_u(users), self.E_i(positives), self.E_i(negatives)))/len(users)
+                + self.shared_l2*sum(p.square().sum() for p in self.encoders.parameters()))
+
+    @torch.no_grad()
+    def representation_diagnostics(self):
+        result = dict(eta_n=self.eta_n, eta_v=self.eta_v,
+            shared_nv_parameters=sum(p.numel() for p in self.encoders.parameters()),
+            shared_nv_l2_coefficient=self.shared_l2,
+            shared_nv_l2_penalty=float(self.shared_l2*sum(p.double().square().sum() for p in self.encoders.parameters())))
+        for name, layer in self.encoders.items():
+            delta = self._modulation(name, getattr(self, name+'_input')).double()
+            result[name+'_parameter_norm'] = float(layer.weight.double().norm())
+            result[name+'_modulation_mean_abs'] = float(delta.abs().mean())
+            result[name+'_modulation_coordinate_std'] = float(delta.std(dim=0, unbiased=False).mean())
+        return result

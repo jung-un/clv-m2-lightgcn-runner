@@ -66,7 +66,7 @@ def test_shared_features_joint_training_resume_and_readout():
         invalid = build_features(frame, **dict(kw, q_n=np.array([np.nan, .2]), valid=np.array([False, True])))
         assert not invalid['user_n'][0].any() and not invalid['user_v'][0].any()
         prep.update(features=features, features_sha256=screen.feature_hash(features),
-            feature_settings=dict(alpha_n=.05, alpha_v=.05, shrinkage=10., bandwidth=.25),
+            feature_settings=dict(eta_n=.05, eta_v=.05, shared_l2=.001, shrinkage=10., bandwidth=.25),
             screen_config=asdict(cfg), source_report='synthetic', source_report_sha256='synthetic')
         prep['feature_settings_sha'] = screen.base._digest(prep['feature_settings'])
         _, prep['m4_weights'], prep['m4_diagnostics'] = screen.prior.lambda025.previous.audit_weights(prep, cfg)
@@ -75,9 +75,13 @@ def test_shared_features_joint_training_resume_and_readout():
             dict(kind='id', graph='binary', rho=0.), 43)
         assert torch.equal(model.E_u.weight, baseline.E_u.weight)
         assert torch.equal(model.E_i.weight, baseline.E_i.weight)
-        assert sum(p.numel() for p in model.encoders.parameters()) == 48
+        assert sum(p.numel() for p in model.encoders.parameters()) == 12*cfg.id_dim
+        assert all(torch.count_nonzero(p) == 0 for p in model.encoders.parameters())
+        for actual, expected in zip(model.embeddings()[:2], baseline.embeddings()[:2]):
+            torch.testing.assert_close(actual, expected[:, :cfg.id_dim])
+            assert not expected[:, cfg.id_dim:].any()  # Legacy rho=0 appends zero columns.
         u, p, n = (torch.tensor(a) for a in ([0, 1], [1, 1], [3, 4]))
-        model.pref_reg = 0.  # Prove N/V gradient comes from BPR, not L2.
+        model.pref_reg = model.shared_l2 = 0.  # BPR, not L2, must move zero-initialized N/V.
         loss, _ = model.bpr_loss(u, p, n)
         loss.backward()
         assert all(layer.weight.grad.norm() > 0 for layer in model.encoders.values())
@@ -89,8 +93,27 @@ def test_shared_features_joint_training_resume_and_readout():
         pos, neg = model._pair_scores(u, p, n)
         weighted, _ = model.weighted_bpr_loss(u, p, n, weights)
         torch.testing.assert_close(weighted, (weights*torch.nn.functional.softplus(neg-pos)).mean())
-        split = screen.base.hm_budget._score_share(model, prep)
-        assert 'n_top10_score_mean_abs' in split and 'v_top10_score_mean_abs' in split
+        probe = screen.diagnose(model, prep, cfg, screen.specs()[0], 0)
+        assert probe['nv_activity_ok'] and probe['n_pair_gap_mean_abs'] == 0
+        assert all(probe[name+'_bpr_gradient_norm'] > 0 for name in model.encoders)
+        assert all(probe[name+'_l2_gradient_norm'] == 0 for name in model.encoders)
+        with torch.no_grad():
+            for layer in model.encoders.values():
+                layer.weight.add_(.01)
+        for name in model.encoders:
+            delta = model._modulation(name, getattr(model, name+'_input'))
+            assert delta.abs().max() <= .05
+        parts_pos, parts_neg = model._pair_components(u, p, n)
+        full_u, full_i, *_ = model.embeddings()
+        torch.testing.assert_close(sum(parts_neg.values()), (full_u[u]*full_i[n]).sum(1))
+        assert not model._modulation('item_n', model.loo_n_input[:1]).any()
+        changed_probe = screen.diagnose(model, prep, cfg, screen.specs()[0], 1)
+        assert changed_probe['nv_activity_ok'] and changed_probe['n_pair_gap_mean_abs'] > 0
+        model.pref_reg, model.shared_l2 = .001, .002
+        expected_l2 = .001*sum(t.square().sum() for t in (model.E_u(u), model.E_i(p), model.E_i(n)))/2
+        expected_l2 += .002*sum(w.square().sum() for w in model.encoders.parameters())
+        torch.testing.assert_close(model.batch_l2(u, p, n), expected_l2)
+        torch.testing.assert_close(model.batch_l2(u.repeat(2), p.repeat(2), n.repeat(2)), expected_l2)
         assert set(s['model_id'] for s in screen.specs()) == {screen.M2, screen.M5}
         metrics = {k: 1. for k in (*screen.base.ACCURACY, *screen.es.fixed.PRIMARY)}
         metrics['고CLV_revenue@10'] = .5
@@ -119,12 +142,36 @@ def test_shared_features_joint_training_resume_and_readout():
             assert report['arms'][2]['diagnostics']['shared_nv_l2_coefficient'] == cfg.pref_reg
             assert report['arms'][2]['training']['resumed_from_epoch'] == 1
             assert report['arms'][3]['training']['resumed_from_epoch'] == 0
+            assert all(a['training']['history'][0]['diagnostics']['nv_activity_ok'] for a in report['arms'][2:])
             assert not report['reading'][screen.M5]['both_economic_at10_above_m4']
             assert '고CLV_revenue@10' in pd.read_csv(paths['absolute']).columns
             assert len(report['arms']) == 4
             # Completed arms must reuse; no training or optimizer after cache hit.
             with patch.object(screen.es, '_train', side_effect=AssertionError('unexpected training')):
                 screen.run(cfg, prep)
+        # A failed activity probe must save its completed epoch and block blind resume.
+        failed_cfg = replace(cfg, out_dir=str(Path(folder)/'failed'))
+        failed_prep = dict(prep, screen_config=asdict(failed_cfg))
+        real_diagnose = screen.diagnose
+        def inactive_probe(*args):
+            result = real_diagnose(*args)
+            if args[-1] > 0:
+                result['nv_activity_ok'] = False
+            return result
+        with patch.object(screen, 'configure', return_value=failed_cfg), \
+             patch.object(screen.prior, 'verified_anchors', return_value=anchors), \
+             patch.object(screen.base.capacity, '_evaluate', return_value=metrics), \
+             patch.object(screen, 'diagnose', side_effect=inactive_probe):
+            for _ in range(2):
+                try:
+                    screen.run(failed_cfg, failed_prep)
+                except RuntimeError as exc:
+                    assert 'activity check failed' in str(exc)
+                else:
+                    raise AssertionError('Inactive N/V silently continued')
+            checkpoint = next(Path(failed_cfg.out_dir).glob('arms/*/progress/resume/*_latest.pt'))
+            state = torch.load(checkpoint, weights_only=False)
+            assert state['epoch'] == 1 and not state['history'][0]['diagnostics']['nv_activity_ok']
         with patch.object(screen.base, '_prepare', side_effect=AssertionError('unexpected data load')):
             # An existing v1 report cannot be overwritten by the correction.
             report['code_version'] = 'shared-nv-feature-m2-m5-seed43-development-v1'
