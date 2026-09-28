@@ -127,7 +127,7 @@ def rank_views(views, prep):
     if d['n_items'] < 50 or len(np.unique(users)) != len(users):
         raise ValueError('Top50 needs >=50 items and unique evaluation users')
     tops = {}
-    batch = min(int(prep['base_cfg']['EVAL_BATCH']), 256)
+    batch = int(prep['base_cfg']['EVAL_BATCH'])
     if batch <= 0:
         raise ValueError('Positive evaluation batch required')
     for name in VIEWS:
@@ -142,7 +142,7 @@ def rank_views(views, prep):
                 seen = d['csr_items'][d['csr_ptr'][u]:d['csr_ptr'][u+1]]
                 if d['n_items']-len(seen) < 50:
                     raise ValueError('Fewer than50 unseen candidates for an evaluation user')
-                scores[row, seen] = -torch.inf
+                scores[row, seen] = -1e9
             top[start:start+len(bu)] = scores.topk(50, dim=1).indices.cpu().numpy()
         tops[name] = top
         print(f'[재평가] {name}: {len(users):,}명 완료 (학습 없음)', flush=True)
