@@ -41,6 +41,15 @@ def fixture():
     return m, prep
 
 
+def test_full_view_uses_original_embeddings_with_float32_roundoff():
+    model, _ = fixture()
+    user, item, user_value, item_value = model.embeddings()
+    original = (user + 5e-7, item, user_value, item_value)
+    with patch.object(model, 'embeddings', return_value=original):
+        views = audit.view_embeddings(model)
+    torch.testing.assert_close(views['full'][0], original[0], rtol=0, atol=0)
+
+
 def test_real_model_views_readback_and_full_audit_without_training(tmp_path):
     model, prep = fixture()
     with patch.object(audit.source.base.v3, 'DEVICE', 'cpu'):

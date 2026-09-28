@@ -114,7 +114,8 @@ def view_embeddings(model):
                             for side, z in (('user', uid), ('item', iid)))
     original = model.embeddings()[:2]
     for computed, actual in zip(views['full'], original):
-        torch.testing.assert_close(computed, actual, rtol=0, atol=0)
+        torch.testing.assert_close(computed, actual, rtol=1e-5, atol=2e-6)
+    views['full'] = original
     return views
 
 
