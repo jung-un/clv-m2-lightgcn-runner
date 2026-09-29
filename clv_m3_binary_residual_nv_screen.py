@@ -35,7 +35,7 @@ def configure(**overrides):
     return cfg
 
 
-def _original_curve(cfg, beta: float) -> tuple[pd.DataFrame, dict]:
+def _original_curves(cfg, beta: float) -> tuple[pd.DataFrame, dict]:
     root = Path(v3.default_out_dir("dunnhumby") + "_clv_m3_centered_value_graph_v1")
     matches = sorted(root.glob("clv_m3_centered_value_graph_*.json"))
     if len(matches) != 1:
@@ -47,14 +47,17 @@ def _original_curve(cfg, beta: float) -> tuple[pd.DataFrame, dict]:
     if any(old["config"][key] != getattr(cfg, key) for key in fixed):
         raise RuntimeError("기존 M3와 새 실험의 학습 설정이 달라 비교할 수 없습니다")
     if 43 not in old["config"]["seeds"]:
-        raise RuntimeError("기존 M3의 seed 43 결과가 없습니다")
+        raise RuntimeError("기존 M1·M3의 seed 43 결과가 없습니다")
     old_beta = old["betas"][m3.ARM_VALUE_ACTIVITY]
     if not np.isclose(beta, old_beta, rtol=0, atol=1e-6):
         raise RuntimeError(f"N/V 엣지 입력이 기존 M3와 다릅니다: beta {beta} vs {old_beta}")
     curve = pd.DataFrame(old["curve"])
-    curve = curve[curve.model_id.eq(m3.ARM_VALUE_ACTIVITY) & curve.seed.eq(43)].copy()
-    if set(CHECKPOINT_EPOCHS) - set(curve.epoch):
-        raise RuntimeError("기존 M3의 100·300 epoch 결과가 없습니다")
+    curve = curve[curve.model_id.isin((m3.M1_MODEL_ID, m3.ARM_VALUE_ACTIVITY))
+                  & curve.seed.eq(43)].copy()
+    for model_id in (m3.M1_MODEL_ID, m3.ARM_VALUE_ACTIVITY):
+        epochs = set(curve.loc[curve.model_id.eq(model_id), "epoch"])
+        if set(CHECKPOINT_EPOCHS) - epochs:
+            raise RuntimeError(f"기존 {model_id}의 100·300 epoch 결과가 없습니다")
     return curve, {"path": str(matches[0]), "sha256": hashlib.sha256(raw).hexdigest(),
                    "code_version": old["code_version"],
                    "source_revision": old["source_revision"]}
@@ -125,7 +128,6 @@ def _comparison(curve: pd.DataFrame) -> pd.DataFrame:
 
 def run(cfg=None) -> dict:
     cfg = configure() if cfg is None else configure(**asdict(cfg))
-    baselines = m3.load_baseline_curves(cfg)  # No new M1 training.
     prepared = m3._prepare(cfg)
     prepared["config_hash"] = hashlib.sha256(
         f"{CODE_VERSION}:{ALPHA}:{prepared['config_hash']}".encode()
@@ -134,7 +136,7 @@ def run(cfg=None) -> dict:
             "question": "Does preserving M1 propagation plus N/V deviation improve overall results?",
             "mix_alpha": ALPHA, "code_version": CODE_VERSION}
     graph = m3.build_arm_graph(prepared, cfg, spec)
-    old_curve, old_reference = _original_curve(
+    old_curve, old_reference = _original_curves(
         cfg, graph["beta"]
     )  # Fail before training if reference mismatches.
     graph["adjacency"], operator_audit = _mixed_adjacency(prepared, graph["weights"])
@@ -147,7 +149,7 @@ def run(cfg=None) -> dict:
             raise RuntimeError("기존 arm 결과의 코드·강도가 다릅니다. 별도 결과 경로를 사용하세요")
     old_stages = m3.clear_stale_progress(prepared)
     arm = m3._run_arm(prepared, cfg, spec, graph, 43)
-    curve = pd.concat([m3.curve_table([arm], baselines), old_curve], ignore_index=True)
+    curve = pd.concat([m3.curve_table([arm], {}), old_curve], ignore_index=True)
     if curve.duplicated(["model_id", "seed", "epoch"]).any():
         raise RuntimeError("비교 곡선에 중복 모형·시드·epoch가 있습니다")
     comparison = _comparison(curve)
@@ -177,7 +179,7 @@ def run(cfg=None) -> dict:
         "code_version": CODE_VERSION, "config": asdict(cfg), "alpha": ALPHA,
         "source_revision": prepared["revision"], "input_hash": prepared["input_hash"],
         "graph_audit": graph["audit"], "operator_audit": operator_audit,
-        "old_m3_reference": old_reference,
+        "old_m1_m3_reference": old_reference,
         "dropped_stale_progress": old_stages, "reading": reading,
         "result_paths": {name: str(path) for name, path in paths.items()},
     })
