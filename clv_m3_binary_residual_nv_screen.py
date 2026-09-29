@@ -35,12 +35,13 @@ def configure(**overrides):
     return cfg
 
 
-def _original_curve(cfg, beta: float) -> pd.DataFrame:
+def _original_curve(cfg, beta: float) -> tuple[pd.DataFrame, dict]:
     root = Path(v3.default_out_dir("dunnhumby") + "_clv_m3_centered_value_graph_v1")
     matches = sorted(root.glob("clv_m3_centered_value_graph_*.json"))
     if len(matches) != 1:
         raise RuntimeError(f"기존 N/V M3 전체 결과 JSON을 한 개 찾지 못했습니다: {root}")
-    old = json.loads(matches[0].read_text(encoding="utf-8"))
+    raw = matches[0].read_bytes()
+    old = json.loads(raw)
     fixed = ("epochs", "eval_every", "batch_size", "lr", "n_layers", "id_dim",
              "pref_reg", "negative_count", "target_cv")
     if any(old["config"][key] != getattr(cfg, key) for key in fixed):
@@ -54,7 +55,9 @@ def _original_curve(cfg, beta: float) -> pd.DataFrame:
     curve = curve[curve.model_id.eq(m3.ARM_VALUE_ACTIVITY) & curve.seed.eq(43)].copy()
     if set(CHECKPOINT_EPOCHS) - set(curve.epoch):
         raise RuntimeError("기존 M3의 100·300 epoch 결과가 없습니다")
-    return curve
+    return curve, {"path": str(matches[0]), "sha256": hashlib.sha256(raw).hexdigest(),
+                   "code_version": old["code_version"],
+                   "source_revision": old["source_revision"]}
 
 
 def _mixed_adjacency(prepared: dict, weights: np.ndarray) -> tuple[torch.Tensor, dict]:
@@ -131,7 +134,9 @@ def run(cfg=None) -> dict:
             "question": "Does preserving M1 propagation plus N/V deviation improve overall results?",
             "mix_alpha": ALPHA, "code_version": CODE_VERSION}
     graph = m3.build_arm_graph(prepared, cfg, spec)
-    old_curve = _original_curve(cfg, graph["beta"])  # Fail before training if reference mismatches.
+    old_curve, old_reference = _original_curve(
+        cfg, graph["beta"]
+    )  # Fail before training if reference mismatches.
     graph["adjacency"], operator_audit = _mixed_adjacency(prepared, graph["weights"])
     arm_path = m3._arm_paths(prepared, MODEL_ID, 43)["result"]
     if arm_path.exists():
@@ -165,14 +170,14 @@ def run(cfg=None) -> dict:
     stem = f"{CODE_VERSION}_{prepared['config_hash']}"
     paths = {"absolute_csv": out / f"{stem}_absolute.csv",
              "comparison_csv": out / f"{stem}_comparison.csv",
-             "json": out / f"{stem}.json"}
+             "json": out / f"{stem}.json", "arm_result": arm_path}
     io._atomic_csv(paths["absolute_csv"], curve)
     io._atomic_csv(paths["comparison_csv"], comparison)
     io._atomic_json(paths["json"], {
         "code_version": CODE_VERSION, "config": asdict(cfg), "alpha": ALPHA,
         "source_revision": prepared["revision"], "input_hash": prepared["input_hash"],
         "graph_audit": graph["audit"], "operator_audit": operator_audit,
-        "old_m3_reference": "centered N/V arm B, same seed and epoch",
+        "old_m3_reference": old_reference,
         "dropped_stale_progress": old_stages, "reading": reading,
         "result_paths": {name: str(path) for name, path in paths.items()},
     })
