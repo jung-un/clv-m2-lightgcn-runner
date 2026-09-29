@@ -342,10 +342,12 @@ def build_arm_graph(prepared: dict, cfg: CenteredGraphConfig, spec: dict) -> dic
 def _build_model(prepared: dict, cfg: CenteredGraphConfig, graph: dict, seed: int):
     data = prepared["data"]
     v3.set_seed(seed)
-    adjacency = v3.build_adj(
-        prepared["signals"]["edge_users"], prepared["signals"]["edge_items"],
-        graph["weights"].astype(np.float32), data["n_users"], data["n_items"],
-    )
+    adjacency = graph.get("adjacency")
+    if adjacency is None:
+        adjacency = v3.build_adj(
+            prepared["signals"]["edge_users"], prepared["signals"]["edge_items"],
+            graph["weights"].astype(np.float32), data["n_users"], data["n_items"],
+        )
     model = M5NConditionedValueBasisLightGCN(
         n_users=data["n_users"], n_items=data["n_items"],
         user_q_n=prepared["q_n"], user_q_v=prepared["q_v"], user_q_c=prepared["q_c"],
@@ -473,7 +475,7 @@ def _run_arm(prepared: dict, cfg: CenteredGraphConfig, spec: dict, graph: dict,
     store = ProgressStore(
         prepared["out_dir"] / "progress" / prepared["config_hash"],
         RunIdentity(
-            stage="centered_graph_dev", model_id=spec["model_id"], seed=seed,
+            stage=spec.get("stage", "centered_graph_dev"), model_id=spec["model_id"], seed=seed,
             config_hash=prepared["config_hash"], source_revision=prepared["revision"],
             input_hash=prepared["input_hash"],
         ),
@@ -481,9 +483,11 @@ def _run_arm(prepared: dict, cfg: CenteredGraphConfig, spec: dict, graph: dict,
     curve = capacity._train_curve(model, prepared, cfg, spec, seed, store)
     payload = {
         **{key: spec[key] for key in ("model_id", "arm", "gamma", "question")},
+        **({"mix_alpha": spec["mix_alpha"]} if "mix_alpha" in spec else {}),
         "seed": seed, "beta": graph["beta"], "edge_audit": graph["audit"],
         "id_dim": cfg.id_dim, "pref_reg": cfg.pref_reg,
-        "code_version": CODE_VERSION, "source_revision": prepared["revision"],
+        "code_version": spec.get("code_version", CODE_VERSION),
+        "source_revision": prepared["revision"],
         "evaluated_at": datetime.now(timezone.utc).isoformat(), "curve": curve,
     }
     test10._atomic_json(paths["result"], payload)
