@@ -187,6 +187,7 @@ def run(cfg, prep):
         origin=a['origin'], seed=43, selected_epoch=a['selected_epoch'],
         stopped_epoch=a['stopped_epoch'], **a['metrics']) for a in all_arms])
     comparisons = []
+    same_epoch = []
     for reference in anchors:
         for metric, value in arm['metrics'].items():
             old = reference['metrics'][metric]
@@ -194,6 +195,16 @@ def run(cfg, prep):
                 metric=metric, value=value, reference_value=old, delta=value-old,
                 relative_change_pct=100*(value/old-1) if old else np.nan,
                 model_epoch=arm['selected_epoch'], reference_epoch=reference['selected_epoch']))
+        reference_curve = {r['epoch']: r['metrics'] for r in reference['curve']}
+        for record in arm['curve']:
+            epoch = record['epoch']
+            if epoch not in reference_curve:
+                continue
+            for metric, value in record['metrics'].items():
+                old = reference_curve[epoch][metric]
+                same_epoch.append(dict(model_id=MODEL_ID, reference=reference['model_id'],
+                    epoch=epoch, metric=metric, value=value, reference_value=old,
+                    delta=value-old, relative_change_pct=100*(value/old-1) if old else np.nan))
     curve = pd.DataFrame([dict(model_id=a['model_id'], origin=a['origin'], epoch=r['epoch'],
         **r['metrics']) for a in all_arms for r in a['curve']])
     diagnostics = pd.DataFrame([dict(epoch=r['epoch'], **r['diagnostics'])
@@ -207,6 +218,7 @@ def run(cfg, prep):
                                       for k in PRIMARY))
     paths, out = {}, Path(cfg.out_dir)/'reports'
     for name, frame in (('absolute', absolute), ('comparison', pd.DataFrame(comparisons)),
+                        ('same_epoch_comparison', pd.DataFrame(same_epoch)),
                         ('curve', curve), ('diagnostics', diagnostics)):
         paths[name] = str(out/f'{name}.csv')
         m2.base.capacity.test10._atomic_csv(Path(paths[name]), frame)
@@ -221,6 +233,7 @@ def run(cfg, prep):
         reference_reports=dict(m2=prep['m2_report'], m2_sha256=M2_REPORT_SHA,
                                m3=prep['m3_report'], m3_sha256=M3_REPORT_SHA),
         m3_selection_note='retrospective replay of an older fixed-epoch curve; not original M3 preregistration',
+        same_epoch_note='observed common epochs only; no interpolation or further baseline fitting',
         m1_cross_run_mismatches=prep['m1_mismatch'],
         m3_audit_cross_run_mismatches=prep['m3_audit_mismatch'],
         reading=reading, arms=all_arms, final_test=False, holdout=False, paths=paths,
