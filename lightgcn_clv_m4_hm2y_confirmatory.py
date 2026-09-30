@@ -41,9 +41,10 @@ TEST_SPLIT = "hm2y_test_2020-09-09_15"
 ECONOMIC_METRICS = screen.ECONOMIC_METRICS
 ACCURACY_METRICS = screen.ACCURACY_METRICS
 ACCURACY_GUARD = screen.ACCURACY_GUARD
-# 개발 결과를 재현하는지 확인할 때 허용하는 오차. 같은 가중치·같은 입력이면
-# 완전히 같은 수가 나와야 하므로 수치오차 수준만 허용한다.
-REPRODUCTION_TOLERANCE = 1e-9
+# 개발 결과를 재현하는지 확인할 때 허용하는 오차. 같은 가중치·같은 입력이라도
+# float32 누적 순서가 GPU·세션마다 달라 마지막 자리가 흔들린다(eps 약 1.2e-7).
+# 그래서 절대값이 아니라 상대오차로 본다. 이 값은 검증용이며 성과 판정과 무관하다.
+REPRODUCTION_RELATIVE_TOLERANCE = 1e-6
 
 
 @dataclass(frozen=True)
@@ -82,7 +83,8 @@ def preflight_summary(cfg: ConfirmatoryConfig) -> dict:
         },
         "verification_before_opening_the_test_split": (
             "every arm is re-scored on validation and must reproduce its reported "
-            f"development metrics to {REPRODUCTION_TOLERANCE}"
+            f"development metrics to a relative gap of "
+            f"{REPRODUCTION_RELATIVE_TOLERANCE}"
         ),
         "nothing_selected_afterwards": (
             "arms, seeds, metrics and conditions are fixed above; no epoch, arm or "
@@ -199,19 +201,23 @@ def verify_development_reproduction(prepared: dict, arms: dict) -> pd.DataFrame:
                     f"가진 키 예: {sorted(source)[:6]}"
                 )
         for metric in wanted:
-            gap = abs(float(rescored[metric]) - float(reported[metric]))
+            expected = float(reported[metric])
+            gap = abs(float(rescored[metric]) - expected)
             rows.append({"model_id": model_id, "metric": metric,
-                         "reported": float(reported[metric]),
-                         "rescored": float(rescored[metric]), "abs_gap": gap})
+                         "reported": expected, "rescored": float(rescored[metric]),
+                         "abs_gap": gap,
+                         "rel_gap": gap / max(abs(expected), 1e-30)})
     frame = pd.DataFrame(rows)
-    worst = frame.abs_gap.max()
-    if worst > REPRODUCTION_TOLERANCE:
-        offender = frame.loc[frame.abs_gap.idxmax()]
+    worst = frame.rel_gap.max()
+    if worst > REPRODUCTION_RELATIVE_TOLERANCE:
+        offender = frame.loc[frame.rel_gap.idxmax()]
         raise RuntimeError(
-            f"개발 결과가 재현되지 않습니다 (최대 오차 {worst:.3e}, "
-            f"{offender.model_id}/{offender.metric}). 보호분할을 열지 않습니다."
+            f"개발 결과가 재현되지 않습니다 (최대 상대오차 {worst:.3e}, "
+            f"{offender.model_id}/{offender.metric}: 보고 {offender.reported:.8f} "
+            f"vs 재채점 {offender.rescored:.8f}). 보호분할을 열지 않습니다."
         )
-    print(f"  개발 결과 재현 확인: 최대 오차 {worst:.3e}")
+    print(f"  개발 결과 재현 확인: 최대 상대오차 {worst:.3e} "
+          f"(절대 {frame.abs_gap.max():.3e})")
     return frame
 
 

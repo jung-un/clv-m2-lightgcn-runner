@@ -115,7 +115,7 @@ def test_reproduction_fails_loudly_when_the_numbers_do_not_match(monkeypatch):
     wanted = list(screen.ACCURACY_METRICS) + list(screen.ECONOMIC_METRICS)
     reported = {m: 0.01 for m in wanted}
     monkeypatch.setattr(conf, "evaluate_on",
-                        lambda *a, **k: {**reported, wanted[0]: 0.02})
+                        lambda *a, **k: {**reported, wanted[0]: 0.02})   # 2배 차이
     arms = {"models": {screen.M1_MODEL_ID: object()},
             "payloads": {screen.M1_MODEL_ID: {"metrics": reported}}}
 
@@ -125,3 +125,25 @@ def test_reproduction_fails_loudly_when_the_numbers_do_not_match(monkeypatch):
     monkeypatch.setattr(conf, "evaluate_on", lambda *a, **k: dict(reported))
     frame = conf.verify_development_reproduction({"cache": None}, arms)
     assert frame.abs_gap.max() == 0.0 and len(frame) == len(wanted)
+
+
+def test_float32_rounding_is_not_treated_as_a_mismatch(monkeypatch):
+    """Same weights on another GPU differ in the last float32 digit, not in kind."""
+
+    wanted = list(screen.ACCURACY_METRICS) + list(screen.ECONOMIC_METRICS)
+    reported = {m: 0.0149 for m in wanted}
+    rounding = {m: v + 8.96e-9 for m, v in reported.items()}      # 상대 6e-7
+    monkeypatch.setattr(conf, "evaluate_on", lambda *a, **k: rounding)
+    arms = {"models": {screen.M1_MODEL_ID: object()},
+            "payloads": {screen.M1_MODEL_ID: {"metrics": reported}}}
+
+    frame = conf.verify_development_reproduction({"cache": None}, arms)
+    assert frame.rel_gap.max() < conf.REPRODUCTION_RELATIVE_TOLERANCE
+
+    # 같은 절대오차라도 값이 작으면 상대오차가 커져 잡힌다
+    small = {m: 1e-5 for m in wanted}
+    monkeypatch.setattr(conf, "evaluate_on",
+                        lambda *a, **k: {m: v + 8.96e-9 for m, v in small.items()})
+    arms["payloads"][screen.M1_MODEL_ID]["metrics"] = small
+    with pytest.raises(RuntimeError, match="재현되지 않습니다"):
+        conf.verify_development_reproduction({"cache": None}, arms)
