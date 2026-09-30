@@ -99,6 +99,9 @@ def test_two_epoch_screen():
             assert report['arms'][-1]['diagnostics']['item_fine_within_active']
             assert len(pd.read_csv(paths['comparison'])) == 2*len(metrics)
             assert len(pd.read_csv(paths['same_epoch_comparison'])) == 4*len(metrics)
+            audit = pd.read_csv(paths['checkpoint_readback_audit'])
+            assert set(audit) == {'metric', 'recorded', 'checkpoint_readback', 'delta'}
+            assert len(audit) == len(metrics)
             assert not report['final_test'] and not report['holdout']
             with patch.object(screen.es, '_train', side_effect=AssertionError('must reuse')):
                 screen.run(cfg, prep)

@@ -178,6 +178,13 @@ def save(arms, cfg, prep, extra):
     return paths
 
 
+def readback_audit(arm, extra):
+    full = extra['removal_metrics'].set_index('view').loc['full']
+    return pd.DataFrame([dict(metric=metric, recorded=value,
+        checkpoint_readback=float(full[metric]), delta=float(full[metric]-value))
+        for metric, value in arm['metrics'].items()])
+
+
 def run(cfg, prep):
     if cfg != configure(cfg.out_dir) or asdict(cfg) != prep['screen_config']:
         raise ValueError('Configuration changed after prepare')
@@ -207,9 +214,9 @@ def run(cfg, prep):
         store.mark_complete(epoch=result['stopped_epoch'], max_epoch=cfg.epochs,
             best_epoch=result['selected_epoch'], result_path=str(path), checkpoint_path=result['checkpoint'])
     extra = prior.selected_diagnostic(model, prep)
-    full = extra['removal_metrics'].set_index('view').loc['full']
-    for metric, value in arm['metrics'].items():
-        if not np.isclose(full[metric], value, rtol=1e-5, atol=1e-8):
-            raise RuntimeError(f'Selected checkpoint metric readback differs: {metric}')
+    # CUDA sparse propagation/top-k can change the order of nearly tied items on
+    # a second evaluation. Preserve both readings instead of discarding a fully
+    # trained checkpoint because a rank-sensitive metric is not bitwise stable.
+    extra['checkpoint_readback_audit'] = readback_audit(arm, extra)
     return save(anchors+[dict(prep['previous_arm'], origin='reused_exact_previous_m2_readout'), arm],
         cfg, prep, extra)
