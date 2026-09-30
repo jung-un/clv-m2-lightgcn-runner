@@ -88,14 +88,17 @@ def test_two_epoch_screen():
         anchors = [dict(model_id='m1', seed=43, origin='synthetic', metrics=metrics,
             selected_epoch=1, stopped_epoch=2,
             curve=[dict(epoch=e, metrics=metrics) for e in (1, 2)])]
+        prep['previous_arm'] = dict(anchors[0], model_id=screen.prior.MODEL_ID,
+            identity={'input_hash': 'synthetic'})
+        prep['previous_report_sha256'] = 'synthetic'
         with patch.object(screen, 'configure', return_value=cfg), \
              patch.object(screen, 'read_source', return_value=({}, anchors)):
             paths = screen.run(cfg, prep)
             report = json.loads(Path(paths['json']).read_text())
             assert report['new_fit_count'] == 1 and report['code_version'] == screen.VERSION
             assert report['arms'][-1]['diagnostics']['item_fine_within_active']
-            assert len(pd.read_csv(paths['comparison'])) == len(metrics)
-            assert len(pd.read_csv(paths['same_epoch_comparison'])) == 2*len(metrics)
+            assert len(pd.read_csv(paths['comparison'])) == 2*len(metrics)
+            assert len(pd.read_csv(paths['same_epoch_comparison'])) == 4*len(metrics)
             assert not report['final_test'] and not report['holdout']
             with patch.object(screen.es, '_train', side_effect=AssertionError('must reuse')):
                 screen.run(cfg, prep)

@@ -1,8 +1,10 @@
 """Dunnhumby development screen: one jointly trained N/V + fine-type price M2."""
 
 from dataclasses import asdict
+import hashlib
 import json
 from pathlib import Path
+from zipfile import ZipFile
 
 import numpy as np
 import pandas as pd
@@ -26,12 +28,44 @@ def spec():
                 graph='binary', weighted=False)
 
 
-def prepare(report_path, out_dir):
+def read_previous(path, cfg, prep=None):
+    """Exact old four-axis M2 readout; never load weights or fit a control."""
+    path = Path(path)
+    payload = ZipFile(path).read('result.json') if path.suffix.lower() == '.zip' else path.read_bytes()
+    report = json.loads(payload)
+    expected = json.loads(json.dumps(asdict(cfg)))
+    ignored = {'out_dir', 'reuse_dirs'}
+    if (report['code_version'] != prior.VERSION or report['final_test'] is not False
+            or report['holdout'] is not False or report['selection'] != selection(cfg)
+            or report['feature_settings'] != prior.SETTINGS
+            or report['source_report_sha256'] != source.SOURCE_SHA
+            or {k: v for k, v in report['config'].items() if k not in ignored}
+            != {k: v for k, v in expected.items() if k not in ignored}):
+        raise ValueError('Previous four-axis M2 protocol differs; no training started')
+    matches = [a for a in report['arms'] if a['model_id'] == prior.MODEL_ID and a['seed'] == 43]
+    if len(matches) != 1:
+        raise ValueError('Exactly one completed previous M2 readout required')
+    arm = matches[0]
+    source.check_selected(arm, cfg)
+    for name in (Path(prior.__file__).name, 'clv_shared_feature_residual_m2.py'):
+        if arm['identity']['source_hashes'][name] != file_sha256(Path(__file__).with_name(name)):
+            raise ValueError(f'Previous M2 implementation changed: {name}')
+    if prep is not None:
+        old_features = {name: prep['features'][name] for name in (*prior.AXES, 'keys')}
+        if (arm['identity']['input_hash'] != prep['input_hash']
+                or report['features_sha256'] != feature_hash(old_features)
+                or report['arms'][0]['metrics'] != prep['anchors'][0]['metrics']):
+            raise ValueError('Previous M2 does not share the exact input, features or M1')
+    return arm, hashlib.sha256(payload).hexdigest()
+
+
+def prepare(report_path, previous_report_path, out_dir):
     cfg = configure(str(out_dir))
     target = Path(out_dir)/'reports/result.json'
     if target.is_file() and json.loads(target.read_text())['code_version'] != VERSION:
         raise ValueError('Output belongs to another experiment')
     read_source(report_path, cfg)
+    read_previous(previous_report_path, cfg)
     prep = base._prepare(es.strength_cfg(cfg))
     d, axes = prep['data'], prep['axes']
     if prep['base_cfg']['DATASET'] != 'dunnhumby':
@@ -45,9 +79,10 @@ def prepare(report_path, out_dir):
         feature_settings=json.loads(json.dumps(SETTINGS)), screen_config=asdict(cfg),
         source_report=str(report_path), source_report_sha256=source.SOURCE_SHA)
     _, prep['anchors'] = read_source(report_path, cfg, prep)
+    prep['previous_arm'], prep['previous_report_sha256'] = read_previous(previous_report_path, cfg, prep)
     prior.removal.shared.movement._verify_new_item_truth(prep)
     base.capacity.test10._atomic_json(Path(out_dir)/'feature_diagnostic.json', features['diagnostics'])
-    print('학습 전 확인 완료: 기존 M1 재사용, 새 M2 한 arm만 학습.', flush=True)
+    print('학습 전 확인 완료: 기존 M1·4축 M2 readout 재사용, 새 M2 한 arm만 학습.', flush=True)
     print('사용자 N/V와 상품 가격의 세 좌표를 같은 layer0·plain BPR로 공동학습.', flush=True)
     print('세부 유형은 원시 유형 ID가 아니라 유형 내 가격 백분위에만 사용.', flush=True)
     print(json.dumps(features['diagnostics'][FINE_AXIS], ensure_ascii=False, indent=2), flush=True)
@@ -83,28 +118,30 @@ def diagnose(model, prep, cfg, arm, epoch):
 def identity(prep, cfg):
     ident = prior.identity(prep, cfg)
     ident.update(version=VERSION, feature_settings=SETTINGS,
-        features_sha256=prep['features_sha256'])
+        features_sha256=prep['features_sha256'],
+        previous_report_sha256=prep['previous_report_sha256'])
     for name in (Path(__file__).name, 'clv_m2_fine_price.py'):
         ident['source_hashes'][name] = file_sha256(Path(__file__).with_name(name))
     return json.loads(json.dumps(ident))
 
 
 def save(arms, cfg, prep, extra):
-    m1, m2 = arms
-    ref_curve = {r['epoch']: r['metrics'] for r in m1['curve']}
+    m1, old, m2 = arms
     rows = []
-    for epoch, values, reference in [(None, m2['metrics'], m1['metrics'])]+[
-        (r['epoch'], r['metrics'], ref_curve[r['epoch']])
-        for r in m2['curve'] if r['epoch'] in ref_curve]:
-        if values.keys() != reference.keys():
-            raise ValueError('Metric sets differ from matched M1')
-        for metric, value in values.items():
-            rows.append(dict(seed=43, model_id=MODEL_ID, reference='m1', epoch=epoch,
-                comparison='independently_selected' if epoch is None else 'same_epoch',
-                selected_epoch=m2['selected_epoch'], reference_selected_epoch=m1['selected_epoch'],
-                metric=metric, value=value, reference_value=reference[metric],
-                delta=value-reference[metric],
-                relative_change_pct=100*(value/reference[metric]-1) if reference[metric] else np.nan))
+    for reference_arm in (m1, old):
+        ref_curve = {r['epoch']: r['metrics'] for r in reference_arm['curve']}
+        for epoch, values, reference in [(None, m2['metrics'], reference_arm['metrics'])]+[
+            (r['epoch'], r['metrics'], ref_curve[r['epoch']])
+            for r in m2['curve'] if r['epoch'] in ref_curve]:
+            if values.keys() != reference.keys():
+                raise ValueError('Metric sets differ from matched reference')
+            for metric, value in values.items():
+                rows.append(dict(seed=43, model_id=MODEL_ID, reference=reference_arm['model_id'], epoch=epoch,
+                    comparison='independently_selected' if epoch is None else 'same_epoch',
+                    selected_epoch=m2['selected_epoch'], reference_selected_epoch=reference_arm['selected_epoch'],
+                    metric=metric, value=value, reference_value=reference[metric],
+                    delta=value-reference[metric],
+                    relative_change_pct=100*(value/reference[metric]-1) if reference[metric] else np.nan))
     comparison = pd.DataFrame(rows)
     frames = dict(absolute=pd.DataFrame([dict(seed=43, model_id=a['model_id'], origin=a['origin'],
         selected_epoch=a['selected_epoch'], stopped_epoch=a['stopped_epoch'], **a['metrics']) for a in arms]),
@@ -116,7 +153,9 @@ def save(arms, cfg, prep, extra):
             for r in m2['training']['history'] if 'diagnostics' in r]), **extra)
     reading = dict(complete=True, significance_claim=False,
         accuracy_guard_vs_m1=all(m2['metrics'][k] >= .99*m1['metrics'][k] for k in base.ACCURACY),
-        both_economic_at10_above_m1=all(m2['metrics'][k] > m1['metrics'][k] for k in es.fixed.PRIMARY))
+        both_economic_at10_above_m1=all(m2['metrics'][k] > m1['metrics'][k] for k in es.fixed.PRIMARY),
+        both_economic_at10_above_previous_m2=all(
+            m2['metrics'][k] > old['metrics'][k] for k in es.fixed.PRIMARY))
     paths, root = {}, Path(cfg.out_dir)/'reports'
     for name, frame in frames.items():
         paths[name] = str(root/f'{name}.csv')
@@ -132,6 +171,7 @@ def save(arms, cfg, prep, extra):
         task='new-to-user; train pairs excluded; MIN_ITEM_INTER=1; binary graph; uniform K=1; plain BPR',
         split='historical_development_days_684_690', final_test=False, holdout=False,
         reading=reading, arms=arms, source_report=prep['source_report'], source_report_sha256=source.SOURCE_SHA,
+        previous_report_sha256=prep['previous_report_sha256'],
         limits='one repeatedly exposed development seed; no significance/generalization/CLV attribution',
         diagnostic_note='selected-checkpoint axis removal is inference-only; not retrained causal ablation or matched M1',
         paths=paths))
@@ -144,6 +184,8 @@ def run(cfg, prep):
     if prep['feature_settings'] != SETTINGS or feature_hash(prep['features']) != prep['features_sha256']:
         raise ValueError('Prepared features/settings changed')
     _, anchors = read_source(prep['source_report'], cfg, prep)
+    if prep['previous_arm']['identity']['input_hash'] != prep['input_hash']:
+        raise ValueError('Previous M2 input changed')
     ident = identity(prep, cfg)
     key = base._digest(ident)
     root = Path(cfg.out_dir)/'arms'/key
@@ -169,4 +211,5 @@ def run(cfg, prep):
     for metric, value in arm['metrics'].items():
         if not np.isclose(full[metric], value, rtol=1e-5, atol=1e-8):
             raise RuntimeError(f'Selected checkpoint metric readback differs: {metric}')
-    return save(anchors+[arm], cfg, prep, extra)
+    return save(anchors+[dict(prep['previous_arm'], origin='reused_exact_previous_m2_readout'), arm],
+        cfg, prep, extra)
