@@ -31,6 +31,7 @@ import lightgcn_clv_axis_specific_test10 as test10
 import lightgcn_clv_m4_k1_assignment_control_hm2y as screen
 import lightgcn_clv_m5_economic_positive_weight as legacy
 import lightgcn_clv_m5_k1_m4_improvement_screen as training
+import lightgcn_clv_moe as moe
 import lightgcn_clv_v3 as v3
 
 
@@ -163,15 +164,18 @@ def load_finished_arms(seed: int, cfg: ConfirmatoryConfig) -> tuple[dict, dict]:
 
 @torch.no_grad()
 def evaluate_on(model, prepared: dict, cache) -> dict:
-    """Score one model on one evaluation cache with the development settings."""
+    """Score one model on one evaluation cache with the development settings.
 
-    data, base = prepared["data"], prepared["base_cfg"]
-    gate = torch.ones(data["n_users"], dtype=torch.float32, device=v3.DEVICE)
-    result = v3.evaluate(
-        model, 0.0, gate, cache, prepared["meta"], base["K_LIST"],
-        data["csr_ptr"], data["csr_items"], base, per_user=False,
+    Goes through the same flattening the development runner used, so the keys
+    here are the reported ones (`recall@10`) rather than the nested per-cut-off
+    structure `v3.evaluate` returns.
+    """
+
+    flat, _ = moe._flat_evaluation(
+        model, 0.0, cache, prepared["meta"], prepared["data"],
+        prepared["base_cfg"], per_user=False,
     )
-    return test10._public_metrics(result)
+    return test10._public_metrics(flat)
 
 
 def verify_development_reproduction(prepared: dict, arms: dict) -> pd.DataFrame:
@@ -183,10 +187,18 @@ def verify_development_reproduction(prepared: dict, arms: dict) -> pd.DataFrame:
     """
 
     rows = []
+    wanted = list(ACCURACY_METRICS) + list(ECONOMIC_METRICS)
     for model_id, model in arms["models"].items():
         reported = arms["payloads"][model_id]["metrics"]
         rescored = evaluate_on(model, prepared, prepared["cache"])
-        for metric in list(ACCURACY_METRICS) + list(ECONOMIC_METRICS):
+        for name, source in (("재채점", rescored), ("보고된 개발", reported)):
+            missing = [m for m in wanted if m not in source]
+            if missing:
+                raise RuntimeError(
+                    f"{model_id}의 {name} 지표에 {missing}가 없습니다. "
+                    f"가진 키 예: {sorted(source)[:6]}"
+                )
+        for metric in wanted:
             gap = abs(float(rescored[metric]) - float(reported[metric]))
             rows.append({"model_id": model_id, "metric": metric,
                          "reported": float(reported[metric]),

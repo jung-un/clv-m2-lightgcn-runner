@@ -95,3 +95,33 @@ def test_the_arm_folder_is_found_not_recomputed(tmp_path):
     (other / f"{screen.M1_MODEL_ID}_s43.json").write_text("{}")
     with pytest.raises(RuntimeError, match="2개"):
         conf.discover_arm_hash(str(tmp_path), 43)
+
+
+def test_a_metric_shape_mismatch_is_named_not_a_bare_key_error(monkeypatch):
+    """v3.evaluate returns nested per-cut-off results; the flat keys are required."""
+
+    nested = {"overall": {10: {"recall": 0.01}}, "seg": {}}      # 평탄화 전 형태
+    monkeypatch.setattr(conf, "evaluate_on", lambda *a, **k: nested)
+    arms = {"models": {screen.M1_MODEL_ID: object()},
+            "payloads": {screen.M1_MODEL_ID: {"metrics": {
+                m: 0.01 for m in list(screen.ACCURACY_METRICS)
+                + list(screen.ECONOMIC_METRICS)}}}}
+
+    with pytest.raises(RuntimeError, match="재채점 지표에"):
+        conf.verify_development_reproduction({"cache": None}, arms)
+
+
+def test_reproduction_fails_loudly_when_the_numbers_do_not_match(monkeypatch):
+    wanted = list(screen.ACCURACY_METRICS) + list(screen.ECONOMIC_METRICS)
+    reported = {m: 0.01 for m in wanted}
+    monkeypatch.setattr(conf, "evaluate_on",
+                        lambda *a, **k: {**reported, wanted[0]: 0.02})
+    arms = {"models": {screen.M1_MODEL_ID: object()},
+            "payloads": {screen.M1_MODEL_ID: {"metrics": reported}}}
+
+    with pytest.raises(RuntimeError, match="재현되지 않습니다"):
+        conf.verify_development_reproduction({"cache": None}, arms)
+
+    monkeypatch.setattr(conf, "evaluate_on", lambda *a, **k: dict(reported))
+    frame = conf.verify_development_reproduction({"cache": None}, arms)
+    assert frame.abs_gap.max() == 0.0 and len(frame) == len(wanted)
