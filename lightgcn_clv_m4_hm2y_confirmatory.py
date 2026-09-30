@@ -99,6 +99,30 @@ def preflight_summary(cfg: ConfirmatoryConfig) -> dict:
 # --------------------------------------------------------------------------
 
 
+def discover_arm_hash(dev_out_dir: str, seed: int) -> str:
+    """Find the folder the finished arms actually sit in.
+
+    The development config hash includes the source revision, so recomputing it
+    here - from a later commit that carries this runner - points at a folder that
+    was never written. The arms are located by their file names instead, and all
+    three must live in the same folder for the seed to be usable.
+    """
+
+    root = Path(dev_out_dir) / "arms"
+    folders = set()
+    for model_id in screen.MODEL_IDS:
+        found = sorted(root.glob(f"*/{model_id}_s{seed}.json"))
+        if len(found) != 1:
+            raise RuntimeError(
+                f"seed {seed} {model_id}의 결과 파일이 {len(found)}개입니다 "
+                f"({[str(f) for f in found]}). 이 실행은 학습하지 않습니다."
+            )
+        folders.add(found[0].parent.name)
+    if len(folders) != 1:
+        raise RuntimeError(f"seed {seed}의 arm이 서로 다른 폴더에 있습니다: {sorted(folders)}")
+    return folders.pop()
+
+
 def _arm_config(seed: int, dev_out_dir: str):
     return screen.configure_hm2y_m4_assignment_screen(
         seed=seed, shuffle_seed=seed, out_dir=dev_out_dir
@@ -114,6 +138,10 @@ def load_finished_arms(seed: int, cfg: ConfirmatoryConfig) -> tuple[dict, dict]:
 
     arm_cfg = _arm_config(seed, cfg.dev_out_dir)
     prepared = screen._prepare(arm_cfg)
+    recomputed = prepared["config_hash"]
+    prepared["config_hash"] = discover_arm_hash(cfg.dev_out_dir, seed)
+    print(f"  arm 폴더 {prepared['config_hash']} (이 커밋에서 다시 계산하면 {recomputed} — "
+          f"설정 해시에 소스 커밋이 들어가므로 다릅니다)")
     models: dict[str, object] = {}
     payloads: dict[str, dict] = {}
     for spec in screen.arm_specifications(prepared):

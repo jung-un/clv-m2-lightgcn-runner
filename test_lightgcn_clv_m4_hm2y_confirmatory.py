@@ -75,3 +75,23 @@ def test_the_reading_never_claims_significance_or_post_hoc_selection():
     assert reading["significance_claimed"] is False
     assert reading["selected_after_seeing"] is False
     assert reading["split"] == conf.TEST_SPLIT
+
+
+def test_the_arm_folder_is_found_not_recomputed(tmp_path):
+    """The development hash includes the source revision, so it cannot be recomputed."""
+
+    root = tmp_path / "arms" / "7218001fef1d"
+    root.mkdir(parents=True)
+    for model_id in screen.MODEL_IDS:
+        (root / f"{model_id}_s43.json").write_text("{}")
+        (root / f"{model_id}_s43.pt").write_bytes(b"x")
+    assert conf.discover_arm_hash(str(tmp_path), 43) == "7218001fef1d"
+
+    with pytest.raises(RuntimeError, match="결과 파일이 0개"):
+        conf.discover_arm_hash(str(tmp_path), 42)
+
+    other = tmp_path / "arms" / "429a3169f0d7"
+    other.mkdir(parents=True)
+    (other / f"{screen.M1_MODEL_ID}_s43.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="2개"):
+        conf.discover_arm_hash(str(tmp_path), 43)
