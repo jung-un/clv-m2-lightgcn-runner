@@ -347,9 +347,13 @@ def run_label(spec: dict, seed: int) -> str:
 
 def _train_curve(
     model, prepared: dict, cfg: CapacitySearchConfig, spec: dict, seed: int,
-    store: ProgressStore,
+    store: ProgressStore, row_weights: np.ndarray | None = None,
 ) -> list[dict]:
-    """Train to cfg.epochs, recording development metrics along the way."""
+    """Train to cfg.epochs, recording development metrics along the way.
+
+    ``row_weights`` (one positive weight per train row, mean 1) turns the plain
+    BPR into the M4 weighted BPR; None keeps every earlier caller unchanged.
+    """
 
     data = prepared["data"]
     tr_u, tr_i, positive_keys = data["tr_u"], data["tr_i"], data["pos_key"]
@@ -380,7 +384,10 @@ def _train_curve(
             users = torch.as_tensor(users_np, dtype=torch.long, device=v3.DEVICE)
             positives = torch.as_tensor(positives_np, dtype=torch.long, device=v3.DEVICE)
             negatives = torch.as_tensor(negatives_np, dtype=torch.long, device=v3.DEVICE)
-            loss, _, correct = recheck._batch_loss(model, users, positives, negatives, None)
+            batch_weights = None if row_weights is None else torch.as_tensor(
+                row_weights[index], dtype=torch.float32, device=v3.DEVICE)
+            loss, _, correct = recheck._batch_loss(model, users, positives, negatives,
+                                                   batch_weights)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()

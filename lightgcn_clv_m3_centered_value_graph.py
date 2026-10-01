@@ -480,7 +480,8 @@ def _run_arm(prepared: dict, cfg: CenteredGraphConfig, spec: dict, graph: dict,
             input_hash=prepared["input_hash"],
         ),
     )
-    curve = capacity._train_curve(model, prepared, cfg, spec, seed, store)
+    curve = capacity._train_curve(model, prepared, cfg, spec, seed, store,
+                                  row_weights=graph.get("row_weights"))
     payload = {
         **{key: spec[key] for key in ("model_id", "arm", "gamma", "question")},
         **({"mix_alpha": spec["mix_alpha"]} if "mix_alpha" in spec else {}),
