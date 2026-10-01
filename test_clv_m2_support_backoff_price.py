@@ -11,6 +11,7 @@ import pandas as pd
 import torch
 
 import clv_m2_support_backoff_price_screen as screen
+import clv_m2_support_backoff_price as support_model
 from clv_m2_support_backoff_price import (
     PRICE_AXIS,
     SupportBackoffPriceLightGCN,
@@ -37,6 +38,22 @@ def test_support_backoff_price_prefers_fine_and_shrinks_sparse_items():
     assert abs(values[0] - .5) < abs(values[2] - .5)  # Sparse support shrinks more.
     assert values[3] == .45 and source.tolist() == ['fine', 'fine', 'fine', 'coarse']
     assert valid.all()
+
+
+def test_reliability_gate_zeroes_unsupported_price_after_basis_transform():
+    transform = getattr(support_model, 'reliability_gated_centered_basis', None)
+    assert transform is not None, 'post-basis reliability gate is missing'
+    feature, info = transform(
+        values=np.array([.2, .5, .8, .9]),
+        valid=np.array([True, True, True, False]),
+        reliability=np.array([0., .5, 1., 0.]),
+        bandwidth=.25,
+    )
+    np.testing.assert_array_equal(feature[0], np.zeros(3))
+    np.testing.assert_array_equal(feature[3], np.zeros(3))
+    np.testing.assert_allclose(feature.sum(axis=0), np.zeros(3), atol=1e-7)
+    assert info['zero_reliability_count'] == 1
+    assert info['reliability_gate_after_basis'] is True
 
 
 def test_support_backoff_model_keeps_n_and_v_in_plain_bpr():
