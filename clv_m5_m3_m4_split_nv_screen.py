@@ -1,4 +1,4 @@
-"""M5 = M3 two-axis graph + M4 loss, two loss variants, Dunnhumby dev seed 43.
+"""M5 = M3 two-axis graph + M4 loss, two loss variants, Dunnhumby dev split, one seed.
 
 Both arms keep the confirmed M3 two-axis graph (V and N edge axes) unchanged
 and differ only in the BPR row weight:
@@ -27,12 +27,13 @@ import pandas as pd
 import lightgcn_clv_m3_centered_value_graph as m3
 import lightgcn_clv_v3 as v3
 import lightgcn_clv_axis_specific_test10 as io
-from clv_m3_binary_residual_nv_screen import _original_curves
 
 
 CODE_VERSION = "clv-m5-m3-m4-split-nv-dev-v1"
 LAMBDA = 0.5
-SEED = 43
+# 43 = first screen (2026-10-01); 44 = repeat on a seed the M5 design never saw.
+# Both have finished M1 and M3 (two-axis) curves in the 3-seed M3 result.
+ALLOWED_SEEDS = (43, 44)
 FIXED_EPOCH = 300
 DIAGNOSTIC_EPOCH = 100
 ARM_A = "m5_m3nv_graph_original_m4_bpr_k1"
@@ -45,13 +46,40 @@ ECONOMIC = ("price_purchase_amount_weighted_hit@10", "vndcg@10")
 ACCURACY = tuple(f"{m}@{k}" for m in ("recall", "ndcg") for k in (10, 20, 50))
 
 
-def configure(**overrides):
-    defaults = {"seeds": (SEED,), "epochs": FIXED_EPOCH, "eval_every": 25,
-                "out_dir": f"{v3.default_out_dir('dunnhumby')}_clv_m5_m3_m4_split_nv_s43_v1"}
+def configure(seed: int = 43, **overrides):
+    defaults = {"seeds": (seed,), "epochs": FIXED_EPOCH, "eval_every": 25,
+                "out_dir": f"{v3.default_out_dir('dunnhumby')}_clv_m5_m3_m4_split_nv_s{seed}_v1"}
     cfg = m3.configure_centered_graph(**(defaults | overrides))
-    if cfg.seeds != (SEED,) or cfg.epochs != FIXED_EPOCH or cfg.allow_baseline_training:
-        raise ValueError("이번 스크린은 seed 43·300 epoch·M1/M3 재사용만 허용합니다")
+    if (len(cfg.seeds) != 1 or cfg.seeds[0] not in ALLOWED_SEEDS
+            or cfg.epochs != FIXED_EPOCH or cfg.allow_baseline_training):
+        raise ValueError(f"한 시드({ALLOWED_SEEDS})·300 epoch·M1/M3 재사용만 허용합니다")
     return cfg
+
+
+def _original_curves(cfg, beta: float) -> tuple[pd.DataFrame, dict]:
+    """M1 and M3 (two-axis) curves of this seed from the finished 3-seed M3 run."""
+    seed = cfg.seeds[0]
+    root = Path(v3.default_out_dir("dunnhumby") + "_clv_m3_centered_value_graph_v1")
+    matches = sorted(root.glob("clv_m3_centered_value_graph_*.json"))
+    if len(matches) != 1:
+        raise RuntimeError(f"기존 M3 전체 결과 JSON을 한 개 찾지 못했습니다: {root}")
+    raw = matches[0].read_bytes()
+    old = json.loads(raw)
+    fixed = ("epochs", "eval_every", "batch_size", "lr", "n_layers", "id_dim",
+             "pref_reg", "negative_count", "target_cv")
+    if any(old["config"][key] != getattr(cfg, key) for key in fixed):
+        raise RuntimeError("기존 M3와 새 실험의 학습 설정이 달라 비교할 수 없습니다")
+    if not np.isclose(beta, old["betas"][m3.ARM_VALUE_ACTIVITY], rtol=0, atol=1e-6):
+        raise RuntimeError("N/V 엣지 입력이 기존 M3와 다릅니다")
+    curve = pd.DataFrame(old["curve"])
+    curve = curve[curve.model_id.isin((m3.M1_MODEL_ID, m3.ARM_VALUE_ACTIVITY))
+                  & curve.seed.eq(seed)].copy()
+    for model_id in (m3.M1_MODEL_ID, m3.ARM_VALUE_ACTIVITY):
+        if {DIAGNOSTIC_EPOCH, FIXED_EPOCH} - set(curve.loc[curve.model_id.eq(model_id), "epoch"]):
+            raise RuntimeError(f"기존 {model_id} seed {seed}의 100·300 epoch 결과가 없습니다")
+    return curve, {"path": str(matches[0]), "sha256": hashlib.sha256(raw).hexdigest(),
+                   "code_version": old["code_version"],
+                   "source_revision": old["source_revision"]}
 
 
 def raw_row_weights(q_c, q_n, q_v, item_term, valid, variant: str) -> np.ndarray:
@@ -121,7 +149,7 @@ def self_test() -> None:
     assert np.allclose(cheap[:2], [1.45, 1.45])
 
 
-def _comparison(curve: pd.DataFrame) -> pd.DataFrame:
+def _comparison(curve: pd.DataFrame, seed: int) -> pd.DataFrame:
     index = curve.set_index(["model_id", "seed", "epoch"])
     metrics = [c for c in curve.columns if "@" in c
                or c == "user_value_tendency_recommended_price_alignment"]
@@ -130,10 +158,10 @@ def _comparison(curve: pd.DataFrame) -> pd.DataFrame:
              (ARM_B, m3.M1_MODEL_ID), (ARM_B, m3.ARM_VALUE_ACTIVITY), (ARM_B, ARM_A)]
     for epoch in (DIAGNOSTIC_EPOCH, FIXED_EPOCH):
         for model_id, reference in pairs:
-            left, right = index.loc[(model_id, SEED, epoch)], index.loc[(reference, SEED, epoch)]
+            left, right = index.loc[(model_id, seed, epoch)], index.loc[(reference, seed, epoch)]
             for metric in metrics:
                 base, value = float(right[metric]), float(left[metric])
-                rows.append({"seed": SEED, "epoch": epoch, "model_id": model_id,
+                rows.append({"seed": seed, "epoch": epoch, "model_id": model_id,
                              "reference": reference, "metric": metric,
                              "reference_value": base, "candidate_value": value,
                              "delta": value - base,
@@ -159,7 +187,8 @@ def reading(comparison: pd.DataFrame) -> dict:
 
 
 def run(cfg=None) -> dict:
-    cfg = configure() if cfg is None else configure(**asdict(cfg))
+    cfg = configure() if cfg is None else configure(cfg.seeds[0], **asdict(cfg))
+    seed = cfg.seeds[0]
     prepared = m3._prepare(cfg)
     prepared["config_hash"] = hashlib.sha256(
         f"{CODE_VERSION}:{LAMBDA}:{prepared['config_hash']}".encode()).hexdigest()[:12]
@@ -177,13 +206,13 @@ def run(cfg=None) -> dict:
         spec = {"model_id": model_id, "arm": "value_and_activity", "gamma": 1.0,
                 "question": f"M3 two-axis graph + {loss}: above M1, not below M3?",
                 "code_version": CODE_VERSION, "stage": "m5_m3_m4_dev"}
-        print(f"\n===== {model_id} | seed {SEED} | {cfg.epochs} epoch =====", flush=True)
+        print(f"\n===== {model_id} | seed {seed} | {cfg.epochs} epoch =====", flush=True)
         arms.append(m3._run_arm(prepared, cfg, spec,
-                                {**graph, "row_weights": weights[model_id]}, SEED))
+                                {**graph, "row_weights": weights[model_id]}, seed))
     curve = pd.concat([m3.curve_table(arms, {}), old_curve], ignore_index=True)
     if curve.duplicated(["model_id", "seed", "epoch"]).any():
         raise RuntimeError("비교 곡선에 중복 모형·시드·epoch가 있습니다")
-    comparison = _comparison(curve)
+    comparison = _comparison(curve, seed)
     result_reading = reading(comparison)
     out = Path(cfg.out_dir)
     stem = f"{CODE_VERSION}_{prepared['config_hash']}"
@@ -193,7 +222,7 @@ def run(cfg=None) -> dict:
     io._atomic_csv(paths["absolute_csv"], curve)
     io._atomic_csv(paths["comparison_csv"], comparison)
     io._atomic_json(paths["json"], {
-        "code_version": CODE_VERSION, "config": asdict(cfg), "lambda": LAMBDA,
+        "code_version": CODE_VERSION, "config": asdict(cfg), "seed": seed, "lambda": LAMBDA,
         "source_revision": prepared["revision"], "input_hash": prepared["input_hash"],
         "split": "historical_development_days_684_690", "final_test": False, "holdout": False,
         "beta": graph["beta"], "graph_audit": graph["audit"], "weight_audit": weight_audit,
