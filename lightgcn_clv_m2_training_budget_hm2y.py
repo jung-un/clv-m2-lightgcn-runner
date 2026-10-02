@@ -216,7 +216,13 @@ def _score_share(model, prepared: dict) -> dict:
     return result
 
 
-def _train_curve(model, prepared, cfg, spec, store) -> list[dict]:
+def _train_curve(model, prepared, cfg, spec, store, row_weights=None,
+                 stop_epoch=None) -> list[dict]:
+    """Train toward cfg.epochs; stop_epoch pauses earlier with resumable state.
+
+    row_weights (one positive weight per train row, mean 1) turns plain BPR into
+    the M4 weighted BPR; None keeps every earlier caller unchanged.
+    """
     data = prepared["data"]
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     rng = np.random.default_rng(cfg.seed)
@@ -229,7 +235,7 @@ def _train_curve(model, prepared, cfg, spec, store) -> list[dict]:
     tr_u, tr_i, positive_keys = data["tr_u"], data["tr_i"], data["pos_key"]
     n_batches = math.ceil(len(tr_u) / cfg.batch_size)
     started = time.time()
-    for epoch in range(start_epoch, cfg.epochs + 1):
+    for epoch in range(start_epoch, (stop_epoch or cfg.epochs) + 1):
         model.train()
         permutation = rng.permutation(len(tr_u))
         loss_sum = correct_sum = 0.0
@@ -244,7 +250,10 @@ def _train_curve(model, prepared, cfg, spec, store) -> list[dict]:
             users = torch.as_tensor(users_np, dtype=torch.long, device=v3.DEVICE)
             positives = torch.as_tensor(positives_np, dtype=torch.long, device=v3.DEVICE)
             negatives = torch.as_tensor(negatives_np[:, None], dtype=torch.long, device=v3.DEVICE)
-            loss, _, correct = recheck._batch_loss(model, users, positives, negatives, None)
+            batch_weights = None if row_weights is None else torch.as_tensor(
+                row_weights[index], dtype=torch.float32, device=v3.DEVICE)
+            loss, _, correct = recheck._batch_loss(model, users, positives, negatives,
+                                                   batch_weights)
             optimizer.zero_grad(); loss.backward(); optimizer.step()
             loss_sum += float(loss.detach()); correct_sum += correct
             store.heartbeat(epoch=epoch, max_epoch=cfg.epochs, batch=batch + 1,
