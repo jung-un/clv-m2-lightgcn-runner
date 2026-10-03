@@ -68,16 +68,21 @@ def references(cfg) -> tuple[pd.DataFrame, dict]:
     """M1/M3 (100/200/300) from the H&M M3 run, M4 (100) from the H&M M4 run."""
     root = v3.default_out_dir("hm")
     found = {}
-    for name, suffix, pattern in (
-            ("m3", "_clv_m3_centered_value_graph_s43_v1", "clv_m3_centered_value_graph_hm2y_*.json"),
+    # Exact seed-43 result files (run hashes from the 2026-09-28 / 09-30 records);
+    # the folders also hold other seeds' results, so a glob is ambiguous.
+    for name, suffix, filename in (
+            ("m3", "_clv_m3_centered_value_graph_s43_v1",
+             "clv_m3_centered_value_graph_hm2y_93ab6203637d.json"),
             ("m4", "_m4_k1_assignment_control_hm2y_development_screen_v1",
-             "m4_k1_assignment_control_hm2y_*.json")):
-        matches = sorted(Path(root + suffix).glob(pattern))
-        if len(matches) != 1:
-            raise RuntimeError(f"{name} 기준 결과 JSON을 한 개 찾지 못했습니다: {root + suffix}")
-        raw = matches[0].read_bytes()
-        found[name] = (json.loads(raw), {"path": str(matches[0]),
+             "m4_k1_assignment_control_hm2y_7218001fef1d.json")):
+        path = Path(root + suffix) / filename
+        if not path.is_file():
+            raise RuntimeError(f"{name} 기준 결과가 없습니다: {path}")
+        raw = path.read_bytes()
+        found[name] = (json.loads(raw), {"path": str(path),
                                          "sha256": hashlib.sha256(raw).hexdigest()})
+    if found["m4"][0]["config"]["seed"] != SEED or found["m3"][0]["config"]["seed"] != SEED:
+        raise RuntimeError("기준 결과가 seed 43이 아닙니다")
     m3, m4 = found["m3"][0], found["m4"][0]
     for name, old in (("m3", m3["config"]), ("m4", m4["config"])):
         if any(old[k] != getattr(cfg, k) for k in PROTOCOL):
