@@ -38,12 +38,129 @@ FIXED_EPOCH = 300
 DIAGNOSTIC_EPOCH = 100
 ARM_A = "m5_m3nv_graph_original_m4_bpr_k1"
 ARM_B = "m5_m3nv_graph_split_nv_m4_bpr_k1"
+ARM_M4_B = "m4_binary_graph_split_nv_bpr_k1"
 # Audited original M4 lambda=.5 on this exact development train set (2026-09-25/29 records).
 ORIGINAL_M4_ROWS = 2_478_857
 ORIGINAL_M4_MEAN_RAW = 1.14168269
 ORIGINAL_M4_CV = 0.11679748
 ECONOMIC = ("price_purchase_amount_weighted_hit@10", "vndcg@10")
 ACCURACY = tuple(f"{m}@{k}" for m in ("recall", "ndcg") for k in (10, 20, 50))
+
+
+def standalone_m4_b_spec() -> dict:
+    return {
+        "model_id": ARM_M4_B,
+        "arm": "binary",
+        "gamma": 0.0,
+        "question": "Does split N/V M4 alone explain M5-B on the binary M1 graph?",
+        "code_version": "clv-m4-split-nv-standalone-dev-v1",
+        "stage": "m4_split_nv_standalone_dev",
+    }
+
+
+def binary_m4_graph(prepared: dict) -> dict:
+    """Keep M1 propagation exactly; only the BPR row weight changes."""
+    return {
+        "beta": 0.0,
+        "adjacency": prepared["data"]["adj"],
+        "audit": {"graph": "binary", "edge_weights_changed": False},
+    }
+
+
+def factorial_reading(curve: pd.DataFrame, seed: int) -> dict:
+    at = curve[curve.seed.eq(seed) & curve.epoch.eq(FIXED_EPOCH)]
+    if at.duplicated("model_id").any():
+        raise RuntimeError("factorial 판독표에 모형 중복이 있습니다")
+    index = at.set_index("model_id")
+    required = (m3.M1_MODEL_ID, m3.ARM_VALUE_ACTIVITY, ARM_M4_B, ARM_B)
+    missing = set(required).difference(index.index)
+    if missing:
+        raise RuntimeError(f"factorial 판독에 필요한 모형이 없습니다: {sorted(missing)}")
+
+    m1, m3b, m4b, m5b = (index.loc[model_id] for model_id in required)
+    economic_above = all(
+        float(m5b[metric]) > max(float(m3b[metric]), float(m4b[metric]))
+        for metric in ECONOMIC
+    )
+    accuracy_guard = all(
+        float(m5b[metric]) >= 0.99 * max(float(m3b[metric]), float(m4b[metric]))
+        for metric in ACCURACY
+    )
+    interaction = {
+        metric: ((float(m5b[metric]) - float(m3b[metric]))
+                 - (float(m4b[metric]) - float(m1[metric])))
+        for metric in (*ACCURACY, *ECONOMIC)
+    }
+    return {
+        "development_screen_only": True,
+        "fixed_epoch": FIXED_EPOCH,
+        "significance_claim": False,
+        "m5_b_economic_at10_above_both_standalones": bool(economic_above),
+        "m5_b_accuracy_guard_99pct_vs_better_standalone": bool(accuracy_guard),
+        "combination_candidate": bool(economic_above and accuracy_guard),
+        "interaction_absolute": interaction,
+    }
+
+
+def _existing_m5_b_curves(cfg, input_hash: str) -> tuple[pd.DataFrame, dict]:
+    seed = cfg.seeds[0]
+    root = Path(
+        f"{v3.default_out_dir('dunnhumby')}_clv_m5_m3_m4_split_nv_s{seed}_v1"
+    )
+    matches = sorted(root.glob(f"{CODE_VERSION}_*.json"))
+    if len(matches) != 1:
+        raise RuntimeError(f"기존 M5-B 결과 JSON을 한 개 찾지 못했습니다: {root}")
+    path = matches[0]
+    raw = path.read_bytes()
+    old = json.loads(raw)
+    fixed = ("epochs", "eval_every", "batch_size", "lr", "n_layers", "id_dim",
+             "pref_reg", "negative_count")
+    if (old.get("seed") != seed or old.get("input_hash") != input_hash
+            or any(old["config"][key] != getattr(cfg, key) for key in fixed)):
+        raise RuntimeError("기존 M5-B와 새 M4-B의 입력·학습 설정이 다릅니다")
+    absolute = Path(old["result_paths"]["absolute_csv"])
+    if not absolute.is_file():
+        raise RuntimeError(f"기존 M5-B absolute 결과가 없습니다: {absolute}")
+    curve = pd.read_csv(absolute)
+    keep = (m3.M1_MODEL_ID, m3.ARM_VALUE_ACTIVITY, ARM_B)
+    curve = curve[curve.model_id.isin(keep) & curve.seed.eq(seed)].copy()
+    for model_id in keep:
+        epochs = set(curve.loc[curve.model_id.eq(model_id), "epoch"])
+        if {DIAGNOSTIC_EPOCH, FIXED_EPOCH} - epochs:
+            raise RuntimeError(f"기존 {model_id} seed {seed}의 100·300 epoch가 없습니다")
+    return curve, {
+        "summary_path": str(path),
+        "summary_sha256": hashlib.sha256(raw).hexdigest(),
+        "absolute_path": str(absolute),
+        "absolute_sha256": hashlib.sha256(absolute.read_bytes()).hexdigest(),
+    }
+
+
+def factorial_comparison(curve: pd.DataFrame, seed: int) -> pd.DataFrame:
+    index = curve.set_index(["model_id", "seed", "epoch"])
+    metrics = [column for column in curve.columns if "@" in column
+               or column == "user_value_tendency_recommended_price_alignment"]
+    pairs = (
+        (m3.ARM_VALUE_ACTIVITY, m3.M1_MODEL_ID),
+        (ARM_M4_B, m3.M1_MODEL_ID),
+        (ARM_B, m3.ARM_VALUE_ACTIVITY),
+        (ARM_B, ARM_M4_B),
+    )
+    rows = []
+    for epoch in (DIAGNOSTIC_EPOCH, FIXED_EPOCH):
+        for model_id, reference in pairs:
+            left = index.loc[(model_id, seed, epoch)]
+            right = index.loc[(reference, seed, epoch)]
+            for metric in metrics:
+                base, value = float(right[metric]), float(left[metric])
+                rows.append({
+                    "seed": seed, "epoch": epoch, "model_id": model_id,
+                    "reference": reference, "metric": metric,
+                    "reference_value": base, "candidate_value": value,
+                    "delta": value - base,
+                    "ratio": value / base if base else float("nan"),
+                })
+    return pd.DataFrame(rows)
 
 
 def configure(seed: int = 43, **overrides):
@@ -237,6 +354,80 @@ def run(cfg=None) -> dict:
                      ensure_ascii=False, indent=2))
     return {"absolute": curve, "comparison": comparison, "reading": result_reading,
             "paths": paths}
+
+
+def run_standalone_m4_b(cfg=None) -> dict:
+    """Train the one missing factorial cell: binary M1 graph + split N/V M4."""
+    if cfg is None:
+        cfg = configure(
+            seed=44,
+            out_dir=(
+                f"{v3.default_out_dir('dunnhumby')}"
+                "_clv_m4_split_nv_standalone_s44_v1"
+            ),
+        )
+    else:
+        cfg = configure(cfg.seeds[0], **asdict(cfg))
+    seed = cfg.seeds[0]
+    if seed != 44:
+        raise ValueError("사전등록한 첫 standalone M4-B 실행은 seed 44만 허용합니다")
+
+    prepared = m3._prepare(cfg)
+    old_curve, old_reference = _existing_m5_b_curves(cfg, prepared["input_hash"])
+    weights, weight_audit = row_weights(prepared)
+    check_original_m4(weight_audit)
+    old_hash = prepared["config_hash"]
+    prepared["config_hash"] = hashlib.sha256(
+        f"{standalone_m4_b_spec()['code_version']}:{old_hash}:"
+        f"{weight_audit[ARM_B]['sha256']}".encode()
+    ).hexdigest()[:12]
+
+    graph = binary_m4_graph(prepared)
+    graph["row_weights"] = weights[ARM_B]
+    stale = m3.clear_stale_progress(prepared)
+    print(json.dumps({
+        "seed": seed,
+        "graph_audit": graph["audit"],
+        "weight_audit": weight_audit[ARM_B],
+        "existing_reference": old_reference,
+    }, ensure_ascii=False, indent=2), flush=True)
+    print(f"\n===== {ARM_M4_B} | seed {seed} | {cfg.epochs} epoch =====", flush=True)
+    arm = m3._run_arm(prepared, cfg, standalone_m4_b_spec(), graph, seed)
+
+    curve = pd.concat([old_curve, m3.curve_table([arm], {})], ignore_index=True)
+    if curve.duplicated(["model_id", "seed", "epoch"]).any():
+        raise RuntimeError("factorial 곡선에 중복 모형·시드·epoch가 있습니다")
+    comparison = factorial_comparison(curve, seed)
+    result_reading = factorial_reading(curve, seed)
+
+    out = Path(cfg.out_dir)
+    stem = f"{standalone_m4_b_spec()['code_version']}_{prepared['config_hash']}"
+    paths = {
+        "absolute_csv": out / f"{stem}_absolute.csv",
+        "comparison_csv": out / f"{stem}_comparison.csv",
+        "json": out / f"{stem}.json",
+    }
+    io._atomic_csv(paths["absolute_csv"], curve)
+    io._atomic_csv(paths["comparison_csv"], comparison)
+    io._atomic_json(paths["json"], {
+        "code_version": standalone_m4_b_spec()["code_version"],
+        "config": asdict(cfg), "seed": seed, "lambda": LAMBDA,
+        "source_revision": prepared["revision"], "input_hash": prepared["input_hash"],
+        "split": "historical_development_days_684_690",
+        "final_test": False, "holdout": False,
+        "graph_audit": graph["audit"], "weight_audit": weight_audit[ARM_B],
+        "old_m1_m3_m5_b_reference": old_reference,
+        "dropped_stale_progress": stale, "reading": result_reading,
+        "limits": "single repeatedly exposed development seed; no significance, "
+                  "generalization, interaction causality or CLV attribution claim",
+        "result_paths": {key: str(value) for key, value in paths.items()},
+    })
+    print(json.dumps({
+        "reading": result_reading,
+        "paths": {key: str(value) for key, value in paths.items()},
+    }, ensure_ascii=False, indent=2))
+    return {"absolute": curve, "comparison": comparison,
+            "reading": result_reading, "paths": paths}
 
 
 if __name__ == "__main__":
