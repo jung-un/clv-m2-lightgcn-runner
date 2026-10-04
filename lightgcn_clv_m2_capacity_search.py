@@ -298,7 +298,6 @@ def _clv_score_share(model, prepared: dict, cfg: CapacitySearchConfig) -> dict:
         rng.choice(len(cache.users), size=min(256, len(cache.users)), replace=False)
     ]
     user_vectors, item_vectors, *_ = model.embeddings()
-    cut = model.id_dim
     rows = torch.as_tensor(sample, dtype=torch.long, device=v3.DEVICE)
     scores = user_vectors[rows] @ item_vectors.T
     for offset, user in enumerate(sample):
@@ -308,12 +307,21 @@ def _clv_score_share(model, prepared: dict, cfg: CapacitySearchConfig) -> dict:
     top = scores.topk(10, dim=1).indices
     picked_users = rows[:, None].expand_as(top).reshape(-1)
     picked_items = top.reshape(-1)
-    id_part = (
-        user_vectors[picked_users, :cut] * item_vectors[picked_items, :cut]
-    ).sum(dim=1)
-    clv_part = (
-        user_vectors[picked_users, cut:] * item_vectors[picked_items, cut:]
-    ).sum(dim=1)
+    if hasattr(model, "id_only_embeddings"):
+        id_user, id_item = model.id_only_embeddings()
+        id_part = (id_user[picked_users] * id_item[picked_items]).sum(dim=1)
+        full_part = (user_vectors[picked_users] * item_vectors[picked_items]).sum(dim=1)
+        clv_part = full_part - id_part
+        method = "full_score_minus_same_model_id_only_on_full_top10"
+    else:
+        cut = model.id_dim
+        id_part = (
+            user_vectors[picked_users, :cut] * item_vectors[picked_items, :cut]
+        ).sum(dim=1)
+        clv_part = (
+            user_vectors[picked_users, cut:] * item_vectors[picked_items, cut:]
+        ).sum(dim=1)
+        method = "concatenated_score_blocks_on_full_top10"
     return {
         "id_score_mean_abs": float(id_part.abs().mean()),
         "clv_score_mean_abs": float(clv_part.abs().mean()),
@@ -321,6 +329,7 @@ def _clv_score_share(model, prepared: dict, cfg: CapacitySearchConfig) -> dict:
             clv_part.abs().mean() / (id_part.abs().mean() + clv_part.abs().mean() + 1e-12)
         ),
         "clv_score_measured_on": "top10_of_evaluation_users",
+        "clv_score_decomposition": method,
     }
 
 
