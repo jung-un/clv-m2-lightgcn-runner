@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -30,6 +32,33 @@ def test_standalone_spec_changes_only_the_m4_loss_on_the_binary_graph():
     assert spec["arm"] == "binary"
     assert spec["gamma"] == 0.0
     assert spec["stage"] == "m4_split_nv_standalone_dev"
+
+
+def test_existing_seed43_result_accepts_seed_stored_in_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(screen.v3, "default_out_dir", lambda _: str(tmp_path / "results"))
+    cfg = screen.configure(seed=43)
+    root = tmp_path / "results_clv_m5_m3_m4_split_nv_s43_v1"
+    root.mkdir()
+    absolute = root / "absolute.csv"
+    pd.DataFrame([
+        {"model_id": model_id, "seed": 43, "epoch": epoch}
+        for model_id in (m3.M1_MODEL_ID, m3.ARM_VALUE_ACTIVITY, screen.ARM_B)
+        for epoch in (100, 300)
+    ]).to_csv(absolute, index=False)
+    stored = {
+        "config": {
+            key: getattr(cfg, key)
+            for key in ("epochs", "eval_every", "batch_size", "lr", "n_layers",
+                        "id_dim", "pref_reg", "negative_count")
+        } | {"seeds": [43]},
+        "input_hash": "same-input",
+        "result_paths": {"absolute_csv": str(absolute)},
+    }
+    (root / f"{screen.CODE_VERSION}_legacy.json").write_text(json.dumps(stored))
+
+    curve, _ = screen._existing_m5_b_curves(cfg, "same-input")
+
+    assert set(curve.seed) == {43}
 
 
 def test_factorial_reading_requires_m5_b_to_beat_both_single_interventions():

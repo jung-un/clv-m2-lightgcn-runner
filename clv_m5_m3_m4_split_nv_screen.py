@@ -115,7 +115,9 @@ def _existing_m5_b_curves(cfg, input_hash: str) -> tuple[pd.DataFrame, dict]:
     old = json.loads(raw)
     fixed = ("epochs", "eval_every", "batch_size", "lr", "n_layers", "id_dim",
              "pref_reg", "negative_count")
-    if (old.get("seed") != seed or old.get("input_hash") != input_hash
+    stored_seeds = old.get("config", {}).get("seeds", [])
+    stored_seed = old.get("seed", stored_seeds[0] if len(stored_seeds) == 1 else None)
+    if (stored_seed != seed or old.get("input_hash") != input_hash
             or any(old["config"][key] != getattr(cfg, key) for key in fixed)):
         raise RuntimeError("기존 M5-B와 새 M4-B의 입력·학습 설정이 다릅니다")
     absolute = Path(old["result_paths"]["absolute_csv"])
