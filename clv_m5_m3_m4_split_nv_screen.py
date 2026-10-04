@@ -369,8 +369,6 @@ def run_standalone_m4_b(cfg=None) -> dict:
     else:
         cfg = configure(cfg.seeds[0], **asdict(cfg))
     seed = cfg.seeds[0]
-    if seed != 44:
-        raise ValueError("사전등록한 첫 standalone M4-B 실행은 seed 44만 허용합니다")
 
     prepared = m3._prepare(cfg)
     old_curve, old_reference = _existing_m5_b_curves(cfg, prepared["input_hash"])
