@@ -94,6 +94,23 @@ class LastWeekChecks(unittest.TestCase):
             self.assertEqual(x.seeds_improved,10)
             self.assertTrue(all(Path(p).is_file() for p in result["paths"].values()))
 
+            # Explicit pilot executes exactly four models, not the remaining seeds.
+            pilot=s.configure(out_dir=d,seeds=(49,))
+            pilot_rows=[r for r in rows if r['seed']==49]
+            prep['protocol']={'config':asdict(pilot)}
+            with patch.object(s,'run_arm',side_effect=pilot_rows) as run_arm:
+                result=s.run(pilot,prep)
+            self.assertEqual(run_arm.call_count,4)
+            self.assertTrue(all(call.args[-1]==49 for call in run_arm.call_args_list))
+            self.assertTrue(result['reading']['pilot_only'])
+            self.assertFalse(result['reading']['final_ten_seed_report'])
+            self.assertEqual(result['reading']['seed_count'],1)
+            self.assertTrue(result['summary']['std'].isna().all())
+            self.assertTrue(result['comparison']['paired_delta_std'].isna().all())
+            with self.assertRaises(RuntimeError): s.report(prep,pilot,pilot_rows[:-1])
+            with self.assertRaises(ValueError): s.configure('hm',seeds=(49,))
+            with self.assertRaises(ValueError): s.configure(seeds=(42,))
+
 
 if __name__=="__main__":
     unittest.main()

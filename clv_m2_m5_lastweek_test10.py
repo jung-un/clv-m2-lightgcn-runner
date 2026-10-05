@@ -1,4 +1,4 @@
-"""Fixed last-seven-day evaluation, no validation/holdout; 40 fits per dataset.
+"""Fixed last-seven-day evaluation; ten seeds or explicit Dunnhumby seed49 pilot.
 
 Last weeks were exposed in early research: not an unseen confirmatory split.
 No old development references/checkpoints, early stopping or test selection.
@@ -49,11 +49,15 @@ class Config:
     out_dir: str = ""
 
 
-def configure(dataset="dunnhumby", *, out_dir=None):
+def configure(dataset="dunnhumby", *, out_dir=None, seeds=SEEDS):
     if dataset not in INTERVALS:
         raise ValueError("dataset은 dunnhumby 또는 hm입니다")
-    return Config(dataset=dataset, batch_size=8192 if dataset == "dunnhumby" else 131072,
-                  out_dir=out_dir or v3.default_out_dir(dataset) + "_m2_m5_lastweek_test10_v1")
+    seeds = tuple(seeds)
+    if seeds != SEEDS and not (dataset == "dunnhumby" and seeds == (49,)):
+        raise ValueError("고정 10시드 또는 Dunnhumby seed49 예비 실행만 가능합니다")
+    suffix = "_m2_m5_lastweek_seed49_pilot_v1" if len(seeds) == 1 else "_m2_m5_lastweek_test10_v1"
+    return Config(dataset=dataset, seeds=seeds, batch_size=8192 if dataset == "dunnhumby" else 131072,
+                  out_dir=out_dir or v3.default_out_dir(dataset) + suffix)
 
 
 def base_config(cfg):
@@ -86,8 +90,8 @@ def validate_split(data, cfg):
 
 
 def prepare(cfg):
-    if cfg != configure(cfg.dataset, out_dir=cfg.out_dir):
-        raise ValueError("사전 고정된 10시드·300epoch·설정을 변경할 수 없습니다")
+    if cfg != configure(cfg.dataset, out_dir=cfg.out_dir, seeds=cfg.seeds):
+        raise ValueError("사전 고정된 시드·300epoch·설정을 변경할 수 없습니다")
     manifest = fixed.moe.build_input_manifest(v3.SCHEMA[cfg.dataset])
     input_hash, revision = fixed.moe.manifest_hash(manifest), fixed.moe.source_revision()
     base = base_config(cfg)
@@ -124,7 +128,8 @@ def prepare(cfg):
                 m3_adj=v3.build_adj(signals["edge_users"], signals["edge_items"],
                                    graph["weights"].astype(np.float32), data["n_users"], data["n_items"]))
     protocol = dict(code_version=CODE_VERSION, config=asdict(cfg), models=list(MODELS),
-                    total_fits=40, split="last_seven_days_test", validation=False, holdout=False,
+                    total_fits=len(MODELS)*len(cfg.seeds), pilot_only=len(cfg.seeds)==1,
+                    split="last_seven_days_test", validation=False, holdout=False,
                     intervals=INTERVALS[cfg.dataset], source_revision=revision, input_hash=input_hash,
                     previously_exposed_test=True, unseen_confirmation_claim=False,
                     no_old_reference_reuse=True, no_early_stopping=True, test_evaluations_per_fit=1,
@@ -132,7 +137,7 @@ def prepare(cfg):
                     m4="split N/V B, invalid rows raw=1, normalized train-row mean",
                     m4_weight_audit=audit[BASE], m3_beta=graph["beta"], m3_audit=graph["audit"],
                     m2="q_C*[T0+(2q_N-1)*TN]*b(q_V), item=b(amount percentile); joint optimizer",
-                    primary="10-seed mean economic@10: full > M3+M4 and M1; six accuracy means >= .99*M1",
+                    primary=f"{len(cfg.seeds)}-seed mean economic@10: full > M3+M4 and M1; six accuracy means >= .99*M1",
                     m2_standalone_diagnostic_only=True, significance_claim=False,
                     data_stats=data["data_stats"])
     identity = dict(version=CODE_VERSION, config=asdict(cfg), input_hash=input_hash,
@@ -198,9 +203,9 @@ def run_arm(prep, cfg, model_id, seed):
 def report(prep, cfg, rows):
     absolute = pd.DataFrame([dict(model_id=r["model_id"], seed=r["seed"], **r["metrics"]) for r in rows])
     expected = {(m,s) for m in MODELS for s in cfg.seeds}
-    if (len(absolute) != 40 or absolute.duplicated(["model_id","seed"]).any()
+    if (len(absolute) != len(expected) or absolute.duplicated(["model_id","seed"]).any()
             or set(zip(absolute.model_id,absolute.seed)) != expected):
-        raise RuntimeError("40개 실행 모두 완료 전에는 10시드 최종 판정을 하지 않습니다")
+        raise RuntimeError(f"예정된 {len(expected)}개 실행 모두 완료 전에는 판독을 생성하지 않습니다")
     metrics = list(rows[0]["metrics"])
     if not np.isfinite(absolute[metrics].to_numpy(float)).all():
         raise RuntimeError("집계 지표 누락/비유한값")
@@ -221,11 +226,13 @@ def report(prep, cfg, rows):
             changes.append(dict(model_id=model,reference=ref,metric=metric,
                                 reference_mean=base_mean,mean=value_mean,
                                 relative_change_pct=100*(value_mean/base_mean-1) if base_mean else None,
-                                paired_delta_mean=float(delta.mean()),paired_delta_std=float(delta.std(ddof=1)),
-                                seeds_improved=int((delta>0).sum()),seeds_total=10))
+                                paired_delta_mean=float(delta.mean()),
+                                paired_delta_std=float(delta.std(ddof=1)) if len(cfg.seeds)>1 else None,
+                                seeds_improved=int((delta>0).sum()),seeds_total=len(cfg.seeds)))
     guard = all(means.at[FULL,m] >= .99*means.at[M1,m] for m in ACCURACY)
     economic = all(means.at[FULL,m] > max(means.at[M1,m],means.at[BASE,m]) for m in ECONOMIC)
-    decision = dict(complete=True,seed_count=10,accuracy_mean_guard=bool(guard),
+    decision = dict(complete=True,seed_count=len(cfg.seeds),pilot_only=len(cfg.seeds)==1,
+                    final_ten_seed_report=len(cfg.seeds)==10,accuracy_mean_guard=bool(guard),
                     both_economic_means_above_m1_and_m3_m4=bool(economic),
                     combination_condition_met=bool(guard and economic),
                     significance_claim=False,clv_attribution_claim=False,previously_exposed_test=True)
@@ -249,6 +256,6 @@ def run(cfg, prep):
     rows = []
     for seed in cfg.seeds:
         for model in MODELS:
-            print(f"[{len(rows)+1}/40] {cfg.dataset} / seed{seed} / {model}",flush=True)
+            print(f"[{len(rows)+1}/{len(MODELS)*len(cfg.seeds)}] {cfg.dataset} / seed{seed} / {model}",flush=True)
             rows.append(run_arm(prep,cfg,model,seed))
     return report(prep,cfg,rows)
