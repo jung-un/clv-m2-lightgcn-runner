@@ -254,11 +254,16 @@ def _build_model(prepared: dict, cfg: DunnhumbyTestConfig, seed: int, adjacency)
 
 
 def _train(model, prepared: dict, cfg: DunnhumbyTestConfig, model_id: str,
-           seed: int, store: ProgressStore) -> list[dict]:
+           seed: int, store: ProgressStore, row_weights=None) -> list[dict]:
     """Train to a fixed number of epochs. The test interval is not scored here."""
 
     data = prepared["data"]
     tr_u, tr_i, positive_keys = data["tr_u"], data["tr_i"], data["pos_key"]
+    if row_weights is not None:
+        row_weights = np.asarray(row_weights)
+        if (row_weights.shape != (len(tr_u),) or not np.isfinite(row_weights).all()
+                or np.any(row_weights <= 0)):
+            raise ValueError("BPR 행 가중치 길이/유한성/양수 조건 불일치")
     n_batches = math.ceil(len(tr_u) / cfg.batch_size)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     rng = np.random.default_rng(seed)
@@ -282,7 +287,9 @@ def _train(model, prepared: dict, cfg: DunnhumbyTestConfig, model_id: str,
             )
             tensors = [torch.as_tensor(value, dtype=torch.long, device=v3.DEVICE)
                        for value in (users_np, positives_np, negatives_np)]
-            loss, _, correct = recheck._batch_loss(model, *tensors, None)
+            batch_weights = None if row_weights is None else torch.as_tensor(
+                row_weights[index], dtype=torch.float32, device=v3.DEVICE)
+            loss, _, correct = recheck._batch_loss(model, *tensors, batch_weights)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
