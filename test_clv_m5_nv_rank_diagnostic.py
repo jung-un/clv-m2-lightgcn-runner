@@ -124,6 +124,52 @@ class RankDiagnosticTest(unittest.TestCase):
                                        'input', 'hash', 'revision')
             self.assertEqual(state, {})
 
+    def test_hm_features_limit_customer_context_but_keep_full_item_buyers(self):
+        from clv_hm_m1_m5_error_diagnostic import attach_hm_features
+        users = pd.DataFrame(dict(seed=[43], user=[0], segment=['고CLV'], q_n=[.9],
+            q_v=[.8], clv_valid=[True], degree=[2], truth_count=[1]))
+        train = pd.DataFrame(dict(u_idx=[0, 0, 1, 1], i_idx=[0, 1, 0, 2],
+                                  v=[2., 6., 4., 8.]))
+        prep = dict(data=dict(train=train, n_items=4,
+            tr_u=np.array([0, 0, 1, 1]), tr_i=np.array([0, 1, 0, 2])),
+            item_cat=np.array([0, 1, 0, 1]),
+            item_amount_percentile=np.array([.2, .8, .6, .4]),
+            item_economic_valid=np.ones(4, bool))
+        candidates = pd.DataFrame(dict(seed=[43, 43], user=[0, 0], item=[0, 2]))
+        actual = attach_hm_features(candidates, users, prep)
+        self.assertEqual(actual.item_buyers.tolist(), [2, 1])
+        np.testing.assert_allclose(actual.category_row_share, [.5, .5])
+        np.testing.assert_allclose(actual.category_spend_share, [.25, .25])
+        np.testing.assert_allclose(actual.user_amount_position, [.65, .65])
+        self.assertEqual(prep['_hm_candidate_feature_context']['filtered_train_rows'], 2)
+
+    def test_hm_compact_checkpoint_identity_is_strict(self):
+        import tempfile
+        from pathlib import Path
+        import torch
+        from clv_hm_m1_m5_error_diagnostic import _load_compact_checkpoint
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            path = folder / 'progress/hash/resume/checkpoint_latest.pt'
+            path.parent.mkdir(parents=True)
+            identity = dict(stage='stage', model_id='model', seed=43,
+                            config_hash='arm', source_revision='revision',
+                            input_hash='wrong')
+            torch.save(dict(epoch=300, identity=identity,
+                            parameter_state={'weight': torch.ones(1)}), path)
+            with self.assertRaises(RuntimeError):
+                _load_compact_checkpoint(folder, 'progress/*/resume/*_latest.pt',
+                    stage='stage', model_id='model', input_hash='input',
+                    source_revision='revision')
+            identity['input_hash'] = 'input'
+            torch.save(dict(epoch=300, identity=identity,
+                            parameter_state={'weight': torch.ones(1)}), path)
+            state, source = _load_compact_checkpoint(
+                folder, 'progress/*/resume/*_latest.pt', stage='stage',
+                model_id='model', input_hash='input', source_revision='revision')
+            self.assertIn('weight', state)
+            self.assertEqual(source['epoch'], 300)
+
 
 if __name__ == "__main__":
     unittest.main()

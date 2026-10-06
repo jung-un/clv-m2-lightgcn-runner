@@ -74,9 +74,9 @@ def attach_features(candidates, users, prepared):
     return result
 
 
-def enrich_tables(truth, users, recommendations, prepared):
-    truth = attach_features(truth, users, prepared)
-    recs = attach_features(recommendations, users, prepared)
+def enrich_tables(truth, users, recommendations, prepared, feature_attacher=attach_features):
+    truth = feature_attacher(truth, users, prepared)
+    recs = feature_attacher(recommendations, users, prepared)
     for k in (10, 20, 50):
         a, b = truth.rank_m3.le(k), truth.rank_m5.le(k)
         truth[f"status@{k}"] = np.select([a & b, ~a & b, a & ~b],
