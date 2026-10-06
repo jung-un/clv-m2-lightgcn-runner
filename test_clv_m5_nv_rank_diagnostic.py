@@ -52,7 +52,11 @@ class RankDiagnosticTest(unittest.TestCase):
             csr_items=np.array([0])), cache=SimpleNamespace(users=np.array([0]),
             gt={0: np.array([20, 119])}, rev={0: np.array([2., 3.])}),
             base_cfg={"EVAL_BATCH": 32})
-        result = diag._score_truth(Model(), prepared, 43)
+        recommendations = []
+        result = diag._score_truth(Model(), prepared, 43, recommendations)
+        self.assertEqual(len(recommendations), 50)
+        self.assertNotIn(0, [r["item"] for r in recommendations])
+        self.assertEqual(sum(r["is_truth"] for r in recommendations), 1)
         self.assertEqual(result.loc[0, "rank"], 20)
         self.assertEqual(result.loc[0, "margin@20"], 0.)
         self.assertTrue(np.isnan(result.loc[1, "rank"]))
@@ -60,6 +64,65 @@ class RankDiagnosticTest(unittest.TestCase):
         prepared["cache"].gt[0] = np.array([0])
         with self.assertRaises(RuntimeError):
             diag._score_truth(Model(), prepared, 43)
+
+    def test_train_candidate_features_and_same_user_differences(self):
+        from clv_m1_m5_error_diagnostic import attach_features, enrich_tables
+        users = pd.DataFrame(dict(seed=[43], user=[0], segment=["고CLV"], q_n=[.9],
+            q_v=[.8], clv_valid=[True], degree=[2], truth_count=[2]))
+        train = pd.DataFrame(dict(u_idx=[0, 0, 1], i_idx=[0, 1, 2], v=[2., 6., 8.]))
+        prep = dict(data=dict(train=train, n_items=120, item_cat=np.arange(120) % 2),
+            item_amount_percentile=np.linspace(0, 1, 120), item_economic_valid=np.ones(120, bool))
+        candidates = pd.DataFrame(dict(seed=[43, 43], user=[0, 0], item=[2, 3]))
+        features = attach_features(candidates, users, prep)
+        np.testing.assert_allclose(features.category_row_share, [.5, .5])
+        np.testing.assert_allclose(features.category_spend_share, [.25, .75])
+        self.assertEqual(features.item_buyers.tolist(), [1, 0])
+        np.testing.assert_allclose(features.user_amount_position, [.75/119]*2)
+        truth = pd.DataFrame(dict(seed=[43, 43], user=[0, 0], item=[60, 61],
+                                 rank_m3=[np.nan, np.nan], rank_m5=[np.nan, np.nan]))
+        recs = pd.DataFrame([dict(seed=43, user=0, item=i+2, rank=i+1,
+            is_truth=False, model=label) for label in ("m1", "m5") for i in range(50)])
+        tables = enrich_tables(truth, users, recs, prep)
+        self.assertEqual(len(tables['truth_features']), 2)
+        self.assertEqual(len(tables['paired_user_feature_differences']), 6)
+        self.assertTrue(tables['truth_features']['status@10'].eq('both_miss').all())
+        bad = recs.copy()
+        bad.loc[0, 'is_truth'] = True
+        with self.assertRaises(RuntimeError):
+            enrich_tables(truth, users, bad, prep)
+
+    def test_baseline_identity_and_missing_checkpoint_are_rejected(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        import torch
+        from clv_m1_m5_error_diagnostic import baseline_source
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / 'results_v3_dunnhumby_clv_m2_capacity_search_v1'
+            report_path = folder / 'arms/hash/baseline_m1_bpr_k1_s43.json'
+            report_path.parent.mkdir(parents=True)
+            report_path.write_text(json.dumps(dict(id_dim=64, pref_reg=.001, seed=43,
+                condition='baseline', source_revision='revision', curve=[dict(epoch=300, metrics={})])))
+            cfg = SimpleNamespace(id_dim=64, pref_reg=.001)
+            with self.assertRaises(RuntimeError):
+                baseline_source(root, 43, cfg, {'input_hash': 'input'})
+            ckpt = folder / 'progress/hash/resume/capacity_search_dev_baseline_m1_bpr_k1_s43_latest.pt'
+            ckpt.parent.mkdir(parents=True)
+            identity = dict(stage='capacity_search_dev', model_id='baseline_m1_bpr_k1', seed=43,
+                            config_hash='hash', source_revision='revision', input_hash='WRONG')
+            torch.save(dict(epoch=300, identity=identity, model_state={}), ckpt)
+            spec, _ = baseline_source(root, 43, cfg, {'input_hash': 'input'})
+            self.assertEqual(spec[1], 'm1_bpr_k1')
+            with self.assertRaises(RuntimeError):
+                diag._checkpoint(folder, identity['stage'], identity['model_id'], 43,
+                                 'input', 'hash', 'revision')
+            identity['input_hash'] = 'input'
+            torch.save(dict(epoch=300, identity=identity, model_state={}), ckpt)
+            state, _ = diag._checkpoint(folder, identity['stage'], identity['model_id'], 43,
+                                       'input', 'hash', 'revision')
+            self.assertEqual(state, {})
 
 
 if __name__ == "__main__":

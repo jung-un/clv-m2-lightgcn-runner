@@ -122,7 +122,7 @@ def _checkpoint(root, stage, model_id, seed, input_hash, config_hash, revision):
                                       epoch=300, identity=identity)
 
 
-def _score_truth(model, prepared, seed):
+def _score_truth(model, prepared, seed, recommendations=None):
     import torch
     import lightgcn_clv_v3 as v3
     cache, data = prepared["cache"], prepared["data"]
@@ -148,6 +148,12 @@ def _score_truth(model, prepared, seed):
             for row, user in enumerate(batch):
                 ranks = {int(item): r + 1 for r, item in enumerate(top_items[row])}
                 actual = np.asarray(cache.gt[user], np.int64)
+                if recommendations is not None:
+                    actual_set = set(actual.tolist())
+                    for rank, item in enumerate(top_items[row, :50], 1):
+                        recommendations.append(dict(seed=seed, user=int(user), item=int(item),
+                            rank=rank, is_truth=int(item) in actual_set,
+                            score=float(top_scores[row, rank - 1])))
                 weights = np.asarray(cache.rev[user], float)
                 actual_scores = scores[row, torch.as_tensor(actual, device=v3.DEVICE)].cpu().numpy()
                 if len(actual) != len(weights) or not np.isfinite(actual_scores).all():
@@ -164,7 +170,7 @@ def _score_truth(model, prepared, seed):
     return pd.DataFrame(records)
 
 
-def run(root="/content/drive/MyDrive/논문/data", seeds=(43, 44)):
+def run(root="/content/drive/MyDrive/논문/data", seeds=(43, 44), *, compare_m1=False):
     import torch
     import clv_m5_m3_m4_split_nv_screen as screen
     import lightgcn_clv_m3_centered_value_graph as m3
@@ -178,9 +184,10 @@ def run(root="/content/drive/MyDrive/논문/data", seeds=(43, 44)):
     # CPU-only diagnostic; it can run while existing GPU training continues.
     v3.DEVICE = torch.device("cpu")
     root = Path(root)
-    out = root / "results_v3_dunnhumby_m5_nv_rank_diagnostic_v1"
+    out = root / ("results_v3_dunnhumby_m1_m5_error_diagnostic_v1" if compare_m1
+                  else "results_v3_dunnhumby_m5_nv_rank_diagnostic_v1")
     cfg = screen.configure(seed=seeds[0], out_dir=str(out))
-    print("[사전진단] 기존 M3/M5-B@300 읽기 · 새 학습 0 · 개발684~690일", flush=True)
+    print(f"[사전진단] 기존 {'M1' if compare_m1 else 'M3'}/M5-B@300 읽기 · 새 학습 0 · 개발684~690일", flush=True)
     prepared = m3._prepare(cfg)
     data, cache = prepared["data"], prepared["cache"]
     if (set(data["splits"]) != {"test"} or data["train"].t.max() > 683
@@ -208,6 +215,7 @@ def run(root="/content/drive/MyDrive/논문/data", seeds=(43, 44)):
         population[column], edges[column] = train_bins(prepared[axis], prepared["clv_valid"], cache.users)
     population["degree_bin"], edges["degree_bin"] = train_bins(degree, degree > 0, cache.users)
     all_truth, all_users, audits, absolute, sources = [], [], [], [], []
+    all_recommendations = []
     for seed in seeds:
         m5root = root / f"results_v3_dunnhumby_clv_m5_m3_m4_split_nv_s{seed}_v1"
         m5paths = list(m5root.glob(f"{screen.CODE_VERSION}_*.json"))
@@ -229,19 +237,26 @@ def run(root="/content/drive/MyDrive/논문/data", seeds=(43, 44)):
                             absolute=str(source_csv), absolute_sha256=file_sha256(source_csv)))
         curve = pd.read_csv(source_csv)
         scored = {}
-        for label, model_id, folder, stage, config_hash, revision in (
+        checkpoints = [
             ("m3", m3.ARM_VALUE_ACTIVITY, m3root, "centered_graph_dev",
              m3path.stem.rsplit("_", 1)[-1], m3report["source_revision"]),
             ("m5", screen.ARM_B, m5root, "m5_m3_m4_dev",
              report_path.stem.rsplit("_", 1)[-1], report["source_revision"]),
-        ):
+        ]
+        if compare_m1:
+            from clv_m1_m5_error_diagnostic import baseline_source
+            checkpoints[0], baseline_meta = baseline_source(root, seed, cfg, prepared)
+            sources.append(baseline_meta)
+        for label, model_id, folder, stage, config_hash, revision in checkpoints:
             expected = curve[curve.model_id.eq(model_id) & curve.seed.eq(seed) & curve.epoch.eq(300)]
             if len(expected) != 1:
                 raise RuntimeError("원본 300epoch 성과가 누락/중복됐습니다")
-            state, source = _checkpoint(folder, stage, model_id, seed,
+            checkpoint_id = f"baseline_{model_id}" if compare_m1 and label == "m3" else model_id
+            state, source = _checkpoint(folder, stage, checkpoint_id, seed,
                 prepared["input_hash"], config_hash, revision)
             sources.append(source)
-            model = m3._build_model(prepared, cfg, graph, seed)
+            model_graph = {"adjacency": data["adj"]} if compare_m1 and label == "m3" else graph
+            model = m3._build_model(prepared, cfg, model_graph, seed)
             model.load_state_dict(state, strict=True)
             measured = capacity._evaluate(model, prepared)
             for metric, value in measured.items():
@@ -255,7 +270,11 @@ def run(root="/content/drive/MyDrive/논문/data", seeds=(43, 44)):
             if not all(row["passed"] for row in audits):
                 raise RuntimeError("체크포인트 재현 차이: readback.csv를 확인하세요. 새 학습 없음")
             absolute.append(dict(seed=seed, model_id=model_id, epoch=300, **measured))
-            scored[label] = _score_truth(model, prepared, seed)
+            recommendations = [] if compare_m1 else None
+            scored[label] = _score_truth(model, prepared, seed, recommendations)
+            if compare_m1:
+                all_recommendations.append(pd.DataFrame(recommendations).assign(
+                    model_id=model_id, model="m1" if label == "m3" else "m5"))
             del model, state
             print(f"[진단 완료] seed{seed} {label}: 전체지표 재현·정답 순위 기록", flush=True)
         truth, users = movement_tables(scored["m3"], scored["m5"], population.assign(seed=seed))
@@ -272,11 +291,27 @@ def run(root="/content/drive/MyDrive/논문/data", seeds=(43, 44)):
     frames = dict(truth_movements=truth, user_movements=users, summary=summary,
                   axis_correlations=correlations, rank_transitions=transitions,
                   absolute=pd.DataFrame(absolute), readback=pd.DataFrame(audits))
+    if compare_m1:
+        from clv_m1_m5_error_diagnostic import enrich_tables
+        frames.update(enrich_tables(truth, users, pd.concat(all_recommendations), prepared))
+        for key, frame in frames.items():
+            frames[key] = frame.rename(columns=lambda c: c.replace("_m3", "_m1").replace("m3_", "m1_"))
     paths = {key: str(out / f"{key}.csv") for key in frames}
     for key, frame in frames.items():
         io._atomic_csv(Path(paths[key]), frame)
     paths["json"] = str(out / "result.json")
     io._atomic_json(Path(paths["json"]), dict(code_version=VERSION, seeds=list(seeds),
+        reference_model="M1" if compare_m1 else "M3", candidate_model="M3+M4-B",
+        diagnostic_extension="m1-m5-candidate-features-v1" if compare_m1 else None,
+        feature_definitions=dict(
+            item_buyers="distinct TRAIN buyers; descriptive covariate, not a proposed CLV input",
+            item_amount_percentile="existing TRAIN economic-input percentile; invalid -> NaN",
+            category_row_share="TRAIN transaction rows in candidate category / all customer TRAIN rows",
+            category_spend_share="positive TRAIN spend in candidate category / all positive customer spend; zero-total -> 0",
+            price_distance="absolute item percentile minus customer's positive-spend-weighted TRAIN item percentile; missing valid spend -> NaN",
+            user_macro_mean="mean of each eligible customer's mean feature; valid counts reported",
+            paired_differences="same customer common-miss feature mean minus wrong TopK feature mean; descriptive, no score/popularity matching",
+        ) if compare_m1 else None,
         epoch=300, training=False, final_test=False, holdout=False,
         split="historical_development_days_684_690", input_hash=prepared["input_hash"],
         sources=sources, train_bin_edges=edges, graph_audit=graph["audit"],
