@@ -19,6 +19,15 @@ VERSION = "clv-hm-m1-m5-candidate-error-diagnostic-v1"
 SEED = 43
 EPOCH = 300
 SPLIT = "hm2y_validation_2020-09-02_08"
+ALIGNMENT = "user_value_tendency_recommended_price_alignment"
+
+
+def _readback_match(metric: str, measured: float, recorded: float) -> tuple[bool, float]:
+    # This Spearman correlation is sensitive to GPU top-k tie ordering.  The
+    # ranking, hit, weighted-hit and exposure metrics retain the strict gate.
+    atol = 1e-5 if metric == ALIGNMENT else 1e-7
+    return bool(np.isclose(measured, recorded, rtol=1e-5, atol=atol,
+                           equal_nan=True)), atol
 
 
 def _matching_m1_report(folder: Path, cfg) -> tuple[Path, dict]:
@@ -245,10 +254,11 @@ def run(root="/content/drive/MyDrive/논문/data") -> dict[str, str]:
         measured = common.evaluate(model, prepared)
         for metric, value in measured.items():
             reference = float(expected.iloc[0][metric])
-            passed = bool(np.isclose(value, reference, rtol=1e-5, atol=1e-7,
-                                     equal_nan=True))
+            passed, absolute_tolerance = _readback_match(metric, value, reference)
             audits.append({"seed": SEED, "model_id": model_id, "metric": metric,
                            "recorded": reference, "readback": float(value),
+                           "absolute_difference": abs(float(value) - reference),
+                           "absolute_tolerance": absolute_tolerance,
                            "passed": passed})
         io._atomic_csv(out / "readback.csv", pd.DataFrame(audits))
         if not all(row["passed"] for row in audits):

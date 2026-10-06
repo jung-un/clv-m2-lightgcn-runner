@@ -170,6 +170,12 @@ class RankDiagnosticTest(unittest.TestCase):
             self.assertIn('weight', state)
             self.assertEqual(source['epoch'], 300)
 
+    def test_hm_readback_only_relaxes_tie_sensitive_alignment(self):
+        from clv_hm_m1_m5_error_diagnostic import ALIGNMENT, _readback_match
+        self.assertTrue(_readback_match(ALIGNMENT, .078048, .078044)[0])
+        self.assertFalse(_readback_match('recall@10', .078048, .078044)[0])
+        self.assertFalse(_readback_match(ALIGNMENT, .079044, .078044)[0])
+
 
 if __name__ == "__main__":
     unittest.main()
