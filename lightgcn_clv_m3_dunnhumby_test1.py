@@ -300,10 +300,10 @@ def _train(model, prepared: dict, cfg: DunnhumbyTestConfig, model_id: str,
                             selection="none")
         history.append({"epoch": epoch, "loss": totals["loss"] / n_batches,
                         "p_correct": totals["p_correct"] / n_batches})
-        if epoch % 25 == 0 or epoch == cfg.epochs:
+        if cfg.dataset == "hm" or epoch % 25 == 0 or epoch == cfg.epochs:
             print(f"  [{model_id} s{seed}] ep {epoch:3d}/{cfg.epochs} | "
                   f"loss {history[-1]['loss']:.4f} | "
-                  f"P(pos>neg) {history[-1]['p_correct']:.3f}")
+                  f"P(pos>neg) {history[-1]['p_correct']:.3f}", flush=True)
         store.save_epoch(model, optimizer, rng, epoch=epoch, history=history,
                          wall_clock_sec=time.time() - started, selection="none")
     return history

@@ -14,6 +14,57 @@ from test_clv_m2_nv_conditional_basis_screen import toy
 
 
 class LastWeekChecks(unittest.TestCase):
+    def test_hm_three_arm_formula_training_cache_and_report(self):
+        t = toy()
+        data = dict(n_users=3,n_items=4,adj=t['adj'],tr_u=np.array([0,0,1,2]),
+                    tr_i=np.array([0,1,2,3]),pos_key=np.array([0,1,6,11]))
+        prep = dict(data=data,q_n=np.array([.2,.9,0.]),q_v=np.array([.8,.8,0.]),
+                    q_c=np.array([.6,.6,0.]),clv_valid=t['user_clv_valid'],
+                    item_amount_percentile=t['item_price_percentile'],
+                    item_economic_valid=t['item_price_valid'],m3_adj=t['adj']*.9,
+                    config_hash='hm-test',revision='code',input_hash='input')
+        econ = dict(item_amount_percentile=t['item_price_percentile'],
+                    user_bin_fit=np.array([[1.,.5],[.8,1.],[1.,1.]]),item_bin=np.array([0,1,0,1]))
+        weights, audit = s.hm_m5.row_weights(prep,econ,check_development_reference=False)
+        raw = np.array([1.1*(1+.5*.8*.1),1.1*(1+.5*.8*.5*.5),
+                        1.45*(1+.5*.8*.9*.8),1.])
+        np.testing.assert_allclose(weights['split_nv'],raw/raw.mean())
+        with self.assertRaises(RuntimeError): s.hm_m5.row_weights(prep,econ)
+        prep['m4_weights']=weights['split_nv']
+        with tempfile.TemporaryDirectory() as d, patch.object(s.v3,'DEVICE',torch.device('cpu')):
+            cfg=s.configure('hm',seeds=(49,),experiment='hm_m4b_m5b',out_dir=d)
+            self.assertEqual((cfg.epochs,cfg.batch_size,cfg.rho),(300,131072,0.))
+            self.assertEqual(s.models_for(cfg),(s.M1,s.M4_B,s.BASE))
+            cfg=replace(cfg,epochs=2,id_dim=4,batch_size=2)
+            prep.update(run_dir=Path(d),protocol={'config':asdict(cfg)})
+            m1=s.build_model(prep,cfg,s.M1,49)
+            m4=s.build_model(prep,cfg,s.M4_B,49)
+            m5=s.build_model(prep,cfg,s.BASE,49)
+            torch.testing.assert_close(m1.E_u.weight,m4.E_u.weight,rtol=0,atol=0)
+            torch.testing.assert_close(m4.E_u.weight,m5.E_u.weight,rtol=0,atol=0)
+            torch.testing.assert_close(m4.adj.to_dense(),data['adj'].to_dense())
+            torch.testing.assert_close(m5.adj.to_dense(),prep['m3_adj'].to_dense())
+            metrics=[{m:factor for m in (*s.ACCURACY,*s.ECONOMIC)} for factor in (1.,1.01,1.02)]
+            with patch.object(s.fixed,'_evaluate',side_effect=metrics) as evaluate, \
+                    patch.object(s.fixed,'_train',wraps=s.fixed._train) as train:
+                result=s.run(cfg,prep)
+                self.assertEqual(evaluate.call_count,3)
+                self.assertIsNone(train.call_args_list[0].kwargs['row_weights'])
+                self.assertIs(train.call_args_list[1].kwargs['row_weights'],prep['m4_weights'])
+                self.assertIs(train.call_args_list[2].kwargs['row_weights'],prep['m4_weights'])
+                s.run(cfg,prep)
+                self.assertEqual((train.call_count,evaluate.call_count),(3,3))
+            self.assertEqual(len(result['absolute']),3)
+            self.assertTrue(result['reading']['combination_condition_met'])
+            self.assertTrue(result['reading']['both_economic_at10_above_m1_and_m4_b'])
+            self.assertFalse(result['reading']['interaction_attribution_claim'])
+            digests=result['diagnostics'].set_index('model_id').weight_sha256
+            self.assertEqual(digests[s.M4_B],digests[s.BASE])
+            self.assertEqual(digests[s.BASE],audit['split_nv']['sha256'])
+            self.assertTrue(result['summary']['std'].isna().all())
+        with self.assertRaises(ValueError): s.configure('hm',seeds=(43,),experiment='hm_m4b_m5b')
+        with self.assertRaises(ValueError): s.configure('dunnhumby',seeds=(49,),experiment='hm_m4b_m5b')
+
     def test_real_split_builder_both_datasets(self):
         for dataset in ("dunnhumby", "hm"):
             cfg = s.configure(dataset)

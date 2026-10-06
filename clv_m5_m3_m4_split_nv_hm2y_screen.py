@@ -103,7 +103,7 @@ def references(cfg) -> tuple[pd.DataFrame, dict]:
     return curve, {name: meta for name, (_, meta) in found.items()}
 
 
-def row_weights(prepared: dict, economic: dict) -> tuple[dict[str, np.ndarray], dict]:
+def row_weights(prepared: dict, economic: dict, *, check_development_reference=True) -> tuple[dict[str, np.ndarray], dict]:
     data = prepared["data"]
     u = np.asarray(data["tr_u"], np.int64)
     i = np.asarray(data["tr_i"], np.int64)
@@ -129,7 +129,7 @@ def row_weights(prepared: dict, economic: dict) -> tuple[dict[str, np.ndarray], 
                           "customer_mass_ratio_cv": float((total[seen] / count[seen]).std()),
                           "sha256": hashlib.sha256(w.astype(np.float32).tobytes()).hexdigest()}
     a = audit["original"]
-    if (not np.isclose(a["train_mean_raw_weight"], HM_M4_MEAN_RAW, rtol=1e-5)
+    if check_development_reference and (not np.isclose(a["train_mean_raw_weight"], HM_M4_MEAN_RAW, rtol=1e-5)
             or not np.isclose(a["row_weight_cv"], HM_M4_CV, rtol=1e-4)):
         raise RuntimeError(f"A의 가중치가 확증된 H&M M4와 다릅니다: {a}")
     return weights, audit

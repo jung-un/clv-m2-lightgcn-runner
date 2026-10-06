@@ -1,4 +1,4 @@
-"""Fixed last-seven-day evaluation; ten seeds or explicit Dunnhumby seed49 pilot.
+"""Fixed last-seven-day evaluation; ten seeds or explicitly scoped seed49 pilots.
 
 Last weeks were exposed in early research: not an unseen confirmatory split.
 No old development references/checkpoints, early stopping or test selection.
@@ -16,6 +16,7 @@ import clv_m2_nv_conditional_basis_m5_screen as previous
 import lightgcn_clv_m3_dunnhumby_test1 as fixed
 import lightgcn_clv_m3_centered_value_graph_hm2y as hm_graph
 import lightgcn_clv_m5_nv_economic_positive_weight as economics
+import clv_m5_m3_m4_split_nv_hm2y_screen as hm_m5
 from clv_run_state import ProgressStore, RunIdentity
 
 v3, io = fixed.v3, fixed.test10
@@ -23,6 +24,7 @@ CODE_VERSION = "clv-m2-m5-lastweek-test10-v1"
 SEEDS = tuple(range(42, 52))
 M1, M2, BASE, FULL = previous.M1, previous.M2, previous.M5_BASE, previous.M5_FULL
 MODELS = (M1, BASE, M2, FULL)
+M4_B = previous.m5.ARM_M4_B
 ACCURACY, ECONOMIC = previous.ACCURACY, previous.ECONOMIC
 INTERVALS = {"dunnhumby": (1, 704, 711),
              "hm": ("2018-09-20", "2020-09-15", "2020-09-22")}
@@ -30,6 +32,7 @@ INTERVALS = {"dunnhumby": (1, 704, 711),
 
 @dataclass(frozen=True)
 class Config:
+    experiment: str = "m2_m5"
     dataset: str = "dunnhumby"
     seeds: tuple = SEEDS
     epochs: int = 300
@@ -49,15 +52,26 @@ class Config:
     out_dir: str = ""
 
 
-def configure(dataset="dunnhumby", *, out_dir=None, seeds=SEEDS):
+def configure(dataset="dunnhumby", *, out_dir=None, seeds=SEEDS, experiment="m2_m5"):
     if dataset not in INTERVALS:
         raise ValueError("dataset은 dunnhumby 또는 hm입니다")
     seeds = tuple(seeds)
+    if experiment == "hm_m4b_m5b":
+        if dataset != "hm" or seeds != (49,):
+            raise ValueError("H&M M4-B/M5-B 비교는 hm·seed49만 허용합니다")
+        return Config(experiment=experiment, dataset="hm", seeds=seeds, batch_size=131072,
+                      rho=0., out_dir=out_dir or v3.default_out_dir("hm")+"_m4b_m5b_lastweek_seed49_v1")
+    if experiment != "m2_m5":
+        raise ValueError("알 수 없는 실험입니다")
     if seeds != SEEDS and not (dataset == "dunnhumby" and seeds == (49,)):
         raise ValueError("고정 10시드 또는 Dunnhumby seed49 예비 실행만 가능합니다")
     suffix = "_m2_m5_lastweek_seed49_pilot_v1" if len(seeds) == 1 else "_m2_m5_lastweek_test10_v1"
     return Config(dataset=dataset, seeds=seeds, batch_size=8192 if dataset == "dunnhumby" else 131072,
                   out_dir=out_dir or v3.default_out_dir(dataset) + suffix)
+
+
+def models_for(cfg):
+    return (M1, M4_B, BASE) if cfg.experiment == "hm_m4b_m5b" else MODELS
 
 
 def base_config(cfg):
@@ -90,7 +104,7 @@ def validate_split(data, cfg):
 
 
 def prepare(cfg):
-    if cfg != configure(cfg.dataset, out_dir=cfg.out_dir, seeds=cfg.seeds):
+    if cfg != configure(cfg.dataset, out_dir=cfg.out_dir, seeds=cfg.seeds, experiment=cfg.experiment):
         raise ValueError("사전 고정된 시드·300epoch·설정을 변경할 수 없습니다")
     manifest = fixed.moe.build_input_manifest(v3.SCHEMA[cfg.dataset])
     input_hash, revision = fixed.moe.manifest_hash(manifest), fixed.moe.source_revision()
@@ -122,26 +136,38 @@ def prepare(cfg):
     for key in ("item_amount_percentile", "item_economic_valid", "user_economic_valid", "user_bin_fit", "item_bin"):
         prep[key] = econ[key]
     graph = fixed.build_graph(prep, cfg)
-    weights, audit = previous.m5.row_weights(prep)
+    hm_comparison = cfg.experiment == "hm_m4b_m5b"
+    if hm_comparison:
+        # Preserve the actual H&M B formula; only the training window changed.
+        weights, audit = hm_m5.row_weights(prep, econ, check_development_reference=False)
+        row_weight, weight_audit = weights["split_nv"], audit["split_nv"]
+    else:
+        weights, audit = previous.m5.row_weights(prep)
+        row_weight, weight_audit = weights[BASE], audit[BASE]
     # New training windows must NOT be compared to the old dev row count/weight SHA.
-    prep.update(m3_graph=graph, m4_weights=weights[BASE],
+    prep.update(m3_graph=graph, m4_weights=row_weight,
                 m3_adj=v3.build_adj(signals["edge_users"], signals["edge_items"],
                                    graph["weights"].astype(np.float32), data["n_users"], data["n_items"]))
-    protocol = dict(code_version=CODE_VERSION, config=asdict(cfg), models=list(MODELS),
-                    total_fits=len(MODELS)*len(cfg.seeds), pilot_only=len(cfg.seeds)==1,
+    protocol = dict(code_version=CODE_VERSION, config=asdict(cfg), models=list(models_for(cfg)),
+                    total_fits=len(models_for(cfg))*len(cfg.seeds), pilot_only=len(cfg.seeds)==1,
                     split="last_seven_days_test", validation=False, holdout=False,
                     intervals=INTERVALS[cfg.dataset], source_revision=revision, input_hash=input_hash,
                     previously_exposed_test=True, unseen_confirmation_claim=False,
                     no_old_reference_reuse=True, no_early_stopping=True, test_evaluations_per_fit=1,
                     test_checkpoint="fixed epoch300 only", clv_input_days=cfg.input_days,
                     m4="split N/V B, invalid rows raw=1, normalized train-row mean",
-                    m4_weight_audit=audit[BASE], m3_beta=graph["beta"], m3_audit=graph["audit"],
+                    m4_weight_audit=weight_audit, m3_beta=graph["beta"], m3_audit=graph["audit"],
                     m2="q_C*[T0+(2q_N-1)*TN]*b(q_V), item=b(amount percentile); joint optimizer",
                     primary=f"{len(cfg.seeds)}-seed mean economic@10: full > M3+M4 and M1; six accuracy means >= .99*M1",
                     m2_standalone_diagnostic_only=True, significance_claim=False,
                     data_stats=data["data_stats"])
+    if hm_comparison:
+        protocol.update(m4="(1+.5*q_N)*(1+.5*q_V*price_percentile*fit), train-row mean normalized; H&M invalid CLV axes=0, no extra economic-valid mask",
+                        m2="not included", m2_standalone_diagnostic_only=False,
+                        primary="seed49 M5-B economic@10 > M1 and identical M4-B; six accuracy metrics >= .99*M1",
+                        comparison_scope="M3 addition conditional on M4-B; no factorial synergy or CLV attribution claim")
     identity = dict(version=CODE_VERSION, config=asdict(cfg), input_hash=input_hash,
-                    source_revision=revision, weights=audit[BASE]["sha256"], beta=graph["beta"])
+                    source_revision=revision, weights=weight_audit["sha256"], beta=graph["beta"])
     prep["config_hash"] = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
     root = Path(cfg.out_dir) / prep["config_hash"]
     prep.update(run_dir=root, protocol=protocol)
@@ -154,7 +180,7 @@ def prepare(cfg):
 
 
 def build_model(prep, cfg, model_id, seed):
-    if model_id not in MODELS or seed not in cfg.seeds:
+    if model_id not in models_for(cfg) or seed not in cfg.seeds:
         raise ValueError("사전등록 모형/시드가 아닙니다")
     v3.set_seed(seed)
     data = prep["data"]
@@ -181,7 +207,7 @@ def run_arm(prep, cfg, model_id, seed):
         return row
     model = build_model(prep, cfg, model_id, seed)
     store = ProgressStore(prep["run_dir"] / "progress", identity)
-    weights = prep["m4_weights"] if model_id in (BASE, FULL) else None
+    weights = prep["m4_weights"] if model_id in (M4_B, BASE, FULL) else None
     history = fixed._train(model, prep, cfg, model_id, seed, store, row_weights=weights)
     if len(history) != cfg.epochs or history[-1]["epoch"] != cfg.epochs:
         raise RuntimeError("고정 epoch 학습을 완료하지 않아 test를 평가하지 않습니다")
@@ -189,6 +215,9 @@ def run_arm(prep, cfg, model_id, seed):
     if not np.isfinite(list(metrics.values())).all():
         raise RuntimeError("최종 평가 지표에 비유한값이 있습니다")
     diagnostic = model.representation_diagnostics() if model_id in (M2, FULL) else {"rho": 0.}
+    diagnostic.update(graph="centered_nv" if model_id in (BASE,FULL) else "binary",
+                      row_weighted=weights is not None,
+                      weight_sha256=hashlib.sha256(weights.astype(np.float32).tobytes()).hexdigest() if weights is not None else None)
     row = dict(identity=asdict(identity), model_id=model_id, seed=seed, epochs=cfg.epochs,
                metrics=metrics, training_history=history, diagnostics=diagnostic)
     io._atomic_json(path, row)
@@ -202,7 +231,7 @@ def run_arm(prep, cfg, model_id, seed):
 
 def report(prep, cfg, rows):
     absolute = pd.DataFrame([dict(model_id=r["model_id"], seed=r["seed"], **r["metrics"]) for r in rows])
-    expected = {(m,s) for m in MODELS for s in cfg.seeds}
+    expected = {(m,s) for m in models_for(cfg) for s in cfg.seeds}
     if (len(absolute) != len(expected) or absolute.duplicated(["model_id","seed"]).any()
             or set(zip(absolute.model_id,absolute.seed)) != expected):
         raise RuntimeError(f"예정된 {len(expected)}개 실행 모두 완료 전에는 판독을 생성하지 않습니다")
@@ -213,7 +242,9 @@ def report(prep, cfg, rows):
     summary = absolute.melt(id_vars=["model_id","seed"], var_name="metric", value_name="value")
     summary = summary.groupby(["model_id","metric"]).value.agg(["mean","std","count"]).reset_index()
     paired, changes = [], []
-    for model, ref in ((M2,M1),(BASE,M1),(FULL,BASE),(FULL,M1)):
+    hm_comparison = cfg.experiment == "hm_m4b_m5b"
+    pairs = ((M4_B,M1),(BASE,M1),(BASE,M4_B)) if hm_comparison else ((M2,M1),(BASE,M1),(FULL,BASE),(FULL,M1))
+    for model, ref in pairs:
         a = absolute[absolute.model_id.eq(model)].set_index("seed").loc[list(cfg.seeds)]
         b = absolute[absolute.model_id.eq(ref)].set_index("seed").loc[list(cfg.seeds)]
         for metric in metrics:
@@ -229,13 +260,19 @@ def report(prep, cfg, rows):
                                 paired_delta_mean=float(delta.mean()),
                                 paired_delta_std=float(delta.std(ddof=1)) if len(cfg.seeds)>1 else None,
                                 seeds_improved=int((delta>0).sum()),seeds_total=len(cfg.seeds)))
-    guard = all(means.at[FULL,m] >= .99*means.at[M1,m] for m in ACCURACY)
-    economic = all(means.at[FULL,m] > max(means.at[M1,m],means.at[BASE,m]) for m in ECONOMIC)
+    target, reference = (BASE,M4_B) if hm_comparison else (FULL,BASE)
+    guard = all(means.at[target,m] >= .99*means.at[M1,m] for m in ACCURACY)
+    economic = all(means.at[target,m] > max(means.at[M1,m],means.at[reference,m]) for m in ECONOMIC)
     decision = dict(complete=True,seed_count=len(cfg.seeds),pilot_only=len(cfg.seeds)==1,
                     final_ten_seed_report=len(cfg.seeds)==10,accuracy_mean_guard=bool(guard),
                     both_economic_means_above_m1_and_m3_m4=bool(economic),
                     combination_condition_met=bool(guard and economic),
                     significance_claim=False,clv_attribution_claim=False,previously_exposed_test=True)
+    if hm_comparison:
+        decision.pop("both_economic_means_above_m1_and_m3_m4")
+        decision.update(both_economic_at10_above_m1_and_m4_b=bool(economic),
+                        accuracy_guard_vs_m4_b=bool(all(means.at[BASE,m]>=.99*means.at[M4_B,m] for m in ACCURACY)),
+                        evaluated_epoch=cfg.epochs,interaction_attribution_claim=False)
     tables = dict(absolute=absolute,summary=summary,comparison=pd.DataFrame(changes),
                   paired_comparison=pd.DataFrame(paired),
                   diagnostics=pd.DataFrame([dict(model_id=r["model_id"],seed=r["seed"],
@@ -255,7 +292,7 @@ def run(cfg, prep):
         raise ValueError("prepare 이후 설정이 변경됐습니다")
     rows = []
     for seed in cfg.seeds:
-        for model in MODELS:
-            print(f"[{len(rows)+1}/{len(MODELS)*len(cfg.seeds)}] {cfg.dataset} / seed{seed} / {model}",flush=True)
+        for model in models_for(cfg):
+            print(f"[{len(rows)+1}/{len(models_for(cfg))*len(cfg.seeds)}] {cfg.dataset} / seed{seed} / {model}",flush=True)
             rows.append(run_arm(prep,cfg,model,seed))
     return report(prep,cfg,rows)
