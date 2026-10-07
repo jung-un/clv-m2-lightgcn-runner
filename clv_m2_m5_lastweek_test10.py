@@ -26,6 +26,8 @@ M1, M2, BASE, FULL = previous.M1, previous.M2, previous.M5_BASE, previous.M5_FUL
 MODELS = (M1, BASE, M2, FULL)
 M4_B = previous.m5.ARM_M4_B
 M3 = previous.m5.m3.ARM_VALUE_ACTIVITY
+M4_A = "m4_binary_graph_original_m4_bpr_k1"
+M5_A = previous.m5.ARM_A
 ACCURACY, ECONOMIC = previous.ACCURACY, previous.ECONOMIC
 INTERVALS = {"dunnhumby": (1, 704, 711),
              "hm": ("2018-09-20", "2020-09-15", "2020-09-22")}
@@ -62,6 +64,11 @@ def configure(dataset="dunnhumby", *, out_dir=None, seeds=SEEDS, experiment="m2_
             raise ValueError("누락 비교는 Dunnhumby seed49만 허용합니다")
         return Config(experiment=experiment, seeds=seeds,
                       out_dir=out_dir or v3.default_out_dir(dataset)+"_m3_m4b_lastweek_seed49_v1")
+    if experiment == "dh_m4a_m5a_completion":
+        if dataset != "dunnhumby" or seeds != (49,):
+            raise ValueError("A형 누락 비교는 Dunnhumby seed49만 허용합니다")
+        return Config(experiment=experiment, seeds=seeds,
+                      out_dir=out_dir or v3.default_out_dir(dataset)+"_m4a_m5a_lastweek_seed49_v1")
     if experiment == "hm_m4b_m5b":
         if dataset != "hm" or seeds != (49,):
             raise ValueError("H&M M4-B/M5-B 비교는 hm·seed49만 허용합니다")
@@ -79,6 +86,8 @@ def configure(dataset="dunnhumby", *, out_dir=None, seeds=SEEDS, experiment="m2_
 def models_for(cfg):
     if cfg.experiment == "dh_m3_m4b_completion":
         return (M3, M4_B)
+    if cfg.experiment == "dh_m4a_m5a_completion":
+        return (M4_A, M5_A)
     return (M1, M4_B, BASE) if cfg.experiment == "hm_m4b_m5b" else MODELS
 
 
@@ -145,13 +154,15 @@ def prepare(cfg):
         prep[key] = econ[key]
     graph = fixed.build_graph(prep, cfg)
     hm_comparison = cfg.experiment == "hm_m4b_m5b"
+    a_comparison = cfg.experiment == "dh_m4a_m5a_completion"
     if hm_comparison:
         # Preserve the actual H&M B formula; only the training window changed.
         weights, audit = hm_m5.row_weights(prep, econ, check_development_reference=False)
         row_weight, weight_audit = weights["split_nv"], audit["split_nv"]
     else:
         weights, audit = previous.m5.row_weights(prep)
-        row_weight, weight_audit = weights[BASE], audit[BASE]
+        key = M5_A if a_comparison else BASE
+        row_weight, weight_audit = weights[key], audit[key]
     # New training windows must NOT be compared to the old dev row count/weight SHA.
     prep.update(m3_graph=graph, m4_weights=row_weight,
                 m3_adj=v3.build_adj(signals["edge_users"], signals["edge_items"],
@@ -180,6 +191,14 @@ def prepare(cfg):
                         reference_policy="only SHA-pinned lastweek seed49 M1/M5-B; no retraining or reevaluation",
                         primary="M5-B economic@10 > M1/M3/M4-B; six accuracy metrics >= .99*M1 and .99*best standalone; all guards reported separately; new descriptive rule, no replacement of original decision",
                         comparison_scope="complete M1/M3/M4-B/M5-B factorial; descriptive only")
+    if a_comparison:
+        protocol.update(
+            m4="original A: 1+.5*q_C*item_amount_percentile*user_economic_bin_fit; invalid rows raw=1; train-row mean normalized",
+            m2="not included", m2_standalone_diagnostic_only=False,
+            no_old_reference_reuse=False,
+            reference_policy="only SHA-pinned lastweek seed49 M1/M3/M4-B/M5-B; no retraining or reevaluation",
+            primary="M5-A economic@10 > M1/M3/M4-A; six accuracy metrics >= .99*M1 and .99*best standalone; A/B comparison descriptive only",
+            comparison_scope="add M4-A and M5-A to the existing six-cell A/B factorial; descriptive pilot only")
     identity = dict(version=CODE_VERSION, config=asdict(cfg), input_hash=input_hash,
                     source_revision=revision, weights=weight_audit["sha256"], beta=graph["beta"])
     prep["config_hash"] = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
@@ -205,7 +224,7 @@ def build_model(prep, cfg, model_id, seed):
                user_q_n=prep["q_n"], user_q_v=prep["q_v"], user_q_c=prep["q_c"],
                user_clv_valid=prep["clv_valid"], item_price_percentile=prep["item_amount_percentile"],
                item_price_valid=prep["item_economic_valid"],
-               adj=prep["m3_adj"] if model_id in (M3, BASE, FULL) else data["adj"],
+               adj=prep["m3_adj"] if model_id in (M3, BASE, FULL, M5_A) else data["adj"],
                id_dim=cfg.id_dim, n_layers=cfg.n_layers, pref_reg=cfg.pref_reg,
                rho=cfg.rho if has_m2 else 0., basis_bandwidth=cfg.basis_bandwidth, **options).to(v3.DEVICE)
 
@@ -221,7 +240,7 @@ def run_arm(prep, cfg, model_id, seed):
         return row
     model = build_model(prep, cfg, model_id, seed)
     store = ProgressStore(prep["run_dir"] / "progress", identity)
-    weights = prep["m4_weights"] if model_id in (M4_B, BASE, FULL) else None
+    weights = prep["m4_weights"] if model_id in (M4_B, BASE, FULL, M4_A, M5_A) else None
     history = fixed._train(model, prep, cfg, model_id, seed, store, row_weights=weights)
     if len(history) != cfg.epochs or history[-1]["epoch"] != cfg.epochs:
         raise RuntimeError("고정 epoch 학습을 완료하지 않아 test를 평가하지 않습니다")
@@ -229,7 +248,7 @@ def run_arm(prep, cfg, model_id, seed):
     if not np.isfinite(list(metrics.values())).all():
         raise RuntimeError("최종 평가 지표에 비유한값이 있습니다")
     diagnostic = model.representation_diagnostics() if model_id in (M2, FULL) else {"rho": 0.}
-    diagnostic.update(graph="centered_nv" if model_id in (M3,BASE,FULL) else "binary",
+    diagnostic.update(graph="centered_nv" if model_id in (M3,BASE,FULL,M5_A) else "binary",
                       row_weighted=weights is not None,
                       weight_sha256=hashlib.sha256(weights.astype(np.float32).tobytes()).hexdigest() if weights is not None else None)
     row = dict(identity=asdict(identity), model_id=model_id, seed=seed, epochs=cfg.epochs,
@@ -302,7 +321,7 @@ def report(prep, cfg, rows):
 
 
 def run(cfg, prep):
-    if cfg.experiment == "dh_m3_m4b_completion":
+    if cfg.experiment in ("dh_m3_m4b_completion", "dh_m4a_m5a_completion"):
         raise ValueError("기준 결과 검증이 필요한 실험입니다. clv_dh_m3_m4b_lastweek_completion.run을 사용하세요")
     if json.loads(json.dumps(asdict(cfg))) != json.loads(json.dumps(prep["protocol"]["config"])):
         raise ValueError("prepare 이후 설정이 변경됐습니다")
