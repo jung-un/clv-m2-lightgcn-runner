@@ -566,7 +566,7 @@ def _public_per_user(per_user: dict) -> dict:
 
 def _atomic_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.{time.time_ns()}.tmp")
     temporary.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
@@ -576,7 +576,7 @@ def _atomic_json(path: Path, payload: dict) -> None:
 
 def _atomic_csv(path: Path, frame: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.{time.time_ns()}.tmp")
     frame.to_csv(temporary, index=False, float_format="%.10g")
     os.replace(temporary, path)
 
