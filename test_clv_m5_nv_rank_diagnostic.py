@@ -128,20 +128,21 @@ class RankDiagnosticTest(unittest.TestCase):
         from clv_hm_m1_m5_error_diagnostic import attach_hm_features
         users = pd.DataFrame(dict(seed=[43], user=[0], segment=['고CLV'], q_n=[.9],
             q_v=[.8], clv_valid=[True], degree=[2], truth_count=[1]))
-        train = pd.DataFrame(dict(u_idx=[0, 0, 1, 1], i_idx=[0, 1, 0, 2],
-                                  v=[2., 6., 4., 8.]))
+        train = pd.DataFrame(dict(u_idx=[0, 0, 0, 1, 1], i_idx=[0, 0, 1, 0, 2],
+                                  v=[1., 1., 6., 4., 8.]))
         prep = dict(data=dict(train=train, n_items=4,
-            tr_u=np.array([0, 0, 1, 1]), tr_i=np.array([0, 1, 0, 2])),
+            tr_u=np.array([0, 0, 0, 1, 1]), tr_i=np.array([0, 0, 1, 0, 2]),
+            pos_key=np.array([0, 1, 4, 6])),
             item_cat=np.array([0, 1, 0, 1]),
             item_amount_percentile=np.array([.2, .8, .6, .4]),
             item_economic_valid=np.ones(4, bool))
         candidates = pd.DataFrame(dict(seed=[43, 43], user=[0, 0], item=[0, 2]))
         actual = attach_hm_features(candidates, users, prep)
         self.assertEqual(actual.item_buyers.tolist(), [2, 1])
-        np.testing.assert_allclose(actual.category_row_share, [.5, .5])
+        np.testing.assert_allclose(actual.category_row_share, [2 / 3, 2 / 3])
         np.testing.assert_allclose(actual.category_spend_share, [.25, .25])
         np.testing.assert_allclose(actual.user_amount_position, [.65, .65])
-        self.assertEqual(prep['_hm_candidate_feature_context']['filtered_train_rows'], 2)
+        self.assertEqual(prep['_hm_candidate_feature_context']['filtered_train_rows'], 3)
 
     def test_hm_compact_checkpoint_identity_is_strict(self):
         import tempfile

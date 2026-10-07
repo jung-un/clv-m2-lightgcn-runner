@@ -89,10 +89,10 @@ def _feature_context(prepared: dict, evaluation_users: np.ndarray) -> dict:
         return cached
 
     data = prepared["data"]
-    edge_users = np.asarray(data["tr_u"], np.int64)
-    edge_items = np.asarray(data["tr_i"], np.int64)
-    if len(np.unique(edge_users * data["n_items"] + edge_items)) != len(edge_items):
-        raise RuntimeError("H&M 그래프 엣지가 고객-상품 중복을 포함합니다")
+    edge_keys = np.asarray(data["pos_key"], np.int64)
+    if edge_keys.ndim != 1 or np.any(edge_keys[1:] <= edge_keys[:-1]):
+        raise RuntimeError("H&M 고유 그래프 엣지 키가 정렬·중복제거되지 않았습니다")
+    edge_items = edge_keys % data["n_items"]
     buyers = np.bincount(edge_items, minlength=data["n_items"])
 
     train = data["train"]
