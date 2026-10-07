@@ -43,3 +43,22 @@ def test_strength_changes_priority_but_not_customer_mass():
 
     assert strong[1] / strong[0] > weak[1] / weak[0]
     assert np.allclose(np.bincount(users, weights=strong), [2.0, 2.0])
+
+
+def test_comparison_adds_previous_arms_only_when_present():
+    metrics = {metric: 1.0 for metric in (*screen.ACCURACY, *screen.ECONOMIC)}
+    rows = []
+    for epoch in (screen.DIAGNOSTIC_EPOCH, screen.FIXED_EPOCH):
+        for model_id in (screen.m3.M1_MODEL_ID, screen.m3.ARM_VALUE_ACTIVITY, screen.MODEL_ID):
+            rows.append(dict(model_id=model_id, seed=42, epoch=epoch, **metrics))
+    basic = screen._comparison(screen.pd.DataFrame(rows), 42)
+    assert set(basic.reference) == {screen.m3.M1_MODEL_ID, screen.m3.ARM_VALUE_ACTIVITY}
+
+    for epoch in (screen.DIAGNOSTIC_EPOCH, screen.FIXED_EPOCH):
+        for model_id in (screen.prior.ARM_A, screen.prior.ARM_B):
+            rows.append(dict(model_id=model_id, seed=42, epoch=epoch, **metrics))
+    expanded = screen._comparison(screen.pd.DataFrame(rows), 42)
+    assert set(expanded.reference) == {
+        screen.m3.M1_MODEL_ID, screen.m3.ARM_VALUE_ACTIVITY,
+        screen.prior.ARM_A, screen.prior.ARM_B,
+    }

@@ -151,13 +151,61 @@ def row_weights(prepared: dict) -> tuple[np.ndarray, dict]:
     )
 
 
+def _previous_m5_curves(cfg, input_hash: str, beta: float) -> tuple[pd.DataFrame, dict | None]:
+    """Reuse exact M5-A/B rows for seed44; never retrain them here."""
+    seed = cfg.seeds[0]
+    if seed != 44:
+        return pd.DataFrame(), None
+    root = Path(
+        f"{v3.default_out_dir('dunnhumby')}_clv_m5_m3_m4_split_nv_s{seed}_v1"
+    )
+    matches = sorted(root.glob(f"{prior.CODE_VERSION}_*.json"))
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"동일 seed44 M5-A/B 결과 JSON이 필요합니다: {root} "
+            "— 기준모형을 자동 재학습하지 않고 중단합니다."
+        )
+    path = matches[0]
+    raw = path.read_bytes()
+    old = json.loads(raw)
+    fixed = (
+        "epochs", "eval_every", "batch_size", "lr", "n_layers", "id_dim",
+        "pref_reg", "negative_count", "target_cv",
+    )
+    if (old.get("seed") != seed or old.get("input_hash") != input_hash
+            or old.get("split") != "historical_development_days_684_690"
+            or old.get("final_test") is not False or old.get("holdout") is not False
+            or any(old["config"][key] != getattr(cfg, key) for key in fixed)
+            or not np.isclose(old.get("beta"), beta, rtol=0, atol=1e-12)):
+        raise RuntimeError("기존 seed44 M5-A/B와 M5-C의 입력·분할·학습설정·M3가 다릅니다")
+    absolute = Path(old["result_paths"]["absolute_csv"])
+    if not absolute.is_file():
+        raise RuntimeError(f"기존 seed44 M5-A/B absolute CSV가 없습니다: {absolute}")
+    curve = pd.read_csv(absolute)
+    keep = (prior.ARM_A, prior.ARM_B)
+    curve = curve[curve.model_id.isin(keep) & curve.seed.eq(seed)].copy()
+    for model_id in keep:
+        if set(curve.loc[curve.model_id.eq(model_id), "epoch"]) != set(range(25, 301, 25)):
+            raise RuntimeError(f"기존 {model_id} seed44의 25~300epoch 곡선이 완전하지 않습니다")
+    return curve, {
+        "path": str(path),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "absolute_path": str(absolute),
+        "absolute_sha256": hashlib.sha256(absolute.read_bytes()).hexdigest(),
+        "models": list(keep),
+    }
+
+
 def _comparison(curve: pd.DataFrame, seed: int) -> pd.DataFrame:
     index = curve.set_index(["model_id", "seed", "epoch"])
     metrics = [column for column in curve.columns if "@" in column
                or column == "user_value_tendency_recommended_price_alignment"]
     rows = []
+    references = [m3.M1_MODEL_ID, m3.ARM_VALUE_ACTIVITY]
+    if {prior.ARM_A, prior.ARM_B}.issubset(set(curve.model_id)):
+        references.extend((prior.ARM_A, prior.ARM_B))
     for epoch in (DIAGNOSTIC_EPOCH, FIXED_EPOCH):
-        for reference in (m3.M1_MODEL_ID, m3.ARM_VALUE_ACTIVITY):
+        for reference in references:
             candidate = index.loc[(MODEL_ID, seed, epoch)]
             baseline = index.loc[(reference, seed, epoch)]
             for metric in metrics:
@@ -226,6 +274,9 @@ def run(cfg=None) -> dict:
                       if spec["model_id"] == m3.ARM_VALUE_ACTIVITY)
     graph = m3.build_arm_graph(prepared, cfg, graph_spec)
     old_curve, old_reference = prior._original_curves(cfg, graph["beta"])
+    previous_m5_curve, previous_m5_reference = _previous_m5_curves(
+        cfg, prepared["input_hash"], graph["beta"]
+    )
     weights, weight_audit = row_weights(prepared)
 
     old_hash = prepared["config_hash"]
@@ -258,7 +309,9 @@ def run(cfg=None) -> dict:
         {**graph, "row_weights": weights},
         seed,
     )
-    curve = pd.concat([old_curve, m3.curve_table([arm], {})], ignore_index=True)
+    curve = pd.concat(
+        [old_curve, previous_m5_curve, m3.curve_table([arm], {})], ignore_index=True
+    )
     if curve.duplicated(["model_id", "seed", "epoch"]).any():
         raise RuntimeError("비교 곡선에 중복 model/seed/epoch가 있습니다")
     comparison = _comparison(curve, seed)
@@ -292,6 +345,7 @@ def run(cfg=None) -> dict:
         "m3_audit": graph["audit"],
         "m4_c_weight_audit": weight_audit,
         "old_m1_m3_reference": old_reference,
+        "old_m5_a_b_reference": previous_m5_reference,
         "dropped_stale_progress": stale,
         "reading": reading,
         "limits": (
