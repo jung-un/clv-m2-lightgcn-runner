@@ -3,6 +3,18 @@ import numpy as np
 import clv_m5_m3_m4_user_centered_screen as screen
 
 
+def test_only_preregistered_development_seeds_are_allowed():
+    assert screen.configure(42).seeds == (42,)
+    assert screen.configure(44).seeds == (44,)
+
+    try:
+        screen.configure(43)
+    except ValueError as exc:
+        assert "seed" in str(exc)
+    else:
+        raise AssertionError("seed43 must remain outside this exact replication")
+
+
 def test_customer_mass_is_preserved_and_invalid_rows_stay_plain():
     users = np.array([0, 0, 0, 1, 1, 2])
     q_c = np.array([1.0, 0.5, 0.9])

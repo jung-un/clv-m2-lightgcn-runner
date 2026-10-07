@@ -29,7 +29,10 @@ import lightgcn_clv_v3 as v3
 
 CODE_VERSION = "clv-m5-m3-m4-user-centered-dev-v1"
 MODEL_ID = "m5_m3nv_graph_user_centered_m4_bpr_k1"
-SEED = 42
+DEFAULT_SEED = 42
+ALLOWED_SEEDS = (42, 44)
+# Backward-compatible label used by the already published seed42 notebook.
+SEED = DEFAULT_SEED
 LAMBDA = 0.5
 FIXED_EPOCH = 300
 DIAGNOSTIC_EPOCH = 100
@@ -37,18 +40,20 @@ ACCURACY = tuple(f"{name}@{k}" for name in ("recall", "ndcg") for k in (10, 20, 
 ECONOMIC = ("price_purchase_amount_weighted_hit@10", "vndcg@10")
 
 
-def configure(**overrides):
+def configure(seed: int = DEFAULT_SEED, **overrides):
     root = v3.default_out_dir("dunnhumby")
     defaults = {
-        "seeds": (SEED,),
+        "seeds": (seed,),
         "epochs": FIXED_EPOCH,
         "eval_every": 25,
-        "out_dir": f"{root}_clv_m5_m3_m4_user_centered_s{SEED}_v1",
+        "out_dir": f"{root}_clv_m5_m3_m4_user_centered_s{seed}_v1",
     }
     cfg = m3.configure_centered_graph(**(defaults | overrides))
-    if (cfg.seeds != (SEED,) or cfg.epochs != FIXED_EPOCH
+    if (cfg.seeds != (seed,) or seed not in ALLOWED_SEEDS or cfg.epochs != FIXED_EPOCH
             or cfg.eval_every != 25 or cfg.allow_baseline_training):
-        raise ValueError("Dunnhumby 개발 seed42·300epoch·25간격·기존 M1/M3 재사용만 허용합니다")
+        raise ValueError(
+            f"Dunnhumby 개발 seed{ALLOWED_SEEDS}·300epoch·25간격·기존 M1/M3 재사용만 허용합니다"
+        )
     return cfg
 
 
@@ -146,19 +151,19 @@ def row_weights(prepared: dict) -> tuple[np.ndarray, dict]:
     )
 
 
-def _comparison(curve: pd.DataFrame) -> pd.DataFrame:
+def _comparison(curve: pd.DataFrame, seed: int) -> pd.DataFrame:
     index = curve.set_index(["model_id", "seed", "epoch"])
     metrics = [column for column in curve.columns if "@" in column
                or column == "user_value_tendency_recommended_price_alignment"]
     rows = []
     for epoch in (DIAGNOSTIC_EPOCH, FIXED_EPOCH):
         for reference in (m3.M1_MODEL_ID, m3.ARM_VALUE_ACTIVITY):
-            candidate = index.loc[(MODEL_ID, SEED, epoch)]
-            baseline = index.loc[(reference, SEED, epoch)]
+            candidate = index.loc[(MODEL_ID, seed, epoch)]
+            baseline = index.loc[(reference, seed, epoch)]
             for metric in metrics:
                 base, value = float(baseline[metric]), float(candidate[metric])
                 rows.append({
-                    "seed": SEED,
+                    "seed": seed,
                     "epoch": epoch,
                     "model_id": MODEL_ID,
                     "reference": reference,
@@ -214,7 +219,8 @@ def self_test() -> None:
 
 
 def run(cfg=None) -> dict:
-    cfg = configure() if cfg is None else configure(**asdict(cfg))
+    cfg = configure() if cfg is None else configure(cfg.seeds[0], **asdict(cfg))
+    seed = cfg.seeds[0]
     prepared = m3._prepare(cfg)
     graph_spec = next(spec for spec in m3.arm_specifications()
                       if spec["model_id"] == m3.ARM_VALUE_ACTIVITY)
@@ -237,7 +243,7 @@ def run(cfg=None) -> dict:
     }
     print(json.dumps({
         "scope": "Dunnhumby historical development only",
-        "seed": SEED,
+        "seed": seed,
         "fixed_epoch": FIXED_EPOCH,
         "m3_beta": graph["beta"],
         "m3_audit": graph["audit"],
@@ -250,12 +256,12 @@ def run(cfg=None) -> dict:
         cfg,
         spec,
         {**graph, "row_weights": weights},
-        SEED,
+        seed,
     )
     curve = pd.concat([old_curve, m3.curve_table([arm], {})], ignore_index=True)
     if curve.duplicated(["model_id", "seed", "epoch"]).any():
         raise RuntimeError("비교 곡선에 중복 model/seed/epoch가 있습니다")
-    comparison = _comparison(curve)
+    comparison = _comparison(curve, seed)
     reading = _reading(comparison)
 
     out = Path(cfg.out_dir)
@@ -270,7 +276,7 @@ def run(cfg=None) -> dict:
     io._atomic_json(paths["json"], {
         "code_version": CODE_VERSION,
         "config": asdict(cfg),
-        "seed": SEED,
+        "seed": seed,
         "lambda": LAMBDA,
         "source_revision": prepared["revision"],
         "input_hash": prepared["input_hash"],
