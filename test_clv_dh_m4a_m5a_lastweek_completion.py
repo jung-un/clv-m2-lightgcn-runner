@@ -95,6 +95,7 @@ class ACompletionChecks(unittest.TestCase):
             prep.update(run_dir=Path(d),reference_protocol=reference["protocol"],
                         reference_sha256=s.REFERENCE_SHA)
             result=s.report(prep,cfg,reference["rows"]+a_rows)
+            self.assertTrue(result["complete"])
             self.assertEqual(len(result["absolute"]),6)
             self.assertEqual(len(result["comparison"]),11*142)
             self.assertEqual(len(result["interaction"]),2*142)

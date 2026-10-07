@@ -214,7 +214,7 @@ def report(prep, cfg, rows):
         protocol=prep["protocol"], reference_protocol=prep["reference_protocol"],
         reference_sha256=prep["reference_sha256"], rows=rows,
         reading=reading, paths=paths))
-    return dict(**tables, reading=reading, paths=paths)
+    return dict(complete=True, **tables, reading=reading, paths=paths)
 
 
 def report_if_complete(cfg, prep):
