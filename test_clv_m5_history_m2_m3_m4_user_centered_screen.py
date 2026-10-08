@@ -1,6 +1,14 @@
+import ast
+import json
+from pathlib import Path
+
 import pandas as pd
 
 import clv_m5_history_m2_m3_m4_user_centered_screen as screen
+
+
+NOTEBOOK = Path("clv_m5_history_m2_m3_m4_user_centered_colab.ipynb")
+SOURCE_COMMIT = "d1aa9642628aa92b90da3facdf5de9a4ab6ec33d"
 
 
 def _synthetic_curve(*, full_economic_delta: float = 0.02) -> pd.DataFrame:
@@ -106,3 +114,17 @@ def test_strict_gate_requires_both_economic_metrics_in_both_seeds():
     failed = screen.reading(failed_curve, failed_comparison)
     assert not failed["full_both_economic_at10_above_m3_m4_c_mean"]
     assert not failed["strict_two_seed_condition_met"]
+
+
+def test_colab_is_valid_and_pins_the_reviewed_source_commit():
+    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    code = "\n".join(
+        "".join(cell["source"])
+        for cell in notebook["cells"]
+        if cell["cell_type"] == "code"
+    )
+    ast.parse(code)
+    assert f"SOURCE_COMMIT = '{SOURCE_COMMIT}'" in code
+    assert "result = screen.run()" in code
+    assert "final_test" not in code
+    assert "holdout" not in code
