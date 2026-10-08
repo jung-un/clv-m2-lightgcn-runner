@@ -32,8 +32,8 @@ def test_m1_is_retrained_once_per_shared_setting_not_once_per_condition():
     m1 = [s for s in specs if s["model_id"] == search.M1_MODEL_ID]
     m2 = [s for s in specs if s["model_id"] == search.M2_MODEL_ID]
 
-    # five conditions, but three of them share the 64-dim / L2 1e-3 M1
-    assert len(m2) == len(search.CONDITIONS) == 5
+    # six conditions, but four of them share the 64-dim / L2 1e-3 M1
+    assert len(m2) == len(search.CONDITIONS) == 6
     assert {search.shared_baseline(s) for s in m1} == {
         "dim64_l20.001", "dim128_l20.001", "dim64_l20.0001"
     }
@@ -56,7 +56,7 @@ def test_each_condition_changes_exactly_one_knob_from_the_baseline():
 def test_intervention_strength_is_not_reported_as_an_underfitting_test():
     summary = search.preflight_summary(_cfg())
 
-    assert summary["not_an_underfitting_test"] == ["strong_signal"]
+    assert summary["not_an_underfitting_test"] == ["strong_signal", "weak_signal"]
     assert "intervention_strength" in summary["hypotheses"]
 
 

@@ -8,14 +8,16 @@ cannot say whether development accuracy was still rising, already flat, or
 past its peak.
 
 This runner trains to 300 epochs and evaluates every ``eval_every`` epochs, so
-one run yields the whole learning curve.  Four conditions separate the knobs
+one run yields the whole learning curve.  Six conditions separate the knobs
 the advisor named, one change at a time, with M1 retrained under every shared
 setting so each comparison stays paired:
 
 * ``baseline``       - the protocol as run so far (64 dims, L2 1e-3, rho 0.05)
 * ``wide``           - capacity: 128 dims
+* ``axis_wide``      - N/V axis capacity: four to eight dimensions per axis
 * ``light_l2``       - regularization: L2 1e-4
 * ``strong_signal``  - intervention strength: rho 0.10 (the model's own cap)
+* ``weak_signal``    - intervention strength: rho 0.025
 
 The epoch axis is free inside a run, so it is never a grid dimension.  No
 condition is selected here: seed 42 screens the curves, and any shortlisted
@@ -74,6 +76,7 @@ CONDITIONS = (
     Condition("axis_wide", "clv_block_capacity", 64, 1e-3, 0.05, 8),
     Condition("light_l2", "regularization", 64, 1e-4, 0.05, 4),
     Condition("strong_signal", "intervention_strength", 64, 1e-3, 0.10, 4),
+    Condition("weak_signal", "intervention_strength", 64, 1e-3, 0.025, 4),
 )
 
 
