@@ -241,6 +241,67 @@ def test_memory_fix_reuses_inputs_without_preparation_and_preserves_old_run(tmp_
         s.reuse_prepared_after_memory_fix(cfg, prep)
 
 
+def test_local_first_progress_writes_drive_only_at_durable_boundary(tmp_path):
+    identity = s.RunIdentity(s.CODE_VERSION, s.MODEL_ID, 48, "config", "source", "input")
+    local = tmp_path / "local"
+    durable = tmp_path / "drive"
+    store = s.LocalFirstProgressStore(
+        local, durable, identity, max_epoch=3, durable_every=2,
+    )
+    net = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
+    rng = np.random.default_rng(48)
+
+    store.mark_stage("running", epoch=0, max_epoch=3)
+    store.heartbeat(epoch=1, max_epoch=3, batch=1, batches=2)
+    assert not durable.exists()
+    store.save_epoch(net, optimizer, rng, epoch=1, history=[])
+    assert store.latest_checkpoint.is_file()
+    assert not store.durable_checkpoint.exists()
+    store.save_epoch(net, optimizer, rng, epoch=2, history=[])
+    assert store.durable_checkpoint.is_file()
+    assert store.durable_state.is_file()
+    assert not (durable / "progress.json").exists()
+    assert not (durable / "progress.csv").exists()
+
+    recovered = s.LocalFirstProgressStore(
+        tmp_path / "new-local", durable, identity, max_epoch=3, durable_every=2,
+    )
+    restored = torch.nn.Linear(2, 1)
+    restored_optimizer = torch.optim.Adam(restored.parameters(), lr=1e-3)
+    state = recovered.restore_epoch(restored, restored_optimizer, np.random.default_rng(48))
+    assert state["next_epoch"] == 3
+
+
+def test_drive_io_fix_migrates_exact_previous_checkpoint_without_deleting_it(tmp_path):
+    old_identity = s.RunIdentity(
+        s.PREVIOUS_CODE_VERSION, s.MODEL_ID, 48, "old-config", "old-source", "input",
+    )
+    old_store = s.ProgressStore(tmp_path / "old-drive", old_identity)
+    net = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
+    old_store.save_epoch(net, optimizer, np.random.default_rng(48), epoch=7, history=[])
+    old_sha = s.file_sha256(old_store.latest_checkpoint)
+
+    new_identity = s.RunIdentity(
+        s.CODE_VERSION, s.MODEL_ID, 48, "new-config", "new-source", "input",
+    )
+    migrated = s.LocalFirstProgressStore(
+        tmp_path / "new-local", tmp_path / "new-drive", new_identity,
+        max_epoch=300, resume_source=old_store.latest_checkpoint,
+        resume_source_identity=asdict(old_identity),
+    )
+    restored = torch.nn.Linear(2, 1)
+    restored_optimizer = torch.optim.Adam(restored.parameters(), lr=1e-3)
+    state = migrated.restore_epoch(
+        restored, restored_optimizer, np.random.default_rng(48),
+    )
+    assert state["next_epoch"] == 8
+    assert s.file_sha256(old_store.latest_checkpoint) == old_sha
+    payload = torch.load(migrated.latest_checkpoint, map_location="cpu", weights_only=False)
+    assert payload["identity"] == asdict(new_identity)
+
+
 def test_one_arm_shared_loop_resume_and_cache(tmp_path):
     _, _, _, prep = toy()
     prep["out_dir"] = tmp_path

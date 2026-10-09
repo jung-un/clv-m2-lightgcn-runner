@@ -4,23 +4,34 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 
 import numpy as np
 import pandas as pd
+import torch
 
 import clv_m2_nv_conditional_basis_screen as baseline
 import clv_m5_m3_m4_user_centered_screen as m4
 from clv_m5_shared_attributes_model import JointAttributeLightGCN, build_signals
-from clv_run_state import ProgressStore, RunIdentity
+from clv_run_state import (
+    ProgressStore,
+    RunIdentity,
+    _atomic_json,
+    _atomic_torch,
+    file_sha256,
+)
 import lightgcn_clv_axis_specific_test10 as io
 import lightgcn_clv_component_recheck as recheck
 import lightgcn_clv_m2_capacity_search as capacity
 import lightgcn_clv_v3 as v3
 
-CODE_VERSION = "clv-m5-shared-attributes-seed48-dev-v1-edge-backward-fix"
+CODE_VERSION = "clv-m5-shared-attributes-seed48-dev-v1-edge-backward-drive-io-fix"
+PREVIOUS_CODE_VERSION = "clv-m5-shared-attributes-seed48-dev-v1-edge-backward-fix"
 MODEL_ID = "m5_shared_attributes_nv_learned_graph_user_centered_bpr_k1"
 SPLIT = baseline.SPLIT
+DURABLE_CHECKPOINT_EVERY = 25
 
 
 @dataclass(frozen=True)
@@ -37,7 +48,7 @@ class Config:
     eta: float = .1
     epsilon: float = .1
     kappa: float = .2
-    out_dir: str = baseline.ROOT + "_m5_shared_attributes_seed48_dev_v1_edge_backward_fix"
+    out_dir: str = baseline.ROOT + "_m5_shared_attributes_seed48_dev_v1_edge_backward_drive_io_fix"
     baseline_json: str = baseline.Config().baseline_json
 
 
@@ -101,6 +112,7 @@ def prepare(cfg=None):
         "final_test": False, "holdout": False, "selection": "none; fixed epoch300",
         "same_forward_one_optimizer": True, "pretraining_or_freeze": False,
         "propagation_backward": "exact first-order edge gradients; chunk65536; no dense node-square dA",
+        "checkpoint_io": "epoch-local on Colab VM; Drive recovery checkpoint every25 epochs; no Drive heartbeat",
         "external_score_addition_or_reranking": False, "min_item_interactions": 1,
         "new_item_task": True, "negative": "uniform unseen K=1",
         "m2": "shared subtype8+price8; N/V-conditioned per-feature history modulation; positive item LOO",
@@ -129,6 +141,100 @@ def build_model(cfg, prepared):
         signals=prepared["signals"], q_n=prepared["q_n"], q_v=prepared["q_v"],
         valid=prepared["clv_valid"], id_dim=cfg.id_dim, n_layers=cfg.n_layers,
         pref_reg=cfg.pref_reg, eta=cfg.eta, epsilon=cfg.epsilon, kappa=cfg.kappa).to(v3.DEVICE)
+
+
+def _runtime_progress_root(prepared):
+    """Keep frequent writes on the Colab VM, never on mounted Drive."""
+    base = Path("/content") if Path("/content").is_dir() else Path(prepared["out_dir"])
+    return base / ".clv_m5_shared_attributes_seed48_runtime" / prepared["config_hash"]
+
+
+class LocalFirstProgressStore(ProgressStore):
+    """Epoch-local resume with sparse durable snapshots.
+
+    The parent store still records every epoch and minute heartbeat, but its
+    root is the Colab VM.  Only evaluation-boundary checkpoints (25 epochs)
+    and completion metadata touch Drive.
+    """
+
+    def __init__(self, local_root, durable_root, identity, *, max_epoch,
+                 durable_every=DURABLE_CHECKPOINT_EVERY,
+                 resume_source=None, resume_source_identity=None):
+        super().__init__(local_root, identity)
+        self.durable_root = Path(durable_root)
+        self.max_epoch = int(max_epoch)
+        self.durable_every = int(durable_every)
+        safe = f"{identity.stage}_{identity.model_id}_s{identity.seed}"
+        self.durable_checkpoint = self.durable_root / "resume" / f"{safe}_latest.pt"
+        self.durable_state = self.durable_root / "stages" / f"{safe}.durable.json"
+        self.durable_complete = self.durable_root / "stages" / f"{safe}.completed.json"
+        if self.durable_every <= 0:
+            raise ValueError("Drive checkpoint interval must be positive")
+        self._bootstrap(resume_source, resume_source_identity)
+
+    @staticmethod
+    def _load_exact(path):
+        try:
+            return torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as error:
+            raise RuntimeError(f"복구 checkpoint를 읽을 수 없습니다(원본 보존): {path}") from error
+
+    def _bootstrap(self, resume_source, resume_source_identity):
+        if self.latest_checkpoint.is_file():
+            return
+        source = self.durable_checkpoint if self.durable_checkpoint.is_file() else None
+        expected = asdict(self.identity)
+        migrated = False
+        if source is None and resume_source and Path(resume_source).is_file():
+            source = Path(resume_source)
+            if resume_source_identity is None:
+                raise RuntimeError("이전 checkpoint 신원이 없습니다")
+            expected = dict(resume_source_identity)
+            migrated = True
+        if source is None:
+            return
+        payload = self._load_exact(source)
+        if payload.get("identity") != expected:
+            raise RuntimeError("복구 checkpoint identity mismatch")
+        if migrated:
+            payload = dict(payload)
+            payload["identity"] = asdict(self.identity)
+        _atomic_torch(self.latest_checkpoint, payload)
+        action = "이전 저장본 이관" if migrated else "Drive 복구본 로드"
+        print(f"  [{action}] epoch {int(payload['epoch'])} → Colab 로컬", flush=True)
+
+    def _sync_durable(self, epoch):
+        self.durable_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.durable_checkpoint.with_suffix(self.durable_checkpoint.suffix + ".tmp")
+        shutil.copyfile(self.latest_checkpoint, temporary)
+        os.replace(temporary, self.durable_checkpoint)
+        _atomic_json(self.durable_state, {
+            "identity": asdict(self.identity),
+            "epoch": int(epoch),
+            "max_epoch": self.max_epoch,
+            "checkpoint_path": str(self.durable_checkpoint),
+            "checkpoint_sha256": file_sha256(self.durable_checkpoint),
+            "drive_write_policy": f"checkpoint every {self.durable_every} epochs; no heartbeat",
+        })
+        print(f"  [Drive 복구본] epoch {int(epoch)} 저장", flush=True)
+
+    def save_epoch(self, model, optimizer, rng, **epoch_state):
+        path = super().save_epoch(model, optimizer, rng, **epoch_state)
+        epoch = int(epoch_state["epoch"])
+        if epoch % self.durable_every == 0 or epoch == self.max_epoch:
+            self._sync_durable(epoch)
+        return path
+
+    def mark_complete(self, **fields):
+        payload = super().mark_complete(**fields)
+        complete = {
+            "identity": asdict(self.identity),
+            **payload,
+            "checkpoint_path": str(self.durable_checkpoint),
+            "drive_write_policy": f"checkpoint every {self.durable_every} epochs; no heartbeat",
+        }
+        _atomic_json(self.durable_complete, complete)
+        return complete
 
 
 def reuse_prepared_after_memory_fix(cfg, prepared):
@@ -161,6 +267,73 @@ def reuse_prepared_after_memory_fix(cfg, prepared):
     return ready
 
 
+def reuse_prepared_after_drive_io_fix(cfg, prepared):
+    """Reuse prepared arrays and, if present, migrate an exact old checkpoint."""
+    validate_config(cfg)
+    validate_prepared(prepared)
+    previous_preflight = prepared["preflight"]
+    if previous_preflight.get("code_version") != PREVIOUS_CODE_VERSION:
+        raise RuntimeError("Drive I/O 수정 직전 실행이 아닌 prepared입니다")
+    if previous_preflight.get("propagation_backward") != (
+            "exact first-order edge gradients; chunk65536; no dense node-square dA"):
+        raise RuntimeError("OOM 수정판의 prepared가 아닙니다")
+    old, provenance = baseline.load_baseline(cfg, prepared["input_hash"])
+    if provenance != prepared["baseline_provenance"]:
+        raise RuntimeError("기존 prepared와 M1 원본이 달라졌습니다")
+
+    previous_identity = RunIdentity(
+        PREVIOUS_CODE_VERSION, MODEL_ID, 48, prepared["config_hash"],
+        prepared["revision"], prepared["input_hash"],
+    )
+    safe = f"{previous_identity.stage}_{previous_identity.model_id}_s{previous_identity.seed}"
+    old_progress = Path(prepared["out_dir"]) / "progress" / prepared["config_hash"]
+    old_checkpoint = old_progress / "resume" / f"{safe}_latest.pt"
+    old_result = Path(prepared["out_dir"]) / "arms" / prepared["config_hash"] / "m5_s48.json"
+    if old_result.is_file():
+        raise RuntimeError("기존 실행이 이미 완료됐습니다. 이전 결과를 먼저 확인하세요")
+
+    preflight = dict(previous_preflight)
+    revision = capacity.moe.source_revision()
+    preflight.update(
+        code_version=CODE_VERSION,
+        config=asdict(cfg),
+        checkpoint_io=(
+            "epoch-local on Colab VM; Drive recovery checkpoint every25 epochs; "
+            "no Drive heartbeat"
+        ),
+        drive_io_fix_previous_source=prepared["revision"],
+        data_reprepared=False,
+    )
+    fingerprint = {
+        "version": CODE_VERSION,
+        "config": asdict(cfg),
+        "source": revision,
+        "input": prepared["input_hash"],
+        "baseline_sha": provenance["sha256"],
+        "metadata_sha": preflight["metadata_sha256"],
+    }
+    ready = dict(prepared)
+    ready.update(
+        out_dir=Path(cfg.out_dir),
+        revision=revision,
+        baseline=old,
+        preflight=preflight,
+        config_hash=hashlib.sha256(
+            json.dumps(fingerprint, sort_keys=True).encode()
+        ).hexdigest()[:12],
+        resume_source_checkpoint=str(old_checkpoint) if old_checkpoint.is_file() else None,
+        resume_source_identity=asdict(previous_identity),
+    )
+    io._atomic_json(Path(cfg.out_dir) / "preflight.json", preflight)
+    status = "이전 epoch checkpoint 이관 예정" if old_checkpoint.is_file() else "완료 epoch 없음"
+    print(
+        f"[Drive I/O 수정] 데이터·CLV·M4 입력 재사용, {status}. "
+        "빈번한 진행기록은 Colab 로컬, Drive 복구본은 25epoch마다 저장.",
+        flush=True,
+    )
+    return ready
+
+
 def run_arm(cfg, prepared):
     identity = RunIdentity(CODE_VERSION, MODEL_ID, 48, prepared["config_hash"],
                            prepared["revision"], prepared["input_hash"])
@@ -172,7 +345,13 @@ def run_arm(cfg, prepared):
         return payload
     model = build_model(cfg, prepared)
     initial = model.representation_diagnostics()
-    store = ProgressStore(prepared["out_dir"] / "progress" / prepared["config_hash"], identity)
+    durable_root = prepared["out_dir"] / "progress" / prepared["config_hash"]
+    store = LocalFirstProgressStore(
+        _runtime_progress_root(prepared), durable_root, identity,
+        max_epoch=cfg.epochs,
+        resume_source=prepared.get("resume_source_checkpoint"),
+        resume_source_identity=prepared.get("resume_source_identity"),
+    )
     print("[학습] M5 seed48 1회만 실행. 학습형 그래프는 고정그래프보다 느릴 수 있습니다.", flush=True)
     curve = capacity._train_curve(model, prepared, cfg,
         {"model_id": MODEL_ID, "condition": "joint_learned_graph_attributes"}, 48,
@@ -189,7 +368,7 @@ def run_arm(cfg, prepared):
                "final_diagnostics": model.representation_diagnostics()}
     io._atomic_json(path, payload)
     store.mark_complete(epoch=300, max_epoch=300, selection="none",
-                        checkpoint_path=str(store.latest_checkpoint), result_path=str(path))
+                        checkpoint_path=str(store.durable_checkpoint), result_path=str(path))
     return payload
 
 
