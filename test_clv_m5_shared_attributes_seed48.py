@@ -1,5 +1,6 @@
 """Scoped CPU checks, not a substitute for the requested GPU experiment."""
 from dataclasses import asdict, replace
+from copy import deepcopy
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -8,9 +9,10 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 import clv_m5_shared_attributes_seed48_screen as s
-from clv_m5_shared_attributes_model import JointAttributeLightGCN, build_signals
+from clv_m5_shared_attributes_model import JointAttributeLightGCN, build_signals, edge_sparse_mm
 
 
 def toy():
@@ -115,6 +117,81 @@ def test_differentiable_adjacency_matches_manual_degree_normalization():
     assert net.weighted_adjacency().values().requires_grad
 
 
+class RejectDenseNodeSquare(TorchDispatchMode):
+    """Catch the actual OOM pattern before a huge allocation, on CPU or GPU."""
+    def __init__(self, nodes):
+        super().__init__()
+        self.nodes = nodes
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if (str(func) == "aten.mm.default" and len(args) == 2
+                and args[0].shape[0] == self.nodes and args[1].shape[1] == self.nodes):
+            raise AssertionError("OOM regression: backward allocates dense node_count x node_count")
+        result = func(*args, **(kwargs or {}))
+        outputs = result if isinstance(result, (tuple, list)) else (result,)
+        for value in outputs:
+            if (isinstance(value, torch.Tensor) and value.layout == torch.strided
+                    and tuple(value.shape) == (self.nodes, self.nodes)):
+                raise AssertionError("OOM regression: dense node_count x node_count result")
+        return result
+
+
+def test_joint_backward_never_materializes_dense_node_square():
+    net = model(reg=0)
+    loss, _ = net.weighted_bpr_loss(torch.tensor([0, 1]), torch.tensor([0, 1]),
+                                  torch.tensor([2, 3]), torch.ones(2))
+    with RejectDenseNodeSquare(7):
+        loss.backward()
+    assert net.training_gradient_diagnostics()["nv_graph_gradient_norm"] > 0
+
+
+def test_edge_matmul_forward_and_gradcheck_with_duplicate_coordinates():
+    indices = torch.tensor([[0, 0, 1, 2, 2], [1, 1, 2, 0, 3]])
+    values = torch.tensor([.2, .3, .4, .5, .6], dtype=torch.double, requires_grad=True)
+    dense = torch.randn(5, 3, dtype=torch.double, requires_grad=True)
+    expected = torch.sparse_coo_tensor(indices, values, (5, 5)).to_dense() @ dense
+    actual = edge_sparse_mm(indices, values, dense, chunk_size=2)
+    torch.testing.assert_close(actual, expected)
+    assert torch.autograd.gradcheck(lambda v, x: edge_sparse_mm(indices, v, x, 2),
+                                    (values, dense))
+
+
+def test_joint_loss_and_all_parameter_gradients_match_dense_reference():
+    net = model(reg=0).double()
+    reference = deepcopy(net)
+    def dense_id_vectors():
+        adj = reference.weighted_adjacency().to_dense()
+        current = torch.cat([reference.E_u.weight, reference.E_i.weight])
+        layers = [current]
+        for _ in range(reference.n_layers):
+            current = adj @ current
+            layers.append(current)
+        return torch.stack(layers).mean(0).split([3, 4])
+    args = (torch.tensor([0, 0, 1]), torch.tensor([0, 1, 2]), torch.tensor([2, 3, 0]),
+            torch.tensor([.8, 1.2, 1.], dtype=torch.double))
+    actual, _ = net.weighted_bpr_loss(*args)
+    with patch.object(reference, "id_vectors", side_effect=dense_id_vectors):
+        expected, _ = reference.weighted_bpr_loss(*args)
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    actual.backward()
+    expected.backward()
+    for (name, param), (other_name, other) in zip(net.named_parameters(), reference.named_parameters()):
+        assert name == other_name
+        torch.testing.assert_close(param.grad, other.grad, rtol=1e-10, atol=1e-12)
+
+
+def test_edge_backward_large_node_count_uses_only_existing_edges():
+    n = 100000  # dense float32 adjacency would require37.3GiB
+    indices = torch.tensor([[0, 1, n - 1], [1, n - 1, 0]])
+    values = torch.ones(3, requires_grad=True)
+    dense = torch.randn(n, 4, requires_grad=True)
+    with RejectDenseNodeSquare(n):
+        edge_sparse_mm(indices, values, dense, chunk_size=2).square().sum().backward()
+    assert values.grad.shape == (3,)
+    assert dense.grad.shape == (n, 4)
+    assert torch.isfinite(values.grad).all()
+
+
 @pytest.mark.parametrize("field,value", [("seeds", (42,)), ("epochs", 100), ("eta", .2)])
 def test_fixed_seed_budget_and_parameters(field, value):
     with pytest.raises(ValueError):
@@ -137,6 +214,31 @@ def test_missing_m1_stops_before_data_or_training(tmp_path):
     with patch.object(s.recheck, "_prepare") as preparation, pytest.raises(FileNotFoundError):
         s.prepare(cfg)
     preparation.assert_not_called()
+
+
+def test_memory_fix_reuses_inputs_without_preparation_and_preserves_old_run(tmp_path):
+    _, _, _, prep = toy()
+    prep["out_dir"] = tmp_path / "old"
+    prep["preflight"]["metadata_sha256"] = "metadata"
+    prep["baseline_provenance"] = {"sha256": "baseline"}
+    cfg = s.configure(out_dir=str(tmp_path / "fixed"))
+    with patch.object(s.baseline, "load_baseline", return_value=({}, prep["baseline_provenance"])), \
+         patch.object(s.capacity.moe, "source_revision", return_value="fixed-source"), \
+         patch.object(s.recheck, "_prepare") as preparation:
+        ready = s.reuse_prepared_after_memory_fix(cfg, prep)
+    preparation.assert_not_called()
+    assert ready["data"] is prep["data"]
+    assert ready["signals"] is prep["signals"]
+    assert ready["row_weights"] is prep["row_weights"]
+    assert prep["revision"] == "source"
+    assert ready["revision"] == "fixed-source"
+    assert ready["config_hash"] != prep["config_hash"]
+    assert ready["out_dir"] != prep["out_dir"]
+    old = prep["out_dir"] / "progress/config/resume/m5_s48_latest.pt"
+    old.parent.mkdir(parents=True)
+    old.touch()
+    with pytest.raises(RuntimeError, match="checkpoint"):
+        s.reuse_prepared_after_memory_fix(cfg, prep)
 
 
 def test_one_arm_shared_loop_resume_and_cache(tmp_path):

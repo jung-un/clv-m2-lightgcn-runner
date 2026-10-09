@@ -12,6 +12,49 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.autograd.function import once_differentiable
+
+
+class _EdgeSparseMM(torch.autograd.Function):
+    """Exact first-order COO matmul gradients without a dense N-by-N dA.
+
+    For an existing edge (r,c), dL/da_rc = dot(dL/dY[r], X[c]).
+    Computing just those dots in chunks bounds workspace by chunk_size*dim.
+    Degree-normalization and graph-network gradients remain ordinary autograd
+    upstream of the edge-value input. Second derivatives are not supported.
+    """
+    @staticmethod
+    def forward(ctx, indices, values, dense, chunk_size):
+        ctx.save_for_backward(indices, values, dense)
+        ctx.chunk_size = chunk_size
+        n = dense.shape[0]
+        adjacency = torch.sparse_coo_tensor(indices, values, (n, n),
+                                            check_invariants=False).coalesce()
+        return torch.sparse.mm(adjacency, dense)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        indices, values, dense = ctx.saved_tensors
+        grad_values = grad_dense = None
+        if ctx.needs_input_grad[1]:
+            grad_values = torch.empty_like(values)
+            for start in range(0, len(values), ctx.chunk_size):
+                end = min(start + ctx.chunk_size, len(values))
+                rows, cols = indices[:, start:end]
+                grad_values[start:end] = (grad_output[rows] * dense[cols]).sum(dim=1)
+        if ctx.needs_input_grad[2]:
+            n = dense.shape[0]
+            transpose = torch.sparse_coo_tensor(indices.flip(0), values, (n, n),
+                                                check_invariants=False).coalesce()
+            grad_dense = torch.sparse.mm(transpose, grad_output.contiguous())
+        return None, grad_values, grad_dense, None
+
+
+def edge_sparse_mm(indices, values, dense, chunk_size=65536):
+    if chunk_size <= 0:
+        raise ValueError("엣지 역전파 chunk_size는 양수여야 합니다")
+    return _EdgeSparseMM.apply(indices, values, dense, chunk_size)
 
 
 def build_signals(train, products, n_users, n_items):
@@ -101,22 +144,27 @@ class JointAttributeLightGCN(nn.Module):
         inputs = torch.cat([self.relations, self.context[self.edge_users]], dim=1)
         return torch.exp(self.kappa * torch.tanh(self.graph_net(inputs).squeeze(1)))
 
-    def weighted_adjacency(self):
+    def normalized_edge_values(self):
         weights = self.graph_weights()
         destinations = self.edge_items + self.n_users
         degree = weights.new_zeros(self.n_users + self.n_items)
         degree = degree.index_add(0, self.edge_users, weights).index_add(0, destinations, weights)
         norm = weights / (degree[self.edge_users] * degree[destinations]).clamp_min(1e-12).sqrt()
-        # The values stay in autograd: numpy/scipy build_adj would break M3 learning.
-        return torch.sparse_coo_tensor(self.indices, torch.cat([norm, norm]),
-                                       (len(degree), len(degree))).coalesce()
+        return torch.cat([norm, norm])
+
+    def weighted_adjacency(self):
+        # Diagnostic/reference representation; propagation uses the edge-value
+        # operator below to avoid native sparse-value backward's dense dA.
+        n = self.n_users + self.n_items
+        return torch.sparse_coo_tensor(self.indices, self.normalized_edge_values(),
+                                       (n, n), check_invariants=False).coalesce()
 
     def id_vectors(self):
-        adj = self.weighted_adjacency()
+        values = self.normalized_edge_values()
         current = torch.cat([self.E_u.weight, self.E_i.weight])
         layers = [current]
         for _ in range(self.n_layers):
-            current = torch.sparse.mm(adj, current)
+            current = edge_sparse_mm(self.indices, values, current)
             layers.append(current)
         return torch.stack(layers).mean(0).split([self.n_users, self.n_items])
 

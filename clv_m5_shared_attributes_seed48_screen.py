@@ -18,7 +18,7 @@ import lightgcn_clv_component_recheck as recheck
 import lightgcn_clv_m2_capacity_search as capacity
 import lightgcn_clv_v3 as v3
 
-CODE_VERSION = "clv-m5-shared-attributes-seed48-dev-v1"
+CODE_VERSION = "clv-m5-shared-attributes-seed48-dev-v1-edge-backward-fix"
 MODEL_ID = "m5_shared_attributes_nv_learned_graph_user_centered_bpr_k1"
 SPLIT = baseline.SPLIT
 
@@ -37,7 +37,7 @@ class Config:
     eta: float = .1
     epsilon: float = .1
     kappa: float = .2
-    out_dir: str = baseline.ROOT + "_m5_shared_attributes_seed48_dev_v1"
+    out_dir: str = baseline.ROOT + "_m5_shared_attributes_seed48_dev_v1_edge_backward_fix"
     baseline_json: str = baseline.Config().baseline_json
 
 
@@ -100,6 +100,7 @@ def prepare(cfg=None):
         "train_days": [1, 683], "development_days": [684, 690],
         "final_test": False, "holdout": False, "selection": "none; fixed epoch300",
         "same_forward_one_optimizer": True, "pretraining_or_freeze": False,
+        "propagation_backward": "exact first-order edge gradients; chunk65536; no dense node-square dA",
         "external_score_addition_or_reranking": False, "min_item_interactions": 1,
         "new_item_task": True, "negative": "uniform unseen K=1",
         "m2": "shared subtype8+price8; N/V-conditioned per-feature history modulation; positive item LOO",
@@ -128,6 +129,36 @@ def build_model(cfg, prepared):
         signals=prepared["signals"], q_n=prepared["q_n"], q_v=prepared["q_v"],
         valid=prepared["clv_valid"], id_dim=cfg.id_dim, n_layers=cfg.n_layers,
         pref_reg=cfg.pref_reg, eta=cfg.eta, epsilon=cfg.epsilon, kappa=cfg.kappa).to(v3.DEVICE)
+
+
+def reuse_prepared_after_memory_fix(cfg, prepared):
+    """Bind already prepared immutable inputs to the fixed source, without
+    preparing data again or silently abandoning completed old epochs."""
+    validate_config(cfg)
+    validate_prepared(prepared)
+    old_checkpoint = (Path(prepared["out_dir"]) / "progress" / prepared["config_hash"])
+    if list(old_checkpoint.rglob("*_latest.pt")):
+        raise RuntimeError("이전 epoch checkpoint가 있습니다. 자동 초기화하지 말고 재개 경로를 확인하세요")
+    old, provenance = baseline.load_baseline(cfg, prepared["input_hash"])
+    if provenance != prepared["baseline_provenance"]:
+        raise RuntimeError("기존 prepared와 M1 원본이 달라졌습니다")
+    preflight = dict(prepared["preflight"])
+    if "metadata_sha256" not in preflight:
+        raise RuntimeError("상품 속성 입력 신원이 없는 prepared입니다")
+    revision = capacity.moe.source_revision()
+    preflight.update(code_version=CODE_VERSION, config=asdict(cfg),
+        propagation_backward="exact first-order edge gradients; chunk65536; no dense node-square dA",
+        memory_fix_previous_source=prepared["revision"], data_reprepared=False)
+    fingerprint = {"version": CODE_VERSION, "config": asdict(cfg), "source": revision,
+                   "input": prepared["input_hash"], "baseline_sha": provenance["sha256"],
+                   "metadata_sha": preflight["metadata_sha256"]}
+    ready = dict(prepared)
+    ready.update(out_dir=Path(cfg.out_dir), revision=revision, baseline=old,
+                 preflight=preflight,
+                 config_hash=hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:12])
+    io._atomic_json(Path(cfg.out_dir) / "preflight.json", preflight)
+    print("[OOM 수정] 기존 데이터·CLV·M4 입력 재사용. 같은 seed48·구조·300epoch, 엣지 역전파만 수정.", flush=True)
+    return ready
 
 
 def run_arm(cfg, prepared):
