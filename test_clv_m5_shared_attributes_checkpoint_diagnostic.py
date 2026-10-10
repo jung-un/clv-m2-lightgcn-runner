@@ -277,7 +277,8 @@ def test_probe_captures_same_evaluation_topk_and_replays_without_changing_hooks(
         assert d.screen.v3.score_topk is metric_hook
 
 
-def test_probe_uses_cached_context_preserves_failed_readback_and_never_prepares(tmp_path):
+@pytest.mark.parametrize("context_source", ["explicit", "module_cache", "checkpoint_reload"])
+def test_probe_uses_context_preserves_failed_readback_and_never_trains(tmp_path, monkeypatch, context_source):
     out = tmp_path / "out"
     out.mkdir()
     failed_readback = out / "readback.csv"
@@ -292,11 +293,16 @@ def test_probe_uses_cached_context_preserves_failed_readback_and_never_prepares(
     current = saved.copy()
     current[:, [19, 20]] = current[:, [20, 19]]
     context = dict(prepared=prepared, views={"full": None}, arm={"curve": [{"metrics": {"diversity@20": .5}}]}, provenance={})
+    context.update(source_dir=str(source.resolve()), context_origin=context_source,
+                   data_preparation=int(context_source == "checkpoint_reload"))
+    monkeypatch.setattr(d, "_READBACK_CONTEXT", context if context_source == "module_cache" else None, raising=False)
     with patch.object(d.screen.shared, "validate_prepared"), \
          patch.object(d, "prepare", side_effect=AssertionError("preparation forbidden")), \
+         patch.object(d, "_rebuild_probe_context", return_value=context, create=True) as rebuild, \
          patch.object(d, "_capture_evaluation", side_effect=[({"diversity@20": .55}, current, np.arange(50, 0, -1).reshape(1, -1)),
                                                            ({"diversity@20": .5}, saved, saved)]):
-        result = d.probe_failed_readback(source, out, context=context)
+        result = d.probe_failed_readback(source, out, context=context if context_source == "explicit" else None)
+    assert rebuild.call_count == int(context_source == "checkpoint_reload")
     assert failed_readback.read_text() == "original failed readback\n"
     info = json.loads((Path(result["out_dir"]) / "result.json").read_text())
     assert not info["current_probe_readback_passed"]
@@ -305,20 +311,40 @@ def test_probe_uses_cached_context_preserves_failed_readback_and_never_prepares(
     assert info["recommendation_changes"]["10"]["changed_set_users"] == 0
     assert info["recommendation_changes"]["50"]["changed_set_users"] == 0
     assert not info["strict_gate_bypassed"] and Path(result["zip"]).is_file()
+    assert info["data_preparation"] == int(context_source == "checkpoint_reload")
+    assert info["new_training"] == 0
     changes = pd.read_csv(Path(result["out_dir"]) / "topk_item_changes.csv")
     assert len(changes) == 2 and not changes.is_truth.any()
     np.testing.assert_allclose(changes.evaluation_price_percentile, changes.item / 60.)
     np.testing.assert_array_equal(changes.evaluation_category, changes.item % 5)
 
 
-def test_failed_context_recovers_only_selected_runner_locals(monkeypatch):
-    namespace = {}
-    exec(compile("def run():\n prepared = {}\n views = {}\n arm = {}\n provenance = {}\n unrelated = 'do not expose'\n raise RuntimeError('gate')\n", d.__file__, "exec"), namespace)
-    try:
-        namespace["run"]()
-    except RuntimeError as error:
-        monkeypatch.setattr(d.sys, "last_traceback", error.__traceback__, raising=False)
-        assert set(d._failed_context()) == {"prepared", "views", "arm", "provenance"}
-    monkeypatch.setattr(d.sys, "last_traceback", None)
-    with pytest.raises(RuntimeError, match="캐시가 런타임에 없습니다"):
-        d._failed_context()
+def test_rebuild_probe_context_loads_verified_checkpoint_full_only_no_grad(tmp_path, monkeypatch):
+    net = model()
+    prepared = {}
+    arm = {"curve": [{"metrics": {"recall@10": .5}}]}
+    monkeypatch.setattr(d, "_READBACK_CONTEXT", None, raising=False)
+    with patch.object(d, "source_artifacts", return_value=({}, arm, deepcopy(net.state_dict()), {"epoch": 300})), \
+         patch.object(d, "prepare", return_value=(None, prepared)) as prepare, \
+         patch.object(d.screen, "build_model", return_value=net), \
+         patch.object(d, "embedding_views", side_effect=AssertionError("permutation forbidden")), \
+         patch.object(net, "embeddings", wraps=net.embeddings) as embeddings:
+        context = d._rebuild_probe_context(tmp_path / "source", tmp_path / "probe")
+    assert prepare.call_count == 1 and embeddings.call_count == 1
+    assert context["context_origin"] == "checkpoint_reload" and context["data_preparation"] == 1
+    assert set(context["views"]) == {"full"}
+    assert not context["views"]["full"].users.requires_grad
+    assert all(p.grad is None for p in net.parameters())
+    assert d._READBACK_CONTEXT is context
+
+
+def test_rebuild_rejects_changed_checkpoint_buffers_before_inference(tmp_path):
+    net = model()
+    state = deepcopy(net.state_dict())
+    state["context"] = state["context"] + 1
+    with patch.object(d, "source_artifacts", return_value=({}, {}, state, {})), \
+         patch.object(d, "prepare", return_value=(None, {})), \
+         patch.object(d.screen, "build_model", return_value=net), \
+         patch.object(net, "embeddings", side_effect=AssertionError("must not infer")):
+        with pytest.raises(RuntimeError, match="buffer 불일치"):
+            d._rebuild_probe_context(tmp_path / "source", tmp_path / "probe")

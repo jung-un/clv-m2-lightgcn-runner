@@ -12,7 +12,6 @@ from io import StringIO
 import json
 from pathlib import Path
 import shutil
-import sys
 from unittest.mock import patch
 
 import numpy as np
@@ -32,6 +31,10 @@ PERMUTATION_SEED = 1048
 VIEWS = ("full", "joint_id_only", "m2_nv_permuted")
 DEFAULT_SOURCE = screen.Config().out_dir
 DEFAULT_OUT = "/content/clv_m5_shared_attributes_checkpoint_diagnostic_seed48"
+PROBE_VERSION = "clv-m5-shared-readback-ranking-probe-v3-explicit-cache"
+# importlib.reload preserves the module dict. Keep an explicitly saved context,
+# never rely on a notebook's implementation-dependent last exception object.
+_READBACK_CONTEXT = globals().get("_READBACK_CONTEXT")
 
 
 def source_artifacts(source_dir):
@@ -248,16 +251,42 @@ def mechanism_audit(model, views, prepared):
         sample_note="deterministic evenly spaced train edges; not population saturation or gradient attribution")
 
 
-def _failed_context():
-    """Recover only this failed runner's cached read-only inference context."""
-    traceback = getattr(sys, "last_traceback", None)
-    while traceback is not None:
-        frame = traceback.tb_frame
-        if (frame.f_code.co_name == "run" and Path(frame.f_code.co_filename).name == Path(__file__).name
-                and {"prepared", "views", "arm", "provenance"}.issubset(frame.f_locals)):
-            return {key: frame.f_locals[key] for key in ("prepared", "views", "arm", "provenance")}
-        traceback = traceback.tb_next
-    raise RuntimeError("실패 당시 캐시가 런타임에 없습니다. 재학습하지 말고 이 메시지를 알려주세요")
+def _load_verified_model(cfg, prepared, state):
+    model = screen.build_model(cfg, prepared, screen.MODEL_ID)
+    for name, expected in model.named_buffers():
+        actual = state[name].to(expected.device)
+        if expected.is_sparse:
+            good = (torch.equal(expected.coalesce().indices(), actual.coalesce().indices())
+                    and torch.equal(expected.coalesce().values(), actual.coalesce().values()))
+        else:
+            good = torch.equal(expected, actual)
+        if not good:
+            raise RuntimeError(f"checkpoint 학습입력 buffer 불일치: {name}")
+    model.load_state_dict(state, strict=True)
+    model.eval()
+    return model
+
+
+def _remember_context(source, prepared, views, arm, provenance, origin, data_preparation):
+    global _READBACK_CONTEXT
+    _READBACK_CONTEXT = dict(source_dir=str(Path(source).resolve()), prepared=prepared,
+        views={"full": views["full"]}, arm=arm, provenance=provenance,
+        context_origin=origin, data_preparation=data_preparation)
+    return _READBACK_CONTEXT
+
+
+@torch.no_grad()
+def _rebuild_probe_context(source, root):
+    """Reload the approved checkpoint for inference only; never fit or permute."""
+    print("[경계 점검] 명시적 캐시 없음: 기존300epoch checkpoint 읽기·표현 재계산. 학습0", flush=True)
+    report, arm, state, provenance = source_artifacts(source)
+    cfg, prepared = prepare(report, Path(root) / "input_readback")
+    model = _load_verified_model(cfg, prepared, state)
+    del state
+    users, items, _, _ = model.embeddings()
+    full = EmbeddingView(users, items, model.id_dim)
+    del model
+    return _remember_context(source, prepared, {"full": full}, arm, provenance, "checkpoint_reload", 1)
 
 
 def _saved_tops(recommendations, users):
@@ -305,17 +334,25 @@ def _capture_evaluation(view, prepared, forced_tops=None):
 
 
 def probe_failed_readback(source_dir=DEFAULT_SOURCE, out_dir=DEFAULT_OUT, *, context=None):
-    """Read cached full expressions from the failure; do not prepare/train.
+    """Reuse an explicit context, or reload a checkpoint for inference only.
 
     Preserve the failed readback and strict gate. This probe is not an accepted
     three-view result and cannot promote a checkpoint/model to success.
     """
-    context = _failed_context() if context is None else context
-    prepared, view = context["prepared"], context["views"]["full"]
-    screen.shared.validate_prepared(prepared)
     source, root = Path(source_dir).resolve(), Path(out_dir).resolve() / "readback_ranking_probe"
     if source == root or source in root.parents or root in source.parents:
         raise ValueError("원본과 진단 출력 폴더가 겹칩니다")
+    origin, data_preparation = "explicit", 0
+    if context is None:
+        if _READBACK_CONTEXT is not None and _READBACK_CONTEXT["source_dir"] == str(source):
+            context, origin = _READBACK_CONTEXT, "module_cache"
+        else:
+            context = _rebuild_probe_context(source, root)
+            origin, data_preparation = "checkpoint_reload", 1
+    if context.get("source_dir", str(source)) != str(source):
+        raise RuntimeError("캐시와 원본 결과 폴더 불일치")
+    prepared, view = context["prepared"], context["views"]["full"]
+    screen.shared.validate_prepared(prepared)
     recorded = context["arm"]["curve"][-1]["metrics"]
     users = np.asarray(prepared["cache"].users)
     source_path = source / "new_pair_diagnostic" / "recommendations.csv"
@@ -325,7 +362,7 @@ def probe_failed_readback(source_dir=DEFAULT_SOURCE, out_dir=DEFAULT_OUT, *, con
         a, b = prepared["data"]["csr_ptr"][user:user + 2]
         if np.isin(saved[row], prepared["data"]["csr_items"][a:b]).any():
             raise RuntimeError("저장 추천목록에 학습상품이 포함됐습니다")
-    print("[경계 점검] 실패 당시 full 표현 재사용. 데이터 재준비·학습 0", flush=True)
+    print(f"[경계 점검] full 표현 출처={origin}. 데이터 읽기·준비={data_preparation}회, 학습0", flush=True)
     current_metrics, current, values = _capture_evaluation(view, prepared)
     replay_metrics, _, _ = _capture_evaluation(view, prepared, saved)
     audits, changes, boundaries = [], [], []
@@ -360,12 +397,12 @@ def probe_failed_readback(source_dir=DEFAULT_SOURCE, out_dir=DEFAULT_OUT, *, con
     for k in (10, 20, 50):
         repeated[str(k)] = dict(changed_order_users=int(np.any(saved[:, :k] != current[:, :k], axis=1).sum()),
             changed_set_users=sum(set(a) != set(b) for a, b in zip(saved[:, :k], current[:, :k])))
-    info = dict(code_version=VERSION + "-ranking-probe", source_recommendations_sha256=file_sha256(source_path),
+    info = dict(code_version=PROBE_VERSION, source_recommendations_sha256=file_sha256(source_path),
         source_checkpoint=context["provenance"], split=screen.shared.SPLIT, seed=48, epoch=300,
         current_probe_readback_passed=all(r["passed"] for r in audits if r["probe"] == "current_probe"),
         saved_list_replay_matches_recorded=all(r["passed"] for r in audits if r["probe"] == "saved_list_replay"),
         recommendation_changes=repeated, strict_gate_bypassed=False, original_readback_modified=False,
-        new_training=0, data_preparation=0, final_test=False, holdout=False,
+        new_training=0, data_preparation=data_preparation, context_origin=origin, final_test=False, holdout=False,
         caveat="saved recommendations came from top100 diagnostic, not original top50 metric call; replay checks that distinction")
     screen.io._atomic_json(root / "result.json", info)
     archive = shutil.make_archive(str(root), "zip", root_dir=root)
@@ -380,21 +417,11 @@ def run(source_dir=DEFAULT_SOURCE, out_dir=DEFAULT_OUT):
     print("[읽기 진단] Dunnhumby seed48·300epoch·개발684~690일. 새 학습 0", flush=True)
     report, arm, state, provenance = source_artifacts(source)
     cfg, prepared = prepare(report, out)
-    model = screen.build_model(cfg, prepared, screen.MODEL_ID)
-    # Verify input-derived buffers too; loading must not silently replace data.
-    for name, expected in model.named_buffers():
-        actual = state[name].to(expected.device)
-        if expected.is_sparse:
-            good = (torch.equal(expected.coalesce().indices(), actual.coalesce().indices())
-                    and torch.equal(expected.coalesce().values(), actual.coalesce().values()))
-        else:
-            good = torch.equal(expected, actual)
-        if not good:
-            raise RuntimeError(f"checkpoint 학습입력 buffer 불일치: {name}")
-    model.load_state_dict(state, strict=True)
+    model = _load_verified_model(cfg, prepared, state)
     del state
     donor, bins, edges = joint_permutation(np.diff(prepared["data"]["csr_ptr"]), prepared["clv_valid"])
     views = embedding_views(model, donor)
+    _remember_context(source, prepared, views, arm, provenance, "diagnostic_run", 1)
     audit = mechanism_audit(model, views, prepared)
     del model
     permutation = pd.DataFrame(dict(user=np.arange(len(donor)), donor_user=donor, degree_bin=bins,
