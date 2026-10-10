@@ -341,13 +341,17 @@ def probe_failed_readback(source_dir=DEFAULT_SOURCE, out_dir=DEFAULT_OUT, *, con
             for item in sorted(removed | added):
                 changes.append(dict(seed=48, user=int(user), segment=str(prepared["cache"].seg[j]), k=k,
                     item=int(item), movement="entered_current" if item in added else "exited_current",
-                    saved_rank=old_rank.get(int(item)), current_rank=new_rank.get(int(item)), is_truth=item in truth))
+                    saved_rank=old_rank.get(int(item)), current_rank=new_rank.get(int(item)), is_truth=item in truth,
+                    evaluation_price_percentile=float(prepared["meta"]["price_pct"][item]),
+                    evaluation_category=int(prepared["meta"]["cat"][item]),
+                    current_score=float(values[j, new_rank[int(item)] - 1]) if int(item) in new_rank else None))
             if removed or added:
                 boundaries.append(dict(user=int(user), segment=str(prepared["cache"].seg[j]), k=k,
                     current_boundary_item=int(current[j, k - 1]), current_boundary_score=float(values[j, k - 1]),
                     next_item=int(current[j, k]) if k < 50 else None,
                     current_gap_to_next=float(values[j, k - 1] - values[j, k]) if k < 50 else None))
-    change_columns = ["seed", "user", "segment", "k", "item", "movement", "saved_rank", "current_rank", "is_truth"]
+    change_columns = ["seed", "user", "segment", "k", "item", "movement", "saved_rank", "current_rank", "is_truth",
+                      "evaluation_price_percentile", "evaluation_category", "current_score"]
     boundary_columns = ["user", "segment", "k", "current_boundary_item", "current_boundary_score", "next_item", "current_gap_to_next"]
     screen.io._atomic_csv(root / "metric_readback.csv", pd.DataFrame(audits))
     screen.io._atomic_csv(root / "topk_item_changes.csv", pd.DataFrame(changes, columns=change_columns))

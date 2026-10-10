@@ -286,6 +286,7 @@ def test_probe_uses_cached_context_preserves_failed_readback_and_never_prepares(
     recs = pd.DataFrame([dict(model="m5", user=0, rank=k, item=k - 1) for k in range(1, 51)])
     d.screen.io._atomic_csv(source / "new_pair_diagnostic" / "recommendations.csv", recs)
     prepared = dict(data={"csr_ptr": np.array([0, 1]), "csr_items": np.array([59])},
+        meta={"price_pct": np.arange(60) / 60., "cat": np.arange(60) % 5},
         cache=SimpleNamespace(users=np.array([0]), seg=np.array(["고CLV"]), gt={0: np.array([58])}))
     saved = np.arange(50).reshape(1, -1)
     current = saved.copy()
@@ -306,6 +307,8 @@ def test_probe_uses_cached_context_preserves_failed_readback_and_never_prepares(
     assert not info["strict_gate_bypassed"] and Path(result["zip"]).is_file()
     changes = pd.read_csv(Path(result["out_dir"]) / "topk_item_changes.csv")
     assert len(changes) == 2 and not changes.is_truth.any()
+    np.testing.assert_allclose(changes.evaluation_price_percentile, changes.item / 60.)
+    np.testing.assert_array_equal(changes.evaluation_category, changes.item % 5)
 
 
 def test_failed_context_recovers_only_selected_runner_locals(monkeypatch):
