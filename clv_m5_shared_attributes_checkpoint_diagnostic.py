@@ -20,7 +20,7 @@ import torch
 import clv_m5_shared_attributes_centered_seed48_screen as screen
 from clv_run_state import file_sha256
 
-VERSION = "clv-m5-shared-attributes-checkpoint-diagnostic-v1"
+VERSION = "clv-m5-shared-attributes-checkpoint-diagnostic-v2-cached-components"
 SOURCE_HASH = "804a67b9c06d"
 SOURCE_REVISION = "883ffd084b9b2cec81a0aacc4ad3031fa183ad8b"
 INPUT_HASH = "974f1986c80e1ba6541cc8de5e6b31da58f9eeb1317c4b36643b413d748aa0c6"
@@ -133,7 +133,14 @@ class EmbeddingView(torch.nn.Module):
 @torch.no_grad()
 def embedding_views(model, donor):
     model.eval()
-    users, items, _, _ = model.embeddings()
+    # Same operations as the original embeddings(), but cache the independent
+    # ID/item paths. Repeated CUDA sparse propagation need not be bit-identical;
+    # numerical equality after recomputation does not test path independence.
+    user_id, item_id = model.id_vectors()
+    attributes = model.attributes()
+    profiles, messages = model.history_vectors(attributes)
+    users = torch.cat([user_id, model.eta * profiles], 1)
+    items = torch.cat([item_id, model.eta * attributes], 1)
     full = EmbeddingView(users, items, model.id_dim)
     id_users, id_items = users.clone(), items.clone()
     id_users[:, model.id_dim:] = 0
@@ -141,13 +148,28 @@ def embedding_views(model, donor):
     original = model.context.clone()
     try:
         model.context.copy_(original[torch.as_tensor(donor, device=original.device)])
-        swapped_users, swapped_items, _, _ = model.embeddings()
+        _, swapped_messages = model.history_vectors(attributes)
     finally:
         model.context.copy_(original)
-    if not torch.equal(items, swapped_items) or not torch.equal(users[:, :model.id_dim], swapped_users[:, :model.id_dim]):
+    # Retain the actual full profile and aggregate only the N/V-induced message
+    # difference. Identical tuples/invalid customers then have *exactly* zero
+    # perturbation, rather than noise from a second reduction of the full base.
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        delta = messages.new_zeros(profiles.shape).index_add(
+            0, model.edge_users, swapped_messages - messages)
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+    swapped_profiles = profiles + delta / model.degree[:, None].clamp_min(1)
+    swapped_users = torch.cat([user_id, model.eta * swapped_profiles], 1)
+    if not torch.equal(original, model.context):
+        raise RuntimeError("M2 N/V 진단 후 입력 복원 실패")
+    if not torch.equal(users[:, :model.id_dim], swapped_users[:, :model.id_dim]):
         raise RuntimeError("M2 N/V 교체가 아이템·ID·M3 경로를 변경했습니다")
     return dict(zip(VIEWS, (full, EmbeddingView(id_users, id_items, model.id_dim),
-                            EmbeddingView(swapped_users, swapped_items, model.id_dim))))
+                            EmbeddingView(swapped_users, items, model.id_dim))))
 
 
 def comparisons(metrics):
@@ -301,6 +323,7 @@ def run(source_dir=DEFAULT_SOURCE, out_dir=DEFAULT_OUT):
         permutation_changed_users=int(permutation.changed_donor.sum()),
         permutation_changed_eval_users=int(permutation.set_index("user").loc[prepared["cache"].users, "changed_donor"].sum()),
         permutation_note="N/V jointly permuted in training-degree deciles; invalid untouched; no redraw",
+        view_construction="ID/item computed once; full unchanged; N/V message delta deterministically aggregated onto cached full profile",
         m3_m4_unchanged=True, new_training=0, checkpoint_selection=False, final_test=False, holdout=False,
         mechanism=audit, margin_direction_tolerance=1e-8,
         id_only_is_m1=False, causal_attribution_claim=False, significance_claim=False,

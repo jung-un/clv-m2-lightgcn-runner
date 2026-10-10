@@ -64,16 +64,60 @@ def test_three_views_same_id_items_graph_parameters_context_restored():
 def test_context_restored_when_swapped_forward_fails():
     net = model()
     context = net.context.clone()
-    original = net.embeddings
+    original = net.history_vectors
     calls = []
-    def embeddings():
+    def history_vectors(attributes):
         calls.append(1)
         if len(calls) == 2:
             raise RuntimeError("forward failed")
-        return original()
-    with patch.object(net, "embeddings", side_effect=embeddings), pytest.raises(RuntimeError):
+        return original(attributes)
+    with patch.object(net, "history_vectors", side_effect=history_vectors), pytest.raises(RuntimeError):
         d.embedding_views(net, np.array([1, 0, 2]))
     torch.testing.assert_close(net.context, context, rtol=0, atol=0)
+
+
+def test_id_recalculation_roundoff_cannot_contaminate_nv_comparison():
+    """Inject the reported equality failure without requiring a CUDA device."""
+    net = model()
+    original = net.id_vectors
+    calls = []
+    def id_vectors():
+        users, items = original()
+        calls.append(1)
+        if len(calls) > 1:
+            users = users + 1e-7
+        return users, items
+    with patch.object(net, "id_vectors", side_effect=id_vectors):
+        views = d.embedding_views(net, np.array([1, 0, 2]))
+    assert len(calls) == 1
+    torch.testing.assert_close(views["full"].users[:, :net.id_dim],
+        views["m2_nv_permuted"].users[:, :net.id_dim], rtol=0, atol=0)
+
+
+def test_cached_full_matches_original_and_identity_permutation_is_exact():
+    net = model()
+    expected_users, expected_items, _, _ = net.embeddings()
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    views = d.embedding_views(net, np.arange(net.n_users))
+    torch.testing.assert_close(views["full"].users, expected_users, rtol=0, atol=0)
+    torch.testing.assert_close(views["full"].items, expected_items, rtol=0, atol=0)
+    torch.testing.assert_close(views["m2_nv_permuted"].users, views["full"].users, rtol=0, atol=0)
+    assert views["full"].items.data_ptr() == views["m2_nv_permuted"].items.data_ptr()
+    assert torch.are_deterministic_algorithms_enabled() == deterministic
+    assert torch.is_deterministic_algorithms_warn_only_enabled() == warn_only
+
+
+def test_nv_delta_matches_direct_swapped_profile_and_global_setting_restored():
+    net = model()
+    context = net.context.clone()
+    with torch.no_grad():
+        net.context.copy_(context[torch.tensor([1, 0, 2])])
+        direct_users, direct_items, _, _ = net.embeddings()
+        net.context.copy_(context)
+    views = d.embedding_views(net, np.array([1, 0, 2]))
+    torch.testing.assert_close(views["m2_nv_permuted"].users, direct_users, rtol=1e-6, atol=1e-8)
+    torch.testing.assert_close(views["m2_nv_permuted"].items, direct_items, rtol=0, atol=0)
 
 
 def test_full_comparison_preserves_all_keys_losses_and_zero_denominator():
