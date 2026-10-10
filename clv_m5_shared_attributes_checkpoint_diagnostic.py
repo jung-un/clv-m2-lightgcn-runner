@@ -12,6 +12,8 @@ from io import StringIO
 import json
 from pathlib import Path
 import shutil
+import sys
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -244,6 +246,127 @@ def mechanism_audit(model, views, prepared):
         evaluated_users=len(users), effective_attribute_score_coefficient=model.eta ** 2,
         feature_tanh_sample_edges=count, feature_tanh_abs_ge_095_sample_fraction=float((mod.abs() >= .95).float().mean()),
         sample_note="deterministic evenly spaced train edges; not population saturation or gradient attribution")
+
+
+def _failed_context():
+    """Recover only this failed runner's cached read-only inference context."""
+    traceback = getattr(sys, "last_traceback", None)
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if (frame.f_code.co_name == "run" and Path(frame.f_code.co_filename).name == Path(__file__).name
+                and {"prepared", "views", "arm", "provenance"}.issubset(frame.f_locals)):
+            return {key: frame.f_locals[key] for key in ("prepared", "views", "arm", "provenance")}
+        traceback = traceback.tb_next
+    raise RuntimeError("실패 당시 캐시가 런타임에 없습니다. 재학습하지 말고 이 메시지를 알려주세요")
+
+
+def _saved_tops(recommendations, users):
+    part = recommendations.loc[recommendations.model.eq("m5")].copy()
+    if (part.duplicated(["user", "rank"]).any() or part.duplicated(["user", "item"]).any()
+            or set(part.user.unique()) != set(users)):
+        raise RuntimeError("원본 full 추천목록의 고객·상품·순위 키 불일치")
+    table = part.pivot(index="user", columns="rank", values="item").reindex(users)
+    if set(table.columns) != set(range(1, 51)) or table.isna().any().any():
+        raise RuntimeError("원본 고객별 Top50 누락")
+    return table.reindex(columns=range(1, 51)).to_numpy(np.int64)
+
+
+def _capture_evaluation(view, prepared, forced_tops=None):
+    """Capture the SAME top50/score used by evaluation, not top100 re-ranking.
+
+    Optional forced_tops replays the saved list to check whether that list
+    itself reproduces the recorded metrics; no checkpoint or model is changed.
+    """
+    score_fn, metric_fn = screen.v3.combined_score_all, screen.v3.score_topk
+    cache_users = np.asarray(prepared["cache"].users)
+    lookup = {int(u): j for j, u in enumerate(cache_users)}
+    pending, captured, order = {}, [], []
+    def scores(*args, **kwargs):
+        result = score_fn(*args, **kwargs)
+        pending["scores"] = result
+        return result
+    def metrics(top, batch, *args, **kwargs):
+        if forced_tops is not None:
+            # evaluate also reads top after this callback for exposure metrics.
+            # Replace its batch-local array, not the cached/saved lists.
+            top[:] = forced_tops[[lookup[int(u)] for u in batch]]
+        used = top
+        matrix = pending.pop("scores")
+        values = matrix.gather(1, torch.as_tensor(used, dtype=torch.long, device=matrix.device)).detach().cpu().numpy()
+        captured.append((used.copy(), values))
+        order.extend(batch)
+        return metric_fn(used, batch, *args, **kwargs)
+    with patch.object(screen.v3, "combined_score_all", side_effect=scores), \
+         patch.object(screen.v3, "score_topk", side_effect=metrics):
+        measured = screen.capacity._evaluate(view, prepared)
+    if not np.array_equal(np.asarray(order), cache_users):
+        raise RuntimeError("재현 점검 평가고객 순서 불일치")
+    return measured, np.concatenate([v[0] for v in captured]), np.concatenate([v[1] for v in captured])
+
+
+def probe_failed_readback(source_dir=DEFAULT_SOURCE, out_dir=DEFAULT_OUT, *, context=None):
+    """Read cached full expressions from the failure; do not prepare/train.
+
+    Preserve the failed readback and strict gate. This probe is not an accepted
+    three-view result and cannot promote a checkpoint/model to success.
+    """
+    context = _failed_context() if context is None else context
+    prepared, view = context["prepared"], context["views"]["full"]
+    screen.shared.validate_prepared(prepared)
+    source, root = Path(source_dir).resolve(), Path(out_dir).resolve() / "readback_ranking_probe"
+    if source == root or source in root.parents or root in source.parents:
+        raise ValueError("원본과 진단 출력 폴더가 겹칩니다")
+    recorded = context["arm"]["curve"][-1]["metrics"]
+    users = np.asarray(prepared["cache"].users)
+    source_path = source / "new_pair_diagnostic" / "recommendations.csv"
+    recommendations = pd.read_csv(source_path)
+    saved = _saved_tops(recommendations, users)
+    for row, user in enumerate(users):
+        a, b = prepared["data"]["csr_ptr"][user:user + 2]
+        if np.isin(saved[row], prepared["data"]["csr_items"][a:b]).any():
+            raise RuntimeError("저장 추천목록에 학습상품이 포함됐습니다")
+    print("[경계 점검] 실패 당시 full 표현 재사용. 데이터 재준비·학습 0", flush=True)
+    current_metrics, current, values = _capture_evaluation(view, prepared)
+    replay_metrics, _, _ = _capture_evaluation(view, prepared, saved)
+    audits, changes, boundaries = [], [], []
+    for label, measured in (("current_probe", current_metrics), ("saved_list_replay", replay_metrics)):
+        audits.extend(dict(row, probe=label) for row in screen._readback(recorded, measured, label))
+    for j, user in enumerate(users):
+        old_rank = {int(i): rank for rank, i in enumerate(saved[j], 1)}
+        new_rank = {int(i): rank for rank, i in enumerate(current[j], 1)}
+        truth = set(prepared["cache"].gt[user])
+        for k in (10, 20, 50):
+            removed = set(saved[j, :k]) - set(current[j, :k])
+            added = set(current[j, :k]) - set(saved[j, :k])
+            for item in sorted(removed | added):
+                changes.append(dict(seed=48, user=int(user), segment=str(prepared["cache"].seg[j]), k=k,
+                    item=int(item), movement="entered_current" if item in added else "exited_current",
+                    saved_rank=old_rank.get(int(item)), current_rank=new_rank.get(int(item)), is_truth=item in truth))
+            if removed or added:
+                boundaries.append(dict(user=int(user), segment=str(prepared["cache"].seg[j]), k=k,
+                    current_boundary_item=int(current[j, k - 1]), current_boundary_score=float(values[j, k - 1]),
+                    next_item=int(current[j, k]) if k < 50 else None,
+                    current_gap_to_next=float(values[j, k - 1] - values[j, k]) if k < 50 else None))
+    change_columns = ["seed", "user", "segment", "k", "item", "movement", "saved_rank", "current_rank", "is_truth"]
+    boundary_columns = ["user", "segment", "k", "current_boundary_item", "current_boundary_score", "next_item", "current_gap_to_next"]
+    screen.io._atomic_csv(root / "metric_readback.csv", pd.DataFrame(audits))
+    screen.io._atomic_csv(root / "topk_item_changes.csv", pd.DataFrame(changes, columns=change_columns))
+    screen.io._atomic_csv(root / "changed_boundaries.csv", pd.DataFrame(boundaries, columns=boundary_columns))
+    repeated = {}
+    for k in (10, 20, 50):
+        repeated[str(k)] = dict(changed_order_users=int(np.any(saved[:, :k] != current[:, :k], axis=1).sum()),
+            changed_set_users=sum(set(a) != set(b) for a, b in zip(saved[:, :k], current[:, :k])))
+    info = dict(code_version=VERSION + "-ranking-probe", source_recommendations_sha256=file_sha256(source_path),
+        source_checkpoint=context["provenance"], split=screen.shared.SPLIT, seed=48, epoch=300,
+        current_probe_readback_passed=all(r["passed"] for r in audits if r["probe"] == "current_probe"),
+        saved_list_replay_matches_recorded=all(r["passed"] for r in audits if r["probe"] == "saved_list_replay"),
+        recommendation_changes=repeated, strict_gate_bypassed=False, original_readback_modified=False,
+        new_training=0, data_preparation=0, final_test=False, holdout=False,
+        caveat="saved recommendations came from top100 diagnostic, not original top50 metric call; replay checks that distinction")
+    screen.io._atomic_json(root / "result.json", info)
+    archive = shutil.make_archive(str(root), "zip", root_dir=root)
+    print(json.dumps(info, ensure_ascii=False, indent=2), flush=True)
+    return dict(zip=archive, out_dir=str(root))
 
 
 def run(source_dir=DEFAULT_SOURCE, out_dir=DEFAULT_OUT):

@@ -233,3 +233,89 @@ def test_colab_schema_ast_and_pinned_source():
     assert "files.download" in source and "diagnostic.run" in source
     assert "drive.mount" in source and "--detach" in source
     assert "screen.run" not in source
+
+
+def test_saved_list_requires_exact_users_unique_items_and_all50_ranks():
+    rows = pd.DataFrame([dict(model="m5", user=u, rank=k, item=k - 1)
+                         for u in (8, 4) for k in range(1, 51)])
+    top = d._saved_tops(rows, np.array([4, 8]))
+    np.testing.assert_array_equal(top[0], np.arange(50))
+    with pytest.raises(RuntimeError):
+        d._saved_tops(rows.iloc[:-1], np.array([4, 8]))
+    with pytest.raises(RuntimeError):
+        d._saved_tops(pd.concat([rows, rows.iloc[:1]]), np.array([4, 8]))
+
+
+def test_probe_captures_same_evaluation_topk_and_replays_without_changing_hooks():
+    view = d.EmbeddingView(torch.ones(1, 4), torch.ones(60, 4), 4)
+    prepared = dict(cache=SimpleNamespace(users=np.array([7])))
+    current = np.arange(50).reshape(1, -1)
+    saved = np.arange(1, 51).reshape(1, -1)
+    matrix = torch.arange(60, dtype=torch.float32).reshape(1, -1)
+    used = []
+    def metric_fn(top, batch, *args, **kwargs):
+        used.append(top.copy())
+        return float(top.sum())
+    def evaluate(view, prepared):
+        d.screen.v3.combined_score_all()
+        batch_top = current.copy()
+        total = d.screen.v3.score_topk(batch_top, np.array([7]))
+        return {"test": total, "exposure_after_callback": float(batch_top.sum())}
+    with patch.object(d.screen.v3, "combined_score_all", return_value=matrix) as score_hook, \
+         patch.object(d.screen.v3, "score_topk", side_effect=metric_fn) as metric_hook, \
+         patch.object(d.screen.capacity, "_evaluate", side_effect=evaluate):
+        values, top, scores = d._capture_evaluation(view, prepared)
+        np.testing.assert_array_equal(top, current)
+        np.testing.assert_array_equal(scores, current.astype(float))
+        assert values["test"] == current.sum()
+        replay, replay_top, replay_scores = d._capture_evaluation(view, prepared, saved)
+        assert replay["test"] == saved.sum()
+        assert replay["exposure_after_callback"] == saved.sum()
+        np.testing.assert_array_equal(replay_top, saved)
+        np.testing.assert_array_equal(replay_scores, saved.astype(float))
+        assert d.screen.v3.combined_score_all is score_hook
+        assert d.screen.v3.score_topk is metric_hook
+
+
+def test_probe_uses_cached_context_preserves_failed_readback_and_never_prepares(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    failed_readback = out / "readback.csv"
+    failed_readback.write_text("original failed readback\n")
+    source = tmp_path / "source"
+    recs = pd.DataFrame([dict(model="m5", user=0, rank=k, item=k - 1) for k in range(1, 51)])
+    d.screen.io._atomic_csv(source / "new_pair_diagnostic" / "recommendations.csv", recs)
+    prepared = dict(data={"csr_ptr": np.array([0, 1]), "csr_items": np.array([59])},
+        cache=SimpleNamespace(users=np.array([0]), seg=np.array(["고CLV"]), gt={0: np.array([58])}))
+    saved = np.arange(50).reshape(1, -1)
+    current = saved.copy()
+    current[:, [19, 20]] = current[:, [20, 19]]
+    context = dict(prepared=prepared, views={"full": None}, arm={"curve": [{"metrics": {"diversity@20": .5}}]}, provenance={})
+    with patch.object(d.screen.shared, "validate_prepared"), \
+         patch.object(d, "prepare", side_effect=AssertionError("preparation forbidden")), \
+         patch.object(d, "_capture_evaluation", side_effect=[({"diversity@20": .55}, current, np.arange(50, 0, -1).reshape(1, -1)),
+                                                           ({"diversity@20": .5}, saved, saved)]):
+        result = d.probe_failed_readback(source, out, context=context)
+    assert failed_readback.read_text() == "original failed readback\n"
+    info = json.loads((Path(result["out_dir"]) / "result.json").read_text())
+    assert not info["current_probe_readback_passed"]
+    assert info["saved_list_replay_matches_recorded"]
+    assert info["recommendation_changes"]["20"]["changed_set_users"] == 1
+    assert info["recommendation_changes"]["10"]["changed_set_users"] == 0
+    assert info["recommendation_changes"]["50"]["changed_set_users"] == 0
+    assert not info["strict_gate_bypassed"] and Path(result["zip"]).is_file()
+    changes = pd.read_csv(Path(result["out_dir"]) / "topk_item_changes.csv")
+    assert len(changes) == 2 and not changes.is_truth.any()
+
+
+def test_failed_context_recovers_only_selected_runner_locals(monkeypatch):
+    namespace = {}
+    exec(compile("def run():\n prepared = {}\n views = {}\n arm = {}\n provenance = {}\n unrelated = 'do not expose'\n raise RuntimeError('gate')\n", d.__file__, "exec"), namespace)
+    try:
+        namespace["run"]()
+    except RuntimeError as error:
+        monkeypatch.setattr(d.sys, "last_traceback", error.__traceback__, raising=False)
+        assert set(d._failed_context()) == {"prepared", "views", "arm", "provenance"}
+    monkeypatch.setattr(d.sys, "last_traceback", None)
+    with pytest.raises(RuntimeError, match="캐시가 런타임에 없습니다"):
+        d._failed_context()
