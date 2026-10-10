@@ -18,7 +18,6 @@ import numpy as np
 import pandas as pd
 import torch
 
-import clv_m2_m5_lastweek_test10 as lastweek
 import clv_m5_m3_m4_user_centered_attribution as attribution
 import clv_m5_m3_m4_user_centered_screen as m4c
 import lightgcn_clv_m3_dunnhumby_test1 as fixed
