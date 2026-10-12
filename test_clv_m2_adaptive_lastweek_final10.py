@@ -29,7 +29,6 @@ def test_frozen_dataset_batches_keep_final_week_and_plain_bpr():
 
 
 def test_hm_one_seed_is_partial_not_a_final_mean(tmp_path):
-    cfg = s.configure("hm", out_dir=str(tmp_path))
     prepared = {
         "run_dir": Path(tmp_path),
         "protocol": {"compute_seeds": [49]},
