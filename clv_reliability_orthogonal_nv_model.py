@@ -65,7 +65,8 @@ def build_features(
 ) -> dict:
     """Build train-only user/item N/V inputs and positive-row LOO inputs."""
 
-    required = {"u_idx", "i_idx", "up", "b_raw"}
+    basket_column = "b_raw" if "b_raw" in train.columns else "t"
+    required = {"u_idx", "i_idx", "up", basket_column}
     missing = required.difference(train.columns)
     if missing or train.empty:
         raise ValueError(f"비어 있지 않은 TRAIN 입력 열이 필요합니다: {sorted(missing)}")
@@ -81,7 +82,7 @@ def build_features(
         if not np.isfinite(values[valid]).all() or np.any((values[valid] < 0) | (values[valid] > 1)):
             raise ValueError("유효 사용자 N/V는 유한한 [0,1] 값이어야 합니다")
 
-    frame = train[["u_idx", "i_idx", "up", "b_raw"]].copy()
+    frame = train[["u_idx", "i_idx", "up", basket_column]].copy()
     for column, size in (("u_idx", n_users), ("i_idx", n_items)):
         ids = frame[column].to_numpy()
         if not np.isfinite(ids).all() or np.any((ids < 0) | (ids >= size) | (ids != np.floor(ids))):
@@ -89,7 +90,7 @@ def build_features(
     frame["up"] = frame.up.where(np.isfinite(frame.up) & (frame.up > 0))
     pairs = (
         frame.groupby(["u_idx", "i_idx"], sort=True)
-        .agg(up=("up", "mean"), baskets=("b_raw", "nunique"))
+        .agg(up=("up", "mean"), baskets=(basket_column, "nunique"))
         .reset_index()
     )
     u = pairs.u_idx.to_numpy(np.int64)
@@ -100,7 +101,7 @@ def build_features(
     if len(keys) == 0 or np.any(np.diff(keys) <= 0):
         raise ValueError("정렬된 고유 사용자-상품 쌍이 필요합니다")
 
-    purchase_users = frame.drop_duplicates(["u_idx", "b_raw"]).u_idx.to_numpy(np.int64)
+    purchase_users = frame.drop_duplicates(["u_idx", basket_column]).u_idx.to_numpy(np.int64)
     user_purchase_support = np.bincount(purchase_users, minlength=n_users).astype(float)
     user_n_support = user_purchase_support
     user_v_support = user_purchase_support

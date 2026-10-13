@@ -35,6 +35,34 @@ def _empty_adj(size):
     ).coalesce()
 
 
+def test_hm_purchase_dates_match_equivalent_basket_ids():
+    frame = pd.DataFrame(
+        {
+            "u_idx": [0, 0, 0, 1, 1, 1],
+            "i_idx": [0, 1, 0, 1, 2, 2],
+            "up": [1.0, 2.0, 1.5, 2.5, 4.0, 5.0],
+            "t": pd.to_datetime(
+                ["2020-09-01", "2020-09-01", "2020-09-02",
+                 "2020-09-01", "2020-09-02", "2020-09-02"]
+            ),
+        }
+    )
+    basket_frame = frame.assign(b_raw=[10, 10, 11, 20, 21, 21])
+    kwargs = {
+        "n_users": 2, "n_items": 3,
+        "q_n": np.array([0.2, 0.8]), "q_v": np.array([0.3, 0.7]),
+        "valid": np.ones(2, bool),
+    }
+
+    hm = build_features(frame, **kwargs)
+    dunnhumby = build_features(basket_frame, **kwargs)
+
+    for key, expected in dunnhumby.items():
+        if isinstance(expected, np.ndarray):
+            np.testing.assert_allclose(hm[key], expected)
+    assert hm["diagnostics"] == dunnhumby["diagnostics"]
+
+
 def test_train_only_initialization_is_positive_normalized_and_data_dependent():
     first = dataset_parameter_initialization(_features())
     second = dataset_parameter_initialization(
