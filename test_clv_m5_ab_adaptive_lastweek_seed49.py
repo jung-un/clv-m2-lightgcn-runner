@@ -108,3 +108,56 @@ def test_completed_identity_mismatch_rejected(prepared):
     path.write_text(json.dumps({"identity": {}, "epochs": 300, "metrics": {}}))
     with pytest.raises(RuntimeError, match="신원"):
         s.run_arm(prepared, s.M5_A)
+
+
+@pytest.mark.parametrize("dataset,seed,count", [("hm", 49, 1), ("dunnhumby", 50, 2)])
+def test_new_batches_fit_only_requested_models(prepared, monkeypatch, dataset, seed, count):
+    cfg = s.configure(dataset=dataset, seed=seed, out_dir=str(prepared["run_dir"]))
+    prepared["cfg"] = cfg
+    labels, models = s.labels_for(cfg), s.models_for(cfg)
+    refs = pd.DataFrame([{"model_id": m, "seed": seed,
+                        **dict.fromkeys(prepared["references"]["metrics"], 1.)}
+                        for m in labels if m not in models])
+    prepared["references"].update(absolute=refs, diagnostics=refs[["model_id", "seed"]])
+    if dataset == "hm":
+        del prepared["observed_adj"]  # HM must not require or build an M3 graph.
+    trained, evaluated = [], []
+    def train(model, p, config, model_id, run_seed, store, row_weights=None):
+        assert config == cfg and run_seed == seed
+        assert (row_weights is not None) == (labels[model_id] == "M5_B")
+        trained.append(model_id)
+        return [{"epoch": i} for i in range(1, 301)]
+    def evaluate(model, p):
+        evaluated.append(True)
+        return dict.fromkeys(p["references"]["metrics"], 1.01)
+    monkeypatch.setattr(s.fixed, "_train", train)
+    monkeypatch.setattr(s.fixed, "_evaluate", evaluate)
+    result = s.run(prepared)
+    s.run(prepared)
+    assert trained == list(models) and len(evaluated) == count
+    assert result["complete"] and result["reading"]["new_fit_count"] == count
+    assert result["reading"]["reused_count"] == (4 if dataset == "hm" else 5)
+    assert set(result["absolute"].seed) == {seed}
+    assert result["absolute"].model.notna().all()
+    assert len(result["comparison"]) == count * len(refs) * 142
+    s.io._atomic_json(prepared["run_dir"] / "protocol.json", prepared["protocol"])
+    s.io._atomic_json(prepared["run_dir"] / "reference_audit.json", prepared["references"]["audit"])
+    assert s.export_zip(prepared, prepared["run_dir"] / "result.zip")
+
+
+def test_hm_input_path_uses_binary_m2_and_m4_only(monkeypatch):
+    data = {"train": object(), "n_users": 2, "n_items": 3}
+    prepared = {"data": data, "axes": object(), "features": object()}
+    monkeypatch.setattr(s.m2, "prepare", lambda cfg: prepared)
+    monkeypatch.setattr(s.hm, "validate_split", lambda data: None)
+    monkeypatch.setattr(s.fixed.evaluation, "build_clv_inputs", lambda axes:
+        (np.array([.2, .7]), np.array([.3, .8]), np.array([.1, .9]), np.array([True, False])))
+    def economics(train, **kw):
+        assert kw["q_n"][1] == 0 and kw["q_c"][1] == 0
+        return dict.fromkeys(("item_amount_percentile", "item_economic_valid",
+                             "user_economic_valid", "user_bin_fit", "item_bin"), None)
+    monkeypatch.setattr(s.hm.economics, "build_nv_economic_inputs", economics)
+    monkeypatch.setattr(s.hm.m4c, "row_weights", lambda p: (np.ones(3), {"sha256": "test"}))
+    monkeypatch.setattr(s.prior, "prepare", lambda *a: pytest.fail("HM builds M3 unnecessarily"))
+    result = s._prepare_hm_inputs(s.configure(dataset="hm"))
+    assert "observed_adj" not in result and result["observed_weight_audit"]["sha256"] == "test"
