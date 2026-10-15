@@ -32,7 +32,7 @@ def prepared(tmp_path):
 
 def test_fixed_seed_and_only_two_arms(prepared):
     s._validate_config(prepared["cfg"])
-    for change in ({"seeds": (43,)}, {"epochs": 100}, {"input_days": 704}, {"bandwidth": .5}):
+    for change in ({"seeds": (53,)}, {"epochs": 100}, {"input_days": 704}, {"bandwidth": .5}):
         with pytest.raises(ValueError):
             s._validate_config(replace(prepared["cfg"], **change))
     assert s.arm_inputs(prepared, s.M5_A)[0] is prepared["observed_adj"]

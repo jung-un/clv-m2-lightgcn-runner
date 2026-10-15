@@ -1,4 +1,4 @@
-"""Fixed combination batches: DH A/B seed49 or50, HM B seed49 only.
+"""Fixed combination batches: DH A/B seeds42--51, HM B seed49 only.
 
 Reuse immutable final-week same-seed metrics, never reference checkpoints. This
 is a descriptive comparison on an already exposed test, not fresh confirmation.
@@ -65,8 +65,8 @@ class Config:
 
 
 def configure(*, dataset="dunnhumby", seed=49, out_dir=None, m2_reference=None, m4_reference=None):
-    if (dataset, seed) not in (("dunnhumby", 49), ("dunnhumby", 50), ("hm", 49)):
-        raise ValueError("승인된 DH seed49/50 A·B 또는 H&M seed49 B만 허용합니다")
+    if not ((dataset == "dunnhumby" and seed in range(42, 52)) or (dataset, seed) == ("hm", 49)):
+        raise ValueError("승인된 DH seed42~51 A·B 또는 H&M seed49 B만 허용합니다")
     root = v3.default_out_dir(dataset)
     suffix = f"_m5_ab_adaptive_lastweek_seed{seed}_v1" if dataset == "dunnhumby" else "_m5_b_adaptive_lastweek_seed49_v1"
     return Config(out_dir or root + suffix,
