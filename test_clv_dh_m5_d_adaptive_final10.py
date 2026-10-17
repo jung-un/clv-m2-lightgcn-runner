@@ -109,3 +109,31 @@ def test_bad_reference_stops_before_data_prep(tmp_path, monkeypatch):
     monkeypatch.setattr(s.base.prior, "prepare", lambda *a: pytest.fail("unexpected preparation"))
     with pytest.raises(RuntimeError, match="원본"):
         s.prepare(s.configure(m2_reference=str(tmp_path)))
+
+
+def test_prepare_only_builds_inputs_and_writes_m5d_protocol(batch, monkeypatch):
+    shared = batch["shared"]
+    shared["data"].update(data_stats={"test": "lastweek"}, splits={"test": ()},
+                          train={"b_raw": []}, pos_key=shared["features"]["keys"])
+    shared.update(q_n=None, q_v=None, clv_valid=None, base_cfg={},
+                  observed_weight_audit={"sha256": "weights"}, observed_graph={"audit": {}})
+    p2 = {"input_hash": shared["input_hash"], "data_stats": shared["data"]["data_stats"],
+          "feature_sha256": shared["feature_sha256"], "split": "train DAY 1-704; test DAY 705-711"}
+    for ref in batch["references"].values():
+        ref["sources"] = {"m2": {"protocol": p2}, "m4": {"protocol": {
+            "fixed": {}, "m4_c_weight_audit": {"sha256": "weights"}}}}
+    monkeypatch.setattr(s, "load_references", lambda cfg: batch["references"])
+    calls = []
+    def prepare_inputs(cfg):
+        calls.append(cfg)
+        return shared
+    monkeypatch.setattr(s.base.prior, "prepare", prepare_inputs)
+    monkeypatch.setattr(s.base.m2, "build_features", lambda *a, **kw: shared["features"])
+    monkeypatch.setattr(s.base.fixed, "_train", lambda *a, **kw: pytest.fail("prepare trained a model"))
+    result = s.prepare(batch["cfg"])
+    assert len(calls) == 1
+    assert len(result["protocol"]["new_fit_models"]) == 10
+    assert all("m5_d_" in m for m in result["protocol"]["new_fit_models"])
+    assert result["protocol"]["config"]["seeds"] == list(s.SEEDS)
+    assert result["shared"]["base_cfg"]["SEED_LIST"] == list(s.SEEDS)
+    assert len(s.report(result)["absolute"]) == 50
