@@ -82,14 +82,14 @@ def test_resume_restores_optimizer_and_dropout_rng_exactly(prepared, tmp_path):
         s.base.v3.set_seed(49)
         return m, w
     full, weights = fresh()
-    history = s.base.fixed._train(full, prepared, cfg, ident.model_id, 49,
+    history = s.execution.train(full, prepared, cfg, ident.model_id, 49,
         s.SafeProgressStore(tmp_path / 'full', ident), row_weights=weights)
     part, _ = fresh()
     store = s.SafeProgressStore(tmp_path / 'resume', ident)
-    s.base.fixed._train(part, prepared, replace(cfg, epochs=1), ident.model_id, 49,
+    s.execution.train(part, prepared, replace(cfg, epochs=1), ident.model_id, 49,
                         store, row_weights=weights)
     resumed, _ = fresh()
-    actual = s.base.fixed._train(resumed, prepared, cfg, ident.model_id, 49,
+    actual = s.execution.train(resumed, prepared, cfg, ident.model_id, 49,
                                 store, row_weights=weights)
     assert actual == history
     for key, value in full.state_dict().items():
@@ -106,7 +106,7 @@ def test_completed_arms_skipped_and_partial_reports(prepared, monkeypatch):
     def evaluate(model, p):
         evals.append(True)
         return dict.fromkeys(p['references']['metrics'], 1.01)
-    monkeypatch.setattr(s.base.fixed, '_train', train)
+    monkeypatch.setattr(s.execution, 'train', train)
     monkeypatch.setattr(s.base.fixed, '_evaluate', evaluate)
     assert s.report(prepared)['absolute'].empty  # no LightGCN metrics mixed in
     s.run_arm(prepared, 'M1')
@@ -127,7 +127,7 @@ def test_completed_arms_skipped_and_partial_reports(prepared, monkeypatch):
 
 
 def test_incomplete_epoch_and_changed_config_never_evaluate(prepared, monkeypatch):
-    monkeypatch.setattr(s.base.fixed, '_train', lambda *a, **kw: [{'epoch': 299}])
+    monkeypatch.setattr(s.execution, 'train', lambda *a, **kw: [{'epoch': 299}])
     monkeypatch.setattr(s.base.fixed, '_evaluate', lambda *a: pytest.fail('early test'))
     with pytest.raises(RuntimeError, match='300epoch'):
         s.run_arm(prepared, 'M1')
@@ -155,7 +155,7 @@ def test_prepare_keeps_clv_inputs_and_does_not_fit(prepared, monkeypatch):
                             loss_w=None, data_stats={'marker': 'same'})
     monkeypatch.setattr(s.base, 'prepare', lambda cfg: dict(original))
     monkeypatch.setattr(s.base.prior.lastweek, 'validate_split', lambda *a: None)
-    monkeypatch.setattr(s.base.fixed, '_train', lambda *a: pytest.fail('prepare trained'))
+    monkeypatch.setattr(s.execution, 'train', lambda *a: pytest.fail('prepare trained'))
     monkeypatch.setattr(s.base.fixed, '_evaluate', lambda *a: pytest.fail('prepare evaluated'))
     actual = s.prepare(prepared['cfg'])
     assert actual['features'] is original['features']
@@ -164,3 +164,59 @@ def test_prepare_keeps_clv_inputs_and_does_not_fit(prepared, monkeypatch):
     assert actual['protocol']['new_fit_count'] == 8
     assert actual['protocol']['m3_audit'] == original['protocol']['m3_audit']
     assert s.report(actual)['absolute'].empty
+
+
+@pytest.mark.parametrize('label', s.ORDER)
+def test_optimized_training_exactly_matches_original(prepared, tmp_path, label):
+    cfg = replace(prepared['cfg'], epochs=2, batch_size=4)
+    ident = s.identity(prepared, label)
+    outcomes = []
+    for name, trainer, store_type in [('original', s.base.fixed._train, s.base.ProgressStore),
+                                       ('optimized', s.execution.train, s.SafeProgressStore)]:
+        s.base.v3.set_seed(49)
+        model, weights = s.build_model(prepared, label)
+        s.base.v3.set_seed(49)
+        store = store_type(tmp_path / name, ident)
+        hist = trainer(model, prepared, cfg, ident.model_id, 49, store, row_weights=weights)
+        payload = torch.load(store.latest_checkpoint, weights_only=False)
+        outcomes.append((hist, model.state_dict(), payload))
+    assert outcomes[0][0] == outcomes[1][0]
+    for key, value in outcomes[0][1].items():
+        torch.testing.assert_close(outcomes[1][1][key], value, rtol=0, atol=0)
+    assert outcomes[0][2]['numpy_rng_state'] == outcomes[1][2]['numpy_rng_state']
+    torch.testing.assert_close(outcomes[0][2]['torch_rng_state'], outcomes[1][2]['torch_rng_state'], rtol=0, atol=0)
+    for key, value in outcomes[0][2]['optimizer_state']['state'].items():
+        for name, tensor in value.items():
+            torch.testing.assert_close(outcomes[1][2]['optimizer_state']['state'][key][name], tensor, rtol=0, atol=0)
+
+
+def test_drive_publish_failure_preserves_previous_checkpoint(prepared, monkeypatch):
+    import hashlib
+    model, _ = s.build_model(prepared, 'M1')
+    store = s.SafeProgressStore(prepared['run_dir'] / 'progress', s.identity(prepared, 'M1'))
+    optimizer, rng = torch.optim.Adam(model.parameters()), np.random.default_rng(49)
+    store.save_epoch(model, optimizer, rng, epoch=1, history=[{'epoch': 1}])
+    original = store.latest_checkpoint.read_bytes()
+    assert store.read_progress()['checkpoint_sha256'] == hashlib.sha256(original).hexdigest()
+    def fail(*args):
+        raise OSError('simulated Drive disconnected')
+    monkeypatch.setattr(s.execution.os, 'replace', fail)
+    with pytest.raises(OSError, match='Drive disconnected'):
+        store.save_epoch(model, optimizer, rng, epoch=2, history=[{'epoch': 1}, {'epoch': 2}])
+    assert store.latest_checkpoint.read_bytes() == original
+    assert store.read_progress()['epoch'] == 1
+
+
+def test_timing_csv_and_zip_without_extra_evaluation(prepared):
+    import pandas as pd
+    cfg = replace(prepared['cfg'], epochs=1, batch_size=4)
+    model, weights = s.build_model(prepared, 'M5_D')
+    ident = s.identity(prepared, 'M5_D')
+    store = s.SafeProgressStore(prepared['run_dir'] / 'progress', ident)
+    s.execution.train(model, prepared, cfg, ident.model_id, 49, store, row_weights=weights)
+    timing_path = store.root / 'timing' / f'{ident.model_id}_s49.csv'
+    row = pd.read_csv(timing_path).iloc[0]
+    assert row['profile_batches'] == 2 and row['epoch'] == 1
+    assert row['checkpoint_drive_seconds'] > 0 and row['save_seconds'] > 0
+    with ZipFile(s.export_zip(prepared, prepared['run_dir'] / 'timing.zip')) as archive:
+        assert 'timing/' + timing_path.name in archive.namelist()

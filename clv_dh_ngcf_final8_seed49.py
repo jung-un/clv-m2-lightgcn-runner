@@ -17,8 +17,9 @@ import torch
 
 import clv_m5_ab_adaptive_lastweek_seed49 as base
 from clv_ngcf_adaptive_model import AdaptiveNVNGCF
+import clv_ngcf_training_io as execution
 
-VERSION = "clv-dh-ngcf-final8-seed49-v1"
+VERSION = "clv-dh-ngcf-final8-seed49-io-v2"
 # Bits: M2 representation, M3 graph, M4 loss. Order is fixed before test.
 ARMS = {"M1": (False, False, False), "M2": (True, False, False),
         "M3": (False, True, False), "M4": (False, False, True),
@@ -68,6 +69,7 @@ def validate_config(cfg):
 
 
 def prepare(cfg):
+    preparation_started = time.perf_counter()
     validate_config(cfg)
     # This helper does no fitting: it checks frozen reference bytes and the
     # historical CLV/M2 feature/M3/M4 computations against the existing design.
@@ -84,7 +86,8 @@ def prepare(cfg):
     frozen = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
         for name in (Path(__file__).name, "clv_ngcf_adaptive_model.py",
                      "clv_dataset_adaptive_orthogonal_nv_model.py",
-                     "clv_reliability_orthogonal_nv_model.py", "clv_run_state.py")}
+                     "clv_reliability_orthogonal_nv_model.py", "clv_run_state.py",
+                     "clv_ngcf_training_io.py")}
     protocol = {"code_version": VERSION, "config": asdict(cfg),
         "source_revision": prepared["revision"], "code_sha256": frozen,
         "input_hash": prepared["input_hash"], "data_stats": data["data_stats"],
@@ -105,6 +108,8 @@ def prepare(cfg):
         "new_fit_count": 8, "reused_ngcf_results": 0,
         "lightgcn_references": "input audit only; NOT NGCF performance baselines",
         "fixed_epoch": 300, "test_evaluations_per_completed_fit": 1,
+        "execution_optimization": "fixed inputs cached; CPU negative RNG unchanged; tensor logs copied once per epoch; local serialization/hash then synchronous atomic Drive publish every epoch",
+        "timing": "first5 batches of first3 session epochs sampled with CUDA synchronization; every epoch training/save split; no test used for profiling",
         "validation": False, "holdout": False, "early_stopping": False,
         "single_seed_only": True, "significance_claim": False,
         "clv_attribution_claim": False, "unseen_confirmation_claim": False,
@@ -117,6 +122,10 @@ def prepare(cfg):
     prepared.update(cfg=cfg, run_dir=run_dir, config_hash=config_hash, protocol=protocol)
     base.io._atomic_json(path, protocol)
     base.io._atomic_json(run_dir / "reference_audit.json", prepared["references"]["audit"])
+    preparation_timing = {"input_preparation_seconds": time.perf_counter() - preparation_started,
+                          "includes": "reference validation, data/CLV/features/graphs/cache preparation; no training"}
+    base.io._atomic_json(run_dir / "preparation_timing.json", preparation_timing)
+    print(f"[준비 계측] 자료·CLV·그래프·참조 검증 {preparation_timing['input_preparation_seconds']:.1f}초", flush=True)
     print("NGCF 입력 검증 완료: 8모형 순차 새 학습 / seed49 / 마지막 주 / 300epoch", flush=True)
     report(prepared)
     return prepared
@@ -174,10 +183,7 @@ class SafeProgressStore(base.ProgressStore):
         return {"next_epoch": epoch + 1, "history": payload["history"]}
 
     def save_epoch(self, model, optimizer, rng, **state):
-        result = super().save_epoch(model, optimizer, rng, **state)
-        if state["epoch"] % 5 == 0:
-            print(f"  [저장] {self.identity.model_id} {state['epoch']}/300 epoch", flush=True)
-        return result
+        return execution.save_epoch_local_then_drive(self, model, optimizer, rng, state)
 
 
 def build_model(prepared, label):
@@ -208,7 +214,7 @@ def run_arm(prepared, label):
     base.v3.set_seed(49)
     started = time.monotonic()
     try:
-        history = base.fixed._train(model, prepared, cfg, ident.model_id, 49, store, row_weights=weights)
+        history = execution.train(model, prepared, cfg, ident.model_id, 49, store, row_weights=weights)
         if [r["epoch"] for r in history] != list(range(1, 301)):
             raise RuntimeError("300epoch 미완료: test 평가 금지")
         print(f"[평가] NGCF {label} — 고정300epoch 마지막점", flush=True)
@@ -285,8 +291,13 @@ def export_zip(prepared, destination):
             archive.write(file, Path(file).name)
         for name in ("protocol.json", "reference_audit.json"):
             archive.write(prepared["run_dir"] / name, name)
+        prep_timing = prepared["run_dir"] / "preparation_timing.json"
+        if prep_timing.exists():
+            archive.write(prep_timing, prep_timing.name)
         for label in ORDER:
             file = arm_path(prepared, label)
             if file.exists():
                 archive.write(file, "arms/" + file.name)
+        for file in sorted((prepared["run_dir"] / "progress" / "timing").glob("*.csv")):
+            archive.write(file, "timing/" + file.name)
     return str(path)
