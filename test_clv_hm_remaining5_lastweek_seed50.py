@@ -1,6 +1,7 @@
 from dataclasses import asdict, replace
 import hashlib
 import json
+from types import SimpleNamespace
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -10,6 +11,31 @@ import torch
 
 import clv_hm_remaining5_lastweek_seed50 as s
 from test_clv_m5_ab_adaptive_lastweek_seed49 import prepared
+
+
+@pytest.mark.parametrize("weight_state", ["absent", "none", "nonempty"])
+def test_notebook_preflight_optional_loss_weight(weight_state):
+    """Execute the real notebook cell without loading data or starting training."""
+    notebook = json.loads(Path(__file__).with_name(
+        "clv_hm_remaining5_lastweek_seed50_colab.ipynb").read_text())
+    cells = ["".join(cell["source"]) for cell in notebook["cells"]]
+    cell, = [source for source in cells if "prepared = screen.prepare(cfg)" in source]
+    data = {"splits": {"test": {}}}
+    if weight_state != "absent":
+        data["loss_w"] = None if weight_state == "none" else [1.]
+    calls = []
+    def prepare_stub(cfg):
+        calls.append(cfg)
+        return {"data": data, "run_dir": Path("unused")}
+    cfg = SimpleNamespace(seeds=(50,), epochs=300)
+    namespace = {"cfg": cfg, "screen": SimpleNamespace(prepare=prepare_stub)}
+    if weight_state == "nonempty":
+        with pytest.raises(AssertionError):
+            exec(compile(cell, "<notebook-preflight>", "exec"), namespace)
+    else:
+        exec(compile(cell, "<notebook-preflight>", "exec"), namespace)
+    assert calls == [cfg]
+    assert ("loss_w" in data) == (weight_state != "absent")
 
 
 @pytest.fixture
