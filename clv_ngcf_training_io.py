@@ -79,11 +79,17 @@ def _sync(device):
         torch.cuda.synchronize(device)
 
 
-def train(model, prepared, cfg, model_id, seed, store, row_weights=None):
+def train(model, prepared, cfg, model_id, seed, store, row_weights=None, *, negative_sampler=None):
     data = prepared['data']
     tr_u, tr_i, positive_keys = data['tr_u'], data['tr_i'], data['pos_key']
     if cfg.negative_count != 1 or len(tr_u) == 0:
         raise ValueError('고정 uniform K1 / 비어 있지 않은 학습자료가 필요합니다')
+    if negative_sampler is not None:
+        if (positive_keys.ndim != 1 or not len(positive_keys)
+                or np.any(positive_keys[1:] <= positive_keys[:-1])):
+            raise ValueError('이진검색 음성검사에는 정렬된 고유 학습쌍이 필요합니다')
+    else:
+        negative_sampler = fixed.m4_helpers.sample_uniform_negative_matrix
     if row_weights is not None:
         row_weights = np.asarray(row_weights)
         if (row_weights.shape != (len(tr_u),) or not np.isfinite(row_weights).all()
@@ -126,7 +132,7 @@ def train(model, prepared, cfg, model_id, seed, store, row_weights=None):
                 t0 = time.perf_counter()
             index = permutation[batch * cfg.batch_size:(batch + 1) * cfg.batch_size]
             users_np, positives_np = tr_u[index], tr_i[index]
-            negatives_np = fixed.m4_helpers.sample_uniform_negative_matrix(
+            negatives_np = negative_sampler(
                 users_np, positives_np, data['n_items'], positive_keys, rng, k=1)
             idx = torch.as_tensor(index, dtype=torch.long, device=device)
             users, positives = users_all[idx], items_all[idx]

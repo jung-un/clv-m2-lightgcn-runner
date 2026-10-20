@@ -11,6 +11,10 @@ import clv_dh_gat_final8_seed49 as s
 from test_clv_m5_ab_adaptive_lastweek_seed49 import prepared as reference_fixture
 
 
+def gat_train(*args, **kwargs):
+    return s.execution.train(*args, negative_sampler=s.sample_uniform_negative_matrix, **kwargs)
+
+
 @pytest.fixture
 def prepared(reference_fixture):
     p = reference_fixture
@@ -126,14 +130,14 @@ def test_resume_restores_optimizer_and_dropout_rng_exactly(prepared, tmp_path):
         s.base.v3.set_seed(49)
         return m, w
     full, weights = fresh()
-    history = s.execution.train(full, prepared, cfg, ident.model_id, 49,
+    history = gat_train(full, prepared, cfg, ident.model_id, 49,
         s.SafeProgressStore(tmp_path / 'full', ident), row_weights=weights)
     part, _ = fresh()
     store = s.SafeProgressStore(tmp_path / 'resume', ident)
-    s.execution.train(part, prepared, replace(cfg, epochs=1), ident.model_id, 49,
+    gat_train(part, prepared, replace(cfg, epochs=1), ident.model_id, 49,
                         store, row_weights=weights)
     resumed, _ = fresh()
-    actual = s.execution.train(resumed, prepared, cfg, ident.model_id, 49,
+    actual = gat_train(resumed, prepared, cfg, ident.model_id, 49,
                                 store, row_weights=weights)
     assert actual == history
     for key, value in full.state_dict().items():
@@ -143,7 +147,8 @@ def test_resume_restores_optimizer_and_dropout_rng_exactly(prepared, tmp_path):
 
 def test_completed_arms_skipped_and_partial_reports(prepared, monkeypatch):
     fits, evals = [], []
-    def train(model, p, cfg, model_id, seed, store, row_weights=None):
+    def train(model, p, cfg, model_id, seed, store, row_weights=None, *, negative_sampler=None):
+        assert negative_sampler is s.sample_uniform_negative_matrix
         assert cfg.epochs == 300 and seed == 49
         fits.append(model_id)
         return [{'epoch': i} for i in range(1, 301)]
@@ -216,7 +221,7 @@ def test_optimized_training_exactly_matches_original(prepared, tmp_path, label):
     ident = s.identity(prepared, label)
     outcomes = []
     for name, trainer, store_type in [('original', s.base.fixed._train, s.base.ProgressStore),
-                                       ('optimized', s.execution.train, s.SafeProgressStore)]:
+                                       ('optimized', gat_train, s.SafeProgressStore)]:
         s.base.v3.set_seed(49)
         model, weights = s.build_model(prepared, label)
         s.base.v3.set_seed(49)
@@ -257,10 +262,52 @@ def test_timing_csv_and_zip_without_extra_evaluation(prepared):
     model, weights = s.build_model(prepared, 'M5_D')
     ident = s.identity(prepared, 'M5_D')
     store = s.SafeProgressStore(prepared['run_dir'] / 'progress', ident)
-    s.execution.train(model, prepared, cfg, ident.model_id, 49, store, row_weights=weights)
+    gat_train(model, prepared, cfg, ident.model_id, 49, store, row_weights=weights)
     timing_path = store.root / 'timing' / f'{ident.model_id}_s49.csv'
     row = pd.read_csv(timing_path).iloc[0]
     assert row['profile_batches'] == 2 and row['epoch'] == 1
     assert row['checkpoint_drive_seconds'] > 0 and row['save_seconds'] > 0
     with ZipFile(s.export_zip(prepared, prepared['run_dir'] / 'timing.zip')) as archive:
         assert 'timing/' + timing_path.name in archive.namelist()
+
+
+def test_fast_negative_validation_preserves_draws_dtype_and_rng():
+    rng = np.random.default_rng(31)
+    n_users, n_items = 32, 300
+    keys = np.sort(rng.choice(n_users * n_items, 2100, replace=False))
+    pairs = keys[rng.integers(0, len(keys), 128)]
+    users, positives = pairs // n_items, pairs % n_items
+    old_rng, new_rng = np.random.default_rng(49), np.random.default_rng(49)
+    for _ in range(30):
+        expected = s.execution.fixed.m4_helpers.sample_uniform_negative_matrix(
+            users, positives, n_items, keys, old_rng, k=1)
+        actual = s.sample_uniform_negative_matrix(users, positives, n_items, keys, new_rng, k=1)
+        np.testing.assert_array_equal(actual, expected)
+        assert actual.shape == (128, 1) and actual.dtype == expected.dtype
+        assert new_rng.bit_generator.state == old_rng.bit_generator.state
+        assert not np.isin(users[:, None] * n_items + actual, keys).any()
+
+
+def test_fast_negative_validation_boundaries_and_observed_pairs(monkeypatch):
+    users, positives = np.array([0, 2]), np.array([1, 3])
+    keys = np.array([1, 13])
+    monkeypatch.setattr(s.base.v3, 'sample_negatives', lambda *a: np.array([0, 4]))
+    actual = s.sample_uniform_negative_matrix(users, positives, 5, keys, np.random.default_rng(49), k=1)
+    np.testing.assert_array_equal(actual[:, 0], [0, 4])  # below first / above last key
+    monkeypatch.setattr(s.base.v3, 'sample_negatives', lambda *a: np.array([1, 3]))
+    with pytest.raises(RuntimeError, match='학습 관측상품'):
+        s.sample_uniform_negative_matrix(users, positives, 5, keys, np.random.default_rng(49), k=1)
+    with pytest.raises(ValueError, match='K1'):
+        s.sample_uniform_negative_matrix(users, positives, 5, keys, np.random.default_rng(49), k=2)
+
+
+@pytest.mark.parametrize('keys', [np.array([], dtype=np.int64), np.array([1, 1]), np.array([2, 1])])
+def test_fast_training_rejects_invalid_key_order_before_fitting(prepared, keys):
+    model, _ = s.build_model(prepared, 'M1')
+    prepared['data']['pos_key'] = keys
+    cfg = replace(prepared['cfg'], epochs=1, batch_size=4)
+    ident = s.identity(prepared, 'M1')
+    store = s.SafeProgressStore(prepared['run_dir'] / 'progress', ident)
+    with pytest.raises(ValueError, match='정렬된 고유'):
+        gat_train(model, prepared, cfg, ident.model_id, 49, store)
+    assert not store.latest_checkpoint.exists()

@@ -19,7 +19,7 @@ import clv_m5_ab_adaptive_lastweek_seed49 as base
 from clv_gat_adaptive_model import AdaptiveNVGAT
 import clv_ngcf_training_io as execution
 
-VERSION = "clv-dh-gat-final8-seed49-v1"
+VERSION = "clv-dh-gat-final8-seed49-sampling-v2"
 # Bits: M2 representation, M3 graph, M4 loss. Order is fixed before test.
 ARMS = {"M1": (False, False, False), "M2": (True, False, False),
         "M3": (False, True, False), "M4": (False, False, True),
@@ -109,7 +109,7 @@ def prepare(cfg):
         "new_fit_count": 8, "reused_gat_results": 0,
         "lightgcn_references": "input audit only; NOT GAT performance baselines",
         "fixed_epoch": 300, "test_evaluations_per_completed_fit": 1,
-        "execution_optimization": "fixed inputs cached; CPU negative RNG unchanged; tensor logs copied once per epoch; local serialization/hash then synchronous atomic Drive publish every epoch",
+        "execution_optimization": "same uniform K1 draws/retries/RNG; sorted-key binary search for final negative validation; fixed input cache; epoch tensor logs; synchronous atomic Drive checkpoint every epoch",
         "timing": "first5 batches of first3 session epochs sampled with CUDA synchronization; every epoch training/save split; no test used for profiling",
         "validation": False, "holdout": False, "early_stopping": False,
         "single_seed_only": True, "significance_claim": False,
@@ -221,6 +221,18 @@ def build_model(prepared, label):
     return model, prepared["observed_weights"] if m4 else None
 
 
+def sample_uniform_negative_matrix(users, positives, n_items, positive_keys, rng, *, k):
+    """Same draws/retries; binary-search the prevalidated sorted TRAIN keys."""
+    if k != 1:
+        raise ValueError("GAT 고정 uniform K1만 허용합니다")
+    negatives = base.v3.sample_negatives(users, positives, n_items, positive_keys, rng, "uniform")
+    sampled_keys = users.astype(np.int64) * int(n_items) + negatives
+    positions = np.clip(np.searchsorted(positive_keys, sampled_keys), 0, len(positive_keys) - 1)
+    if (positive_keys[positions] == sampled_keys).any():
+        raise RuntimeError("uniform 음성에 학습 관측상품이 남았습니다")
+    return negatives[:, None]
+
+
 def run_arm(prepared, label):
     cfg = prepared["cfg"]
     validate_config(cfg)
@@ -238,7 +250,8 @@ def run_arm(prepared, label):
     base.v3.set_seed(49)
     started = time.monotonic()
     try:
-        history = execution.train(model, prepared, cfg, ident.model_id, 49, store, row_weights=weights)
+        history = execution.train(model, prepared, cfg, ident.model_id, 49, store,
+                                  row_weights=weights, negative_sampler=sample_uniform_negative_matrix)
         if [r["epoch"] for r in history] != list(range(1, 301)):
             raise RuntimeError("300epoch 미완료: test 평가 금지")
         print(f"[평가] GAT {label} — 고정300epoch 마지막점", flush=True)
