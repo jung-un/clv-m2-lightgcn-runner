@@ -79,8 +79,10 @@ def _sync(device):
         torch.cuda.synchronize(device)
 
 
-def train(model, prepared, cfg, model_id, seed, store, row_weights=None, *, negative_sampler=None):
+def train(model, prepared, cfg, model_id, seed, store, row_weights=None, *, negative_sampler=None,
+          loss_function=None):
     data = prepared['data']
+    loss_function = loss_with_tensor_logs if loss_function is None else loss_function
     tr_u, tr_i, positive_keys = data['tr_u'], data['tr_i'], data['pos_key']
     if cfg.negative_count != 1 or len(tr_u) == 0:
         raise ValueError('고정 uniform K1 / 비어 있지 않은 학습자료가 필요합니다')
@@ -141,7 +143,7 @@ def train(model, prepared, cfg, model_id, seed, store, row_weights=None, *, nega
             if profile:
                 _sync(device)
                 t1 = time.perf_counter()
-            loss, correct = loss_with_tensor_logs(model, users, positives, negatives, weights)
+            loss, correct = loss_function(model, users, positives, negatives, weights)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
