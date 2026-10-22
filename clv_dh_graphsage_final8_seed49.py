@@ -102,6 +102,7 @@ def prepare(cfg):
         "backbone": "GraphSAGE mean: ID64, two64-D layers; mean layers0/1/2 output64",
         "propagation": "P=D^-1 A_w; Hnext=L2normalize(ELU(concat(H,P H) W+b)); Z=mean(E,H1,H2)",
         "adjacency": "same binary support; raw M3 weights or ones; weighted row normalization; no self-loop edges; separate self concatenation; full neighbors without sampling",
+        "normalization_precision": "raw float32 weights; float64 degree sums and validation; normalized adjacency cast to float32 for unchanged training precision",
         "regularization": "project sampled raw-ID L2=.001; M2 shared L2=1e-6; GraphSAGE weights/bias L2=1e-6",
         "implementation_scope": "project GraphSAGE mean preset: trainable IDs, BPR, ELU/L2 each layer, dropout0, layers0/1/2 mean; not original benchmark reproduction or unseen-node inductive generalization",
         "paper": "https://papers.nips.cc/paper/6703-inductive-representation-learning-on-large-graphs.pdf",
@@ -159,14 +160,19 @@ def prepare_graphsage_graphs(prepared):
     for name, values in (("graphsage_binary_adj", np.ones_like(weights)), ("graphsage_m3_adj", weights)):
         raw = torch.sparse_coo_tensor(edges, torch.from_numpy(np.tile(values, 2)), (n, n)).coalesce()
         row, col = raw.indices()
-        degree = torch.zeros(n).scatter_add_(0, row, raw.values())
-        norm = raw.values() / degree[row]
+        # Large neighborhoods accumulate noticeable error with float32 scatter.
+        # Keep the formula and raw inputs, but calculate its static sums in float64.
+        degree = torch.zeros(n, dtype=torch.float64).scatter_add_(0, row, raw.values().double())
+        norm64 = raw.values().double() / degree[row]
+        norm = norm64.to(dtype=torch.float32)
         graph = torch.sparse_coo_tensor(raw.indices(), norm, (n, n)).coalesce()
         if not torch.isfinite(graph.values()).all():
             raise RuntimeError("GraphSAGE 정규화 후 비유한 가중치")
-        row_sums = torch.zeros(n).scatter_add_(0, row, norm)
+        # Validate the actual float32 graph values using a high-precision sum.
+        row_sums = torch.zeros(n, dtype=torch.float64).scatter_add_(0, row, graph.values().double())
         if not torch.allclose(row_sums[degree > 0], torch.ones_like(row_sums[degree > 0]), atol=1e-5, rtol=1e-5):
-            raise RuntimeError("GraphSAGE 이웃 가중치 합이 1이 아닙니다")
+            error = float((row_sums[degree > 0] - 1).abs().max())
+            raise RuntimeError(f"GraphSAGE 이웃 가중치 합이 1이 아닙니다: 최대오차={error:.3g}")
         result[name] = graph
     return result
 

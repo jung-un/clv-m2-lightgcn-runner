@@ -102,6 +102,31 @@ def test_m3_raw_weights_neighbor_row_mean_no_self_loops(prepared):
     torch.testing.assert_close(equal['graphsage_binary_adj'].to_dense(), equal['graphsage_m3_adj'].to_dense())
 
 
+@pytest.mark.parametrize('count', [5000, 20000])
+@pytest.mark.parametrize('weighted', [False, True])
+def test_large_neighborhood_float32_accumulation_does_not_false_fail(count, weighted):
+    users, items = np.zeros(count, dtype=np.int64), np.arange(count)
+    row = torch.from_numpy(np.concatenate((users, items + 1)))
+    col = torch.from_numpy(np.concatenate((items + 1, users)))
+    edges = torch.stack((row, col))
+    weights = (np.geomspace(.0365, 4.767, count).astype(np.float32)
+               if weighted else np.ones(count, dtype=np.float32))
+    p = {'data': {'n_users': 1, 'n_items': count, 'pos_key': items,
+                 'adj': torch.sparse_coo_tensor(edges, torch.ones(2 * count),
+                                               (count + 1, count + 1)).coalesce()},
+         'signals': {'edge_users': users, 'edge_items': items},
+         'observed_graph': {'weights': weights}}
+    graphs = s.prepare_graphsage_graphs(p)
+    for name, graph in graphs.items():
+        assert graph.dtype == torch.float32
+        indices, values = graph.indices(), graph.values()
+        sums = torch.zeros(count + 1, dtype=torch.float64).scatter_add_(0, indices[0], values.double())
+        torch.testing.assert_close(sums, torch.ones_like(sums), atol=1e-7, rtol=0)
+        raw = weights if name == 'graphsage_m3_adj' else np.ones(count, dtype=np.float32)
+        expected = (raw.astype(np.float64) / raw.astype(np.float64).sum()).astype(np.float32)
+        np.testing.assert_allclose(values[indices[0] == 0].numpy(), expected, rtol=1e-7, atol=0)
+
+
 @pytest.mark.parametrize('bad', [np.zeros(6), np.full(6, np.nan), np.ones(5), -np.ones(6)])
 def test_invalid_m3_weight_fails_before_training(prepared, bad):
     prepared['observed_graph']['weights'] = bad
