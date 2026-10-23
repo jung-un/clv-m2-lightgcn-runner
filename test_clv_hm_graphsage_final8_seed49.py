@@ -435,3 +435,37 @@ def test_input_bytes_checked_before_expensive_preparation(tmp_path, monkeypatch)
     monkeypatch.setattr(s.base, '_prepare_hm_inputs', lambda cfg:pytest.fail('expensive preparation started'))
     with pytest.raises(RuntimeError, match='원본 파일 불일치'):
         s.prepare(s.configure())
+
+
+def test_completed_checkpoint_compaction_preserves_weights_and_failure_safety(prepared, monkeypatch):
+    import os
+    from clv_hm_graphsage_training_io import compact_completed_checkpoint
+    model, _ = s.build_model(prepared, 'M1')
+    store = s.SafeProgressStore(prepared['run_dir']/'compact',s.identity(prepared,'M1'))
+    optimizer, rng = torch.optim.Adam(model.parameters()), np.random.default_rng(49)
+    sum(p.sum() for p in model.parameters()).backward()
+    optimizer.step()
+    history=[{'epoch': i} for i in range(1,301)]
+    store.save_epoch(model,optimizer,rng,epoch=300,history=history)
+    original=store.latest_checkpoint.read_bytes()
+    compact_completed_checkpoint(store)
+    assert store.latest_checkpoint.read_bytes()==original  # not completed yet
+    result=store.root/'result.json';result.write_text('{}')
+    store.mark_complete(epoch=300,result_path=str(result))
+    real_replace=os.replace
+    monkeypatch.setattr(os,'replace',lambda *a: (_ for _ in ()).throw(OSError('publish failure')))
+    with pytest.raises(OSError,match='publish failure'):
+        compact_completed_checkpoint(store)
+    assert store.latest_checkpoint.read_bytes()==original
+    monkeypatch.setattr(os,'replace',real_replace)
+    compact_completed_checkpoint(store)
+    payload=torch.load(store.latest_checkpoint,weights_only=False)
+    assert payload['completed_weights_only'] and 'optimizer_state' not in payload
+    assert payload['history']==history
+    assert payload['numpy_rng_state']==rng.bit_generator.state
+    for key,value in model.state_dict().items():
+        torch.testing.assert_close(payload['model_state'][key],value,rtol=0,atol=0)
+    assert store.latest_checkpoint.stat().st_size < len(original)
+    compact_completed_checkpoint(store)  # idempotent
+    with pytest.raises(RuntimeError,match='최종 가중치'):
+        store.restore_epoch(model,optimizer,rng)

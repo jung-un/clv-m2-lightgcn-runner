@@ -176,3 +176,53 @@ def train(model, prepared, cfg, model_id, seed, store, row_weights=None, *, nega
 
 OPTIMIZATION_VERSION = 'hm-graphsage-execution-v2'
 
+
+
+def compact_completed_checkpoint(store):
+    """After durable completed result, retain exact final weights without Adam.
+
+    Atomic replacement retains the full checkpoint on failure. This file is
+    explicitly not a resumable intermediate checkpoint. No model math changes.
+    """
+    import hashlib
+    import os
+    from pathlib import Path
+    import tempfile
+    if not store.is_complete() or not store.latest_checkpoint.exists():
+        return
+    progress = store.read_progress()
+    result_path = Path(progress.get('result_path', ''))
+    if not result_path.is_file():
+        raise RuntimeError('완료 결과 파일 없이 checkpoint를 축소할 수 없습니다')
+    payload = torch.load(store.latest_checkpoint, map_location='cpu', weights_only=False)
+    store._validate_identity(payload.get('identity', {}))
+    if payload.get('epoch') != 300:
+        raise RuntimeError('300epoch 이전 checkpoint는 축소하지 않습니다')
+    if payload.get('completed_weights_only'):
+        return
+    payload.pop('optimizer_state')
+    payload['completed_weights_only'] = True
+    temp = store.latest_checkpoint.with_suffix('.compact.tmp')
+    with tempfile.TemporaryDirectory(prefix='hm-final-weights-') as folder:
+        local = Path(folder) / 'final.pt'
+        torch.save(payload, local)
+        digest = hashlib.sha256()
+        with local.open('rb') as source, temp.open('wb') as target:
+            for block in iter(lambda: source.read(8 * 1024 * 1024), b''):
+                digest.update(block)
+                target.write(block)
+            target.flush()
+            os.fsync(target.fileno())
+        if temp.stat().st_size != local.stat().st_size:
+            raise OSError('최종 가중치 복사 크기 불일치: 원 checkpoint 보존')
+        # Verify the copy before replacing the only complete checkpoint.
+        with temp.open('rb') as copied:
+            verify = hashlib.sha256()
+            for block in iter(lambda: copied.read(8 * 1024 * 1024), b''):
+                verify.update(block)
+        if verify.hexdigest() != digest.hexdigest():
+            raise OSError('최종 가중치 복사 해시 불일치: 원 checkpoint 보존')
+        os.replace(temp, store.latest_checkpoint)
+    store.mark_complete(epoch=300, max_epoch=300, selection='none',
+        result_path=str(result_path), completed_weights_only=True,
+        checkpoint_sha256=digest.hexdigest(), checkpoint_bytes=store.latest_checkpoint.stat().st_size)

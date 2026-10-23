@@ -155,6 +155,7 @@ def prepare(cfg):
         "lightgcn_references": "input audit only; NOT GraphSAGE performance baselines",
         "fixed_epoch": 300, "test_evaluations_per_completed_fit": 1,
         "execution_optimization": "same uniform K1 draws/retries/RNG; recheck rejected negatives only; prevalidated CPU positive-pair positions; unchanged floating arithmetic; heartbeat300sec; synchronous atomic Drive checkpoint every epoch",
+        "checkpoint_storage": "full model/Adam/RNG each active epoch; after epoch300 result and completion persist, atomically replace with exact final weights/RNG/history, omit Adam; completed arms skipped",
         "timing": "first5 batches of first3 session epochs sampled with CUDA synchronization; every epoch training/save split; no test used for profiling",
         "validation": False, "holdout": False, "early_stopping": False,
         "single_seed_only": True, "significance_claim": False,
@@ -229,6 +230,8 @@ class SafeProgressStore(base.ProgressStore):
         if not isinstance(epoch, int) or not 1 <= epoch <= 300 or [r.get("epoch") for r in
                 payload.get("history", [])] != list(range(1, epoch + 1)):
             raise RuntimeError("checkpoint epoch/이력 불일치")
+        if payload.get("completed_weights_only"):
+            raise RuntimeError("완료 모형의 최종 가중치입니다. 완료 결과를 확인하고 재학습하지 마세요")
         model.load_state_dict(payload["model_state"])
         optimizer.load_state_dict(payload["optimizer_state"])
         rng.bit_generator.state = payload["numpy_rng_state"]
@@ -262,6 +265,8 @@ def run_arm(prepared, label):
     validate_config(cfg)
     old = completed(prepared, label)
     if old is not None:
+        execution.compact_completed_checkpoint(SafeProgressStore(
+            prepared["run_dir"] / "progress", identity(prepared, label)))
         print(f"[재사용] GraphSAGE {label} seed49 — 재학습·재평가 없음", flush=True)
         return old
     if base.m2._feature_hash(prepared["features"]) != prepared["feature_sha256"]:
@@ -291,6 +296,7 @@ def run_arm(prepared, label):
         path = arm_path(prepared, label)
         base.io._atomic_json(path, row)
         store.mark_complete(epoch=300, max_epoch=300, selection="none", result_path=str(path))
+        execution.compact_completed_checkpoint(store)
         return row
     finally:
         del model
