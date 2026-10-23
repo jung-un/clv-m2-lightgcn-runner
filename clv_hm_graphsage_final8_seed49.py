@@ -17,10 +17,10 @@ import torch
 
 import clv_m5_ab_adaptive_lastweek_seed49 as base
 from clv_graphsage_adaptive_model import AdaptiveNVGraphSAGE
-import clv_ngcf_training_io as execution
+import clv_hm_graphsage_training_io as execution
 import clv_hm_remaining5_lastweek_seed50 as hm_schema
 
-VERSION = "clv-hm-graphsage-final8-seed49-v1"
+VERSION = "clv-hm-graphsage-final8-seed49-v2"
 # Bits: M2 representation, M3 graph, M4 loss. Order is fixed before test.
 ARMS = {"M1": (False, False, False), "M2": (True, False, False),
         "M3": (False, True, False), "M4": (False, False, True),
@@ -70,6 +70,17 @@ def validate_config(cfg):
             raise ValueError("새 출력과 참조 결과는 분리해야 합니다")
 
 
+def verify_input_files(expected_hash):
+    """Fail before expensive preprocessing; file paths do not affect identity."""
+    manifest = base.fixed.moe.build_input_manifest(base.v3.SCHEMA['hm'])
+    actual = base.fixed.moe.manifest_hash(manifest)
+    if actual != expected_hash:
+        raise RuntimeError(
+            f'H&M 원본 파일 불일치: actual={actual}, expected={expected_hash}. '
+            '학교 Drive raw/hm 원본을 확인하세요. CSV 재변환/검증 우회 금지.')
+    return manifest
+
+
 def prepare(cfg):
     preparation_started = time.perf_counter()
     validate_config(cfg)
@@ -82,6 +93,7 @@ def prepare(cfg):
     for key in hm_schema.GRAPH_KEYS:
         if p3["config"][key] != getattr(base.hm.configure(), key):
             raise RuntimeError("H&M M3 고정 설정 불일치: " + key)
+    verify_input_files(p2["input_hash"])
     prepared = base._prepare_hm_inputs(cfg)
     data = prepared['data']
     base.hm.validate_split(data)
@@ -119,7 +131,8 @@ def prepare(cfg):
         for name in (Path(__file__).name, "clv_graphsage_adaptive_model.py",
                      "clv_dataset_adaptive_orthogonal_nv_model.py",
                      "clv_reliability_orthogonal_nv_model.py", "clv_run_state.py",
-                     "clv_ngcf_training_io.py", "clv_dh_graphsage_final8_seed49.py")}
+                     "clv_ngcf_training_io.py", "clv_hm_graphsage_training_io.py",
+                     "clv_dh_graphsage_final8_seed49.py")}
     protocol = {"code_version": VERSION, "config": asdict(cfg),
         "source_revision": prepared["revision"], "code_sha256": frozen,
         "input_hash": prepared["input_hash"], "data_stats": data["data_stats"],
@@ -141,7 +154,7 @@ def prepare(cfg):
         "new_fit_count": 8, "reused_graphsage_results": 0,
         "lightgcn_references": "input audit only; NOT GraphSAGE performance baselines",
         "fixed_epoch": 300, "test_evaluations_per_completed_fit": 1,
-        "execution_optimization": "same uniform K1 draws/retries/RNG; sorted-key binary search for final negative validation; fixed input cache; epoch tensor logs; synchronous atomic Drive checkpoint every epoch",
+        "execution_optimization": "same uniform K1 draws/retries/RNG; recheck rejected negatives only; prevalidated CPU positive-pair positions; unchanged floating arithmetic; heartbeat300sec; synchronous atomic Drive checkpoint every epoch",
         "timing": "first5 batches of first3 session epochs sampled with CUDA synchronization; every epoch training/save split; no test used for profiling",
         "validation": False, "holdout": False, "early_stopping": False,
         "single_seed_only": True, "significance_claim": False,
@@ -197,6 +210,9 @@ def completed(prepared, label):
 class SafeProgressStore(base.ProgressStore):
     """Do not silently delete corrupt checkpoints or restart costly training."""
 
+    def __init__(self, root, identity, *, heartbeat_interval_sec=300):
+        super().__init__(root, identity, heartbeat_interval_sec=heartbeat_interval_sec)
+
     def restore_epoch(self, model, optimizer, rng):
         if not self.latest_checkpoint.exists():
             if self.stage_path.exists():
@@ -237,15 +253,8 @@ def build_model(prepared, label):
 
 
 def sample_uniform_negative_matrix(users, positives, n_items, positive_keys, rng, *, k):
-    """Same draws/retries; binary-search the prevalidated sorted TRAIN keys."""
-    if k != 1:
-        raise ValueError("GraphSAGE 고정 uniform K1만 허용합니다")
-    negatives = base.v3.sample_negatives(users, positives, n_items, positive_keys, rng, "uniform")
-    sampled_keys = users.astype(np.int64) * int(n_items) + negatives
-    positions = np.clip(np.searchsorted(positive_keys, sampled_keys), 0, len(positive_keys) - 1)
-    if (positive_keys[positions] == sampled_keys).any():
-        raise RuntimeError("uniform 음성에 학습 관측상품이 남았습니다")
-    return negatives[:, None]
+    return execution.sample_uniform_negative_matrix(
+        users, positives, n_items, positive_keys, rng, k=k)
 
 
 def run_arm(prepared, label):

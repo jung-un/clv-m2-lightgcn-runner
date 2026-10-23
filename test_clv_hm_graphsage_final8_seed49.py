@@ -8,6 +8,7 @@ import torch
 from torch.nn import functional as F
 
 import clv_hm_graphsage_final8_seed49 as s
+import clv_hm_graphsage_training_io as optimized_io
 from test_clv_m5_ab_adaptive_lastweek_seed49 import prepared as reference_fixture
 
 
@@ -263,7 +264,8 @@ def test_drive_publish_failure_preserves_previous_checkpoint(prepared, monkeypat
     assert store.read_progress()['checkpoint_sha256'] == hashlib.sha256(original).hexdigest()
     def fail(*args):
         raise OSError('simulated Drive disconnected')
-    monkeypatch.setattr(s.execution.os, 'replace', fail)
+    import clv_ngcf_training_io as shared_io
+    monkeypatch.setattr(shared_io.os, 'replace', fail)
     with pytest.raises(OSError, match='Drive disconnected'):
         store.save_epoch(model, optimizer, rng, epoch=2, history=[{'epoch': 1}, {'epoch': 2}])
     assert store.latest_checkpoint.read_bytes() == original
@@ -302,17 +304,23 @@ def test_fast_negative_validation_preserves_draws_dtype_and_rng():
         assert not np.isin(users[:, None] * n_items + actual, keys).any()
 
 
-def test_fast_negative_validation_boundaries_and_observed_pairs(monkeypatch):
+def test_fast_negative_validation_boundaries_and_observed_pairs():
     users, positives = np.array([0, 2]), np.array([1, 3])
     keys = np.array([1, 13])
-    monkeypatch.setattr(s.base.v3, 'sample_negatives', lambda *a: np.array([0, 4]))
-    actual = s.sample_uniform_negative_matrix(users, positives, 5, keys, np.random.default_rng(49), k=1)
-    np.testing.assert_array_equal(actual[:, 0], [0, 4])  # below first / above last key
-    monkeypatch.setattr(s.base.v3, 'sample_negatives', lambda *a: np.array([1, 3]))
+    class FixedRng:
+        def __init__(self, values): self.values = np.array(values); self.calls = 0
+        def integers(self, low, high, size):
+            self.calls += 1
+            assert size == len(self.values)
+            return self.values.copy()
+    actual = s.sample_uniform_negative_matrix(users, positives, 5, keys, FixedRng([0,4]), k=1)
+    np.testing.assert_array_equal(actual[:,0],[0,4])
+    stuck = FixedRng([1,3])
     with pytest.raises(RuntimeError, match='학습 관측상품'):
-        s.sample_uniform_negative_matrix(users, positives, 5, keys, np.random.default_rng(49), k=1)
+        s.sample_uniform_negative_matrix(users, positives, 5, keys, stuck, k=1)
+    assert stuck.calls == 51  # initial draw + exactly 50 redraws, then fail
     with pytest.raises(ValueError, match='K1'):
-        s.sample_uniform_negative_matrix(users, positives, 5, keys, np.random.default_rng(49), k=2)
+        s.sample_uniform_negative_matrix(users, positives, 5, keys, FixedRng([0,4]), k=2)
 
 
 @pytest.mark.parametrize('keys', [np.array([], dtype=np.int64), np.array([1, 1]), np.array([2, 1])])
@@ -367,6 +375,7 @@ def test_hm_prepare_routes_inputs_and_graph_without_training(prepared, monkeypat
               'config':{k:getattr(gc,k) for k in s.hm_schema.GRAPH_KEYS}}
     refs = {**p['references'], 'sources':{k:{'protocol':common} for k in ('m2','m4')},'audit':{}}
     monkeypatch.setattr(s.base,'load_references',lambda cfg:refs)
+    monkeypatch.setattr(s,'verify_input_files',lambda expected: {})
     monkeypatch.setattr(s.base,'_prepare_hm_inputs',lambda cfg:dict(p))
     monkeypatch.setattr(s.base.hm,'validate_split',lambda data:None)
     monkeypatch.setattr(s.base.hm.hm_graph,'_purchase_keyed',lambda data:None)
@@ -381,3 +390,48 @@ def test_hm_prepare_routes_inputs_and_graph_without_training(prepared, monkeypat
     assert actual['features'] is p['features']
     torch.testing.assert_close(actual['graphsage_m3_adj'].to_dense(),p['graphsage_m3_adj'].to_dense())
     assert s.report(actual)['absolute'].empty
+
+
+@pytest.mark.parametrize('density', [.001, .1, .8])
+def test_optimized_negative_dense_retries_preserve_rng(density):
+    import clv_dh_graphsage_final8_seed49 as original
+    gen=np.random.default_rng(10)
+    keys=np.sort(gen.choice(100*200, int(100*200*density),replace=False))
+    batch=keys[gen.integers(0,len(keys),1024)]
+    a,b=np.random.default_rng(49),np.random.default_rng(49)
+    for _ in range(10):
+        old=original.sample_uniform_negative_matrix(batch//200,batch%200,200,keys,a,k=1)
+        new=s.sample_uniform_negative_matrix(batch//200,batch%200,200,keys,b,k=1)
+        np.testing.assert_array_equal(new,old)
+        assert a.bit_generator.state==b.bit_generator.state
+
+
+def test_cached_positions_bypass_search_and_reject_invalid_positive(prepared,tmp_path,monkeypatch):
+    cfg=replace(prepared['cfg'],epochs=1,batch_size=3)
+    model,weights=s.build_model(prepared,'M2')
+    monkeypatch.setattr(model,'_pair_scores',lambda *args:pytest.fail('per-batch lookup used'))
+    ident=s.identity(prepared,'M2')
+    graphsage_train(model,prepared,cfg,ident.model_id,49,
+                    s.SafeProgressStore(tmp_path/'valid',ident),row_weights=weights)
+    prepared['data']['tr_i'][0]=4
+    with pytest.raises(ValueError,match='TRAIN pair'):
+        graphsage_train(model,prepared,cfg,ident.model_id,49,
+                        s.SafeProgressStore(tmp_path/'invalid',ident),row_weights=weights)
+    assert not s.SafeProgressStore(tmp_path/'invalid',ident).latest_checkpoint.exists()
+
+
+def test_input_bytes_checked_before_expensive_preparation(tmp_path, monkeypatch):
+    tx, meta = tmp_path/'tx.parquet', tmp_path/'articles.csv'
+    tx.write_bytes(b'original parquet bytes')
+    meta.write_bytes(b'article_id,category\n0123,A\n')
+    monkeypatch.setitem(s.base.v3.SCHEMA, 'hm', {'tx_path':str(tx),'item_meta_path':str(meta)})
+    expected = s.base.fixed.moe.manifest_hash(s.base.fixed.moe.build_input_manifest(s.base.v3.SCHEMA['hm']))
+    assert s.verify_input_files(expected)['transactions']['bytes'] == tx.stat().st_size
+    tx.write_bytes(b'reencoded but different parquet')
+    with pytest.raises(RuntimeError, match='원본 파일 불일치'):
+        s.verify_input_files(expected)
+    refs={'sources':{'m2':{'protocol':{'input_hash':expected}},'m4':{'protocol':{'config':{k:getattr(s.base.hm.configure(),k) for k in s.hm_schema.GRAPH_KEYS}}}}}
+    monkeypatch.setattr(s.base, 'load_references', lambda cfg:refs)
+    monkeypatch.setattr(s.base, '_prepare_hm_inputs', lambda cfg:pytest.fail('expensive preparation started'))
+    with pytest.raises(RuntimeError, match='원본 파일 불일치'):
+        s.prepare(s.configure())
