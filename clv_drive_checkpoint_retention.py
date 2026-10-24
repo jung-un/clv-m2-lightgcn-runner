@@ -16,11 +16,32 @@ def _quote(s):
     return str(s).replace('\\', '\\\\').replace("'", "\\'")
 
 
+def _execute(request, *, sleep=time.sleep):
+    """Retry quota/transient failures only; do not consume training RNG."""
+    for attempt in range(6):
+        try:
+            return request.execute()
+        except Exception as exc:
+            status = getattr(getattr(exc, 'resp', None), 'status', None)
+            try:
+                body = json.loads(getattr(exc, 'content', b'{}'))
+                reasons = {e.get('reason') for e in body.get('error', {}).get('errors', [])}
+            except (ValueError, TypeError):
+                reasons = set()
+            limited = status == 429 or (status == 403 and bool(
+                reasons & {'rateLimitExceeded', 'userRateLimitExceeded'}))
+            if not (limited or status in (500, 502, 503, 504)) or attempt == 5:
+                raise
+            delay = min(60 * 2**attempt, 480)
+            print(f'[Drive 재시도] 일시 제한/서버 오류: {delay}초 대기; 체크포인트 유지', flush=True)
+            sleep(delay)
+
+
 def _list(api, query):
     rows, token = [], None
     while True:
-        page = api.files().list(q=query, spaces='drive', corpora='user', pageSize=1000,
-            pageToken=token, fields='nextPageToken,incompleteSearch,files('+FIELDS+')').execute()
+        page = _execute(api.files().list(q=query, spaces='drive', corpora='user', pageSize=1000,
+            pageToken=token, fields='nextPageToken,incompleteSearch,files('+FIELDS+')'))
         if page.get('incompleteSearch'):
             raise RuntimeError('체크포인트 목록 불완전: 삭제하지 않습니다')
         rows.extend(page.get('files', []))
@@ -29,7 +50,7 @@ def _list(api, query):
             return rows
 
 
-def prune(api, checkpoint, *, keep_previous=1, retries=6, sleep=time.sleep):
+def prune(api, checkpoint, *, keep_previous=1, retries=30, sleep=time.sleep):
     path = Path(checkpoint)
     if keep_previous not in (0, 1) or not path.name.endswith('_latest.pt'):
         raise ValueError('최신 체크포인트 경로 및 보존수0/1만 허용')
@@ -49,12 +70,12 @@ def prune(api, checkpoint, *, keep_previous=1, retries=6, sleep=time.sleep):
                 current = f
                 break
         if attempt + 1 < retries:
-            sleep(2)
+            sleep(10)
     if current is None:
         raise RuntimeError('최신 체크포인트 Drive 업로드/고유성 확인 실패: 삭제 없이 중단, 이후 재시도하세요')
     parent = current['parents'][0]
     # Parent must still be live; never clean up a user's trashed experiment folder.
-    folder = api.files().get(fileId=parent, fields='id,trashed').execute()
+    folder = _execute(api.files().get(fileId=parent, fields='id,trashed'))
     if folder.get('trashed') is not False:
         raise RuntimeError('체크포인트 폴더 상태 불명: 삭제하지 않습니다')
     old = _list(api, query + " and trashed = true and '"+_quote(parent)+"' in parents")
@@ -68,12 +89,12 @@ def prune(api, checkpoint, *, keep_previous=1, retries=6, sleep=time.sleep):
     removed = 0
     for candidate in old[keep_previous:]:
         # Recheck both live identity and candidate immediately before permanent deletion.
-        live = api.files().get(fileId=current['id'], fields=FIELDS).execute()
+        live = _execute(api.files().get(fileId=current['id'], fields=FIELDS))
         if (live.get('trashed') is not False or live.get('md5Checksum') != expected
                 or live.get('parents') != [parent] or not live.get('ownedByMe')
                 or int(live.get('size', -1)) != size):
             raise RuntimeError('최신 체크포인트 동시변경: 추가 삭제를 중단합니다')
-        fresh = api.files().get(fileId=candidate['id'], fields=FIELDS).execute()
+        fresh = _execute(api.files().get(fileId=candidate['id'], fields=FIELDS))
         if not eligible(fresh):
             raise RuntimeError('이전 사본 상태 변경: 삭제를 중단합니다')
         api.files().delete(fileId=fresh['id']).execute()
@@ -86,7 +107,7 @@ def prune(api, checkpoint, *, keep_previous=1, retries=6, sleep=time.sleep):
 def install(screen, api, prepared):
     """Call after prepare, before run, in an idle runtime. Idempotent."""
     import torch
-    owner = api.about().get(fields='user(emailAddress)').execute()['user']['emailAddress']
+    owner = _execute(api.about().get(fields='user(emailAddress)'))['user']['emailAddress']
     if owner != 'jungunb@u.sogang.ac.kr':
         raise RuntimeError('학교 Drive 계정이 아닙니다')
     module = getattr(screen, 'original', screen)
