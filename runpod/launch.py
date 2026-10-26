@@ -30,7 +30,7 @@ JOBS = {
     'dh-ngcf': dict(module='clv_dh_ngcf_remaining9', dataset='dunnhumby',
                     pin='63146eff4ed60bfb0cc430b77d58fdc40e4db7c5', seed=None),
     'hm-ngcf': dict(module='clv_hm_ngcf_final8_seed49', dataset='hm',
-                    pin='836c0c71c6aab3a952f8f948f9920b32c7b109c8', seed=49),
+                    pin='db39115fadad5aedb020eafe4a492a2862a876db', seed=49),
     'hm-lightgcn': dict(module='clv_hm_final8_seed51', dataset='hm',
                         pin='8ca3baa90be1e0ac02554e1c6fe4c1c6b8deb229', seed=51),
 }
