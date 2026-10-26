@@ -61,7 +61,8 @@ def install(prepared, role):
     foreign = set(s.NEW_SEEDS) - set(ASSIGNMENTS[role])
     for seed in foreign:
         if any((root / 'arms').glob(f'*_s{seed}.json')) or any(
-                (root / 'progress' / 'stages').glob(f'*_s{seed}.*')):
+                (root / 'progress' / 'stages').glob(f'*_s{seed}.*')) or any(
+                (root / 'progress' / 'resume').glob(f'*_s{seed}_*')):
             raise RuntimeError(f'다른 담당 seed{seed}의 기존 작업 발견: 먼저 중복 여부 확인')
     s.base.io._atomic_json(sidecar, rec)
     original = getattr(s, '_split_original_run_arm', s.run_arm)
@@ -145,6 +146,8 @@ def _packet(path, role):
         protocol = json.loads(z.read('protocol.json'))
         rec = json.loads(z.read('split_assignment.json'))
         signature = scientific_signature(protocol)
+        if protocol['seed49_audit']['sha256'] != s.OLD_SHA:
+            raise RuntimeError('seed49 감사 지문 변경')
         chash = digest(protocol)[:12]
         if (rec.get('role') != role or rec.get('seeds') != list(ASSIGNMENTS[role])
                 or rec.get('config_hash') != chash or rec.get('version') != VERSION
@@ -201,6 +204,9 @@ def merge(personal_zip, school_zip, destination):
     tables.update(s.aggregate(absolute, a[4]))
     missing = [f'seed{seed}:{m}' for seed in s.SEEDS for m in s.ORDER if (m, seed) not in pairs]
     root = Path(destination)
+    if missing and any((root / f'{n}.csv').exists() for n in
+                       ('summary', 'core_mean_std', 'comparison_vs_m1', 'paired_vs_m1')):
+        raise RuntimeError('기존 최종 평균표를 부분 결과로 덮어쓰지 않습니다. 새 출력 폴더를 사용하세요')
     root.mkdir(parents=True, exist_ok=True)
     for name, table in tables.items():
         s.base.io._atomic_csv(root / f'{name}.csv', table)
