@@ -226,3 +226,17 @@ def test_prepare_once_inputs_and_source_consistency(prepared, monkeypatch):
     monkeypatch.setattr(s.original, 'prepare', changed)
     with pytest.raises(RuntimeError, match='feature_sha256'):
         s.prepare(prepared['cfg'])
+
+
+def test_audit_platform_roundoff_does_not_hide_changed_weights():
+    old = {"m3_audit": {"coefficient_of_variation": .2, "item_weight_vs_price": -.005},
+           "m4_weight_audit": {"sha256": "exact", "row_weight_cv": .13}}
+    new = copy.deepcopy(old)
+    new["m3_audit"]["coefficient_of_variation"] += 1e-16
+    new["m3_audit"]["item_weight_vs_price"] = -.007
+    assert len(s.compare_audits(old, new)["differences"]) == 2
+    new["m4_weight_audit"]["sha256"] = "changed"
+    with pytest.raises(RuntimeError): s.compare_audits(old, new)
+    new = copy.deepcopy(old)
+    new["m3_audit"]["coefficient_of_variation"] = .21
+    with pytest.raises(RuntimeError): s.compare_audits(old, new)

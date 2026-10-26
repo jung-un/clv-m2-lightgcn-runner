@@ -126,6 +126,31 @@ def check_source_compatibility(previous):
             "difference": "training_io only: optional loss injection unused; original GAT sampler and default loss preserved"}
 
 
+def compare_audits(old, now):
+    # Rank correlations of group means near ties can differ across BLAS builds.
+    # They remain subject to the original graph gates in original.prepare().
+    rank_keys = {"customer_weight_vs_degree", "item_weight_vs_price", "item_weight_vs_popularity"}
+    differences = {}
+    for section in ("m3_audit", "m4_weight_audit"):
+        a, b = old[section], now[section]
+        if set(a) != set(b):
+            raise RuntimeError(f"{section} 진단 항목 불일치")
+        for key in a:
+            x, y = a[key], b[key]
+            if section == "m3_audit" and key in rank_keys:
+                if not np.isfinite([x, y]).all():
+                    raise RuntimeError("M3 상관 진단 비유한값")
+            elif isinstance(x, float):
+                if not np.isclose(x, y, rtol=1e-10, atol=1e-12):
+                    raise RuntimeError(f"{section}.{key} 값 불일치")
+            elif x != y:
+                raise RuntimeError(f"{section}.{key} 불일치")
+            if x != y:
+                differences[f"{section}.{key}"] = {"seed49": x, "current": y}
+    return {"differences": differences,
+            "rule": "input/feature/M4 hash and frozen M3 code exact; numeric audits rtol1e-10 atol1e-12; M3 rank correlations retain original gates and are recorded, not required bitwise equal across platforms"}
+
+
 def prepare(cfg):
     validate_config(cfg)
     previous = load_seed49(cfg.seed49_reference)  # Before costly input preparation.
@@ -138,11 +163,12 @@ def prepare(cfg):
     shared = original.prepare(original.configure(out_dir=str(Path(cfg.out_dir) / "input_audit"),
         m2_reference=cfg.m2_reference, m4_reference=cfg.m4_reference))
     now = shared["protocol"]
-    for key in ("input_hash", "data_stats", "split", "feature_sha256", "m3_audit", "m4_weight_audit",
+    for key in ("input_hash", "data_stats", "split", "feature_sha256",
                 "dataset_initialization", "fixed_intervention_settings", "models", "backbone", "propagation",
                 "adjacency", "regularization", "m2_adaptation", "initialization"):
         if now[key] != old[key]:
             raise RuntimeError(f"seed49와 준비된 입력/설계가 다릅니다: {key}")
+    audit_comparison = compare_audits(old, now)
     if set(shared["references"]["metrics"]) != set(previous["metrics"]):
         raise RuntimeError("seed49와 전체 지표 목록 불일치")
     protocol = {**now, "code_version": VERSION, "config": asdict(cfg),
@@ -151,6 +177,7 @@ def prepare(cfg):
         "new_fit_count": 72, "reused_gat_results": 8, "new_fit_seeds": NEW_SEEDS,
         "reused_seeds": [49], "single_seed_only": False,
         "seed49_audit": previous["audit"], "source_compatibility": compatibility,
+        "cross_platform_audit": audit_comparison,
         "aggregation": "8 models x seeds42--51; full precision arm metrics; arithmetic mean and sample SD ddof=1; final tables only with all80 rows",
         "seed49_checkpoint_reused_for_initialization": False,
         "decision": "fixed 72 fits regardless of interim scores; no seed/epoch/model selection, test retuning or significance claim"}
