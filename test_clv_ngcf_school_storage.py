@@ -77,7 +77,11 @@ def api(monkeypatch):
 
 def test_school_space_guard_and_account_fail_closed(api):
     assert storage.check_space(api, initial=True) == 10_000_000_000
-    api.extra_usage = 6_000_000_000
+    api.extra_usage = 9_000_000_000
+    assert storage.check_space(api, initial=True) == 1_000_000_000
+    with pytest.raises(RuntimeError, match='여유'):
+        storage.check_space(api, required=1)
+    api.extra_usage = 9_000_000_001
     with pytest.raises(RuntimeError, match='여유'):
         storage.check_space(api, initial=True)
     api.owner = 'not-school@example.org'

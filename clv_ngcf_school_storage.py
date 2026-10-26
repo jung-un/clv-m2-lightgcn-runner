@@ -11,8 +11,8 @@ from pathlib import Path
 import time
 
 ACCOUNT = 'jungunb@u.sogang.ac.kr'
-MIN_FREE = 2_000_000_000
-START_FREE = 4_500_000_000  # 16 fits x two ~73MB checkpoints, plus other writers.
+MIN_FREE = 1_000_000_000
+START_FREE = 1_000_000_000  # User-approved reserve; each upload also budgets its size.
 FIELDS = 'id,name,size,md5Checksum,parents,ownedByMe,trashed,appProperties'
 LOCAL_CACHE = Path('/content/ngcf_school_local')
 
