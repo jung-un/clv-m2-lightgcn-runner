@@ -3,7 +3,7 @@ from pathlib import Path
 import sys,subprocess
 import argparse
 parser = argparse.ArgumentParser(description='CPU synthetic checkpoint equality; never runs research training/test.')
-parser.add_argument('job', choices=['dh-ngcf', 'hm-ngcf', 'hm-lightgcn'])
+parser.add_argument('job', choices=['dh-gat', 'dh-ngcf', 'hm-ngcf', 'hm-lightgcn'])
 parser.add_argument('--root', type=Path, default=Path('/workspace/clv'))
 args = parser.parse_args()
 ROOT = args.root.resolve()
@@ -16,7 +16,7 @@ from unittest.mock import patch
 from tempfile import TemporaryDirectory
 if job=='hm-lightgcn':screen.load_references(cfg)
 elif job=='hm-ngcf':screen.base.load_references(screen.base.configure(dataset='hm',seed=49,out_dir=cfg.out_dir,m2_reference=cfg.m2_reference,m4_reference=cfg.m4_reference))
-owner=screen.original if job=='dh-ngcf' else screen
+owner=screen.original if job in ('dh-ngcf','dh-gat') else screen
 key='ProgressStore' if job=='hm-lightgcn' else 'SafeProgressStore'
 original=getattr(owner,key)
 with TemporaryDirectory() as tmp:

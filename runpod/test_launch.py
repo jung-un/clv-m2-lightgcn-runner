@@ -21,6 +21,8 @@ class PlatformChecks(unittest.TestCase):
 
     def test_seed_scope(self):
         self.assertEqual(s.selected_seeds('dh-ngcf', [51, 42]), (42, 51))
+        self.assertEqual(s.selected_seeds('dh-gat', list(s.NEW_SEEDS)), s.NEW_SEEDS)
+        with self.assertRaises(ValueError): s.selected_seeds('dh-gat', [49])
         for seeds in ([], [49], [42, 42], [41], [52]):
             with self.assertRaises(ValueError): s.selected_seeds('dh-ngcf', seeds)
         self.assertEqual(s.selected_seeds('hm-ngcf', None), (49,))

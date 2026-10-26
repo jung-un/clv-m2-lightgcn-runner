@@ -25,6 +25,8 @@ REMOTE = 'https://github.com/jung-un/clv-m2-lightgcn-runner.git'
 ORDER = ('M1', 'M2', 'M3', 'M4', 'M5_A', 'M5_B', 'M5_C', 'M5_D')
 NEW_SEEDS = (42, 43, 44, 45, 46, 47, 48, 50, 51)
 JOBS = {
+    'dh-gat': dict(module='clv_dh_gat_remaining9', dataset='dunnhumby',
+                   pin='5a475a2ed25ef0b40822de11c537fa7fc76e475a', seed=None),
     'dh-ngcf': dict(module='clv_dh_ngcf_remaining9', dataset='dunnhumby',
                     pin='63146eff4ed60bfb0cc430b77d58fdc40e4db7c5', seed=None),
     'hm-ngcf': dict(module='clv_hm_ngcf_final8_seed49', dataset='hm',
@@ -39,6 +41,9 @@ DH_FILES = {
     'references/clv_m4_user_centered_final10_results.zip': 'a6bf92f64bf425248758a3952054bf3f6c9c27c10a4711758d3a08fa1cfcb41f',
     'references/dh_ngcf_final8_seed49_results.zip': '6a04f4f0fcdac6194910092700e3305d88d14c0bc54c8b37e60273881fd0444e',
 }
+DH_GAT_FILES = {k: v for k, v in DH_FILES.items() if 'dh_ngcf_' not in k}
+DH_GAT_FILES['references/dh_gat_final8_seed49_results.zip'] = '303439619e1bde2cc83ce46bc5ac3432355e92e0c836a0457562ff4c4783ae1a'
+
 HM_FILES = {
     'raw/hm/transactions_train.parquet': '0d90884fc1bc400161e6aeba238cba94183998bedfeb4ebbf4962e17d0c8489b',
     'raw/hm/articles.csv': '25f21882053517f7684ea43f524225a9481a7bb9aab9cf0abfc7fe8c4576a72b',
@@ -95,7 +100,7 @@ def unpack(bundle, target):
 
 
 def verify_files(job, root=ROOT):
-    expected = DH_FILES if job == 'dh-ngcf' else HM_FILES
+    expected = DH_GAT_FILES if job == 'dh-gat' else (DH_FILES if job == 'dh-ngcf' else HM_FILES)
     missing, actual = [], {}
     for name, digest in expected.items():
         p = root / 'data' / name
@@ -161,13 +166,13 @@ def exclusive(path):
 
 
 def selected_seeds(job, seeds):
-    if job != 'dh-ngcf':
+    if job not in ('dh-ngcf', 'dh-gat'):
         fixed = JOBS[job]['seed']
         if seeds and tuple(seeds) != (fixed,):
             raise ValueError(f'{job}은 seed{fixed}만 허용합니다.')
         return (fixed,)
     if not seeds or len(set(seeds)) != len(seeds) or not set(seeds).issubset(NEW_SEEDS):
-        raise ValueError('DH NGCF 시드를 명시하세요: 42~48,50,51. seed49는 재사용만 합니다.')
+        raise ValueError('Dunnhumby 시드를 명시하세요: 42~48,50,51. seed49는 재사용만 합니다.')
     return tuple(sorted(seeds))
 
 
@@ -181,7 +186,7 @@ def guard_space(root, required=0, reserve=10 * 1024**3):
 
 def install_storage(screen, job, output):
     """Keep latest + previous checkpoint without changing serialized state or RNG."""
-    owner = screen.original if job == 'dh-ngcf' else screen
+    owner = screen.original if job in ('dh-ngcf', 'dh-gat') else screen
     key = 'ProgressStore' if job == 'hm-lightgcn' else 'SafeProgressStore'
     old = getattr(owner, key)
 
@@ -251,11 +256,11 @@ def load_runner(job, root=ROOT):
                 else ('transactions_train.parquet', 'articles.csv'))
     screen.base.v3.SCHEMA[dataset].update(tx_path=str(data/'raw'/dataset/tx),
                                         item_meta_path=str(data/'raw'/dataset/meta))
-    if job == 'dh-ngcf':
+    if job in ('dh-ngcf', 'dh-gat'):
         cfg = screen.configure(out_dir=str(root/'results'/job),
             m2_reference=str(data/'references/clv_m2_adaptive_dunnhumby_final10_results.zip'),
             m4_reference=str(data/'references/clv_m4_user_centered_final10_results.zip'),
-            seed49_reference=str(data/'references/dh_ngcf_final8_seed49_results.zip'))
+            seed49_reference=str(data/('references/dh_gat_final8_seed49_results.zip' if job == 'dh-gat' else 'references/dh_ngcf_final8_seed49_results.zip')))
         previous = screen.load_seed49(cfg.seed49_reference)
         screen.check_source_compatibility(previous)
     else:
@@ -348,7 +353,7 @@ def execute(job, seeds, mode, root=ROOT):
             for label in ORDER:
                 print(f'[실행] {job} seed{seed} {label}', flush=True)
                 with evaluation_once(screen, prepared, label, seed):
-                    if job == 'dh-ngcf':
+                    if job in ('dh-ngcf', 'dh-gat'):
                         screen.run_arm(prepared, label, seed)
                     else:
                         screen.run_arm(prepared, label)
@@ -367,7 +372,7 @@ def main():
                         help='해당 모델·시드가 다른 서버에서 시작되지 않았거나 이 Runpod 출력에서만 재개함을 확인')
     args = parser.parse_args()
     if args.mode == 'setup':
-        for job in JOBS:
+        for job in ([args.job] if args.job else JOBS):
             source_checkout(job)
         return
     if args.mode == 'unpack':
