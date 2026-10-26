@@ -2,7 +2,7 @@
 
 Does not change training/source identity. Only deletes explicitly trashed,
 owned, same-name/same-parent older copies after live MD5/size verification.
-Never empties Trash. One previous copy retained while training, zero on completion.
+Never empties Trash. One previous copy retained during training and on completion.
 """
 import hashlib
 import json
@@ -112,8 +112,19 @@ def install(screen, api, prepared):
         raise RuntimeError('학교 Drive 계정이 아닙니다')
     module = getattr(screen, 'original', screen)
     cls = module.SafeProgressStore
-    if getattr(cls, '_retention_installed', False):
-        return
+    # A newly loaded module must replace the old closures, not silently skip.
+    # Only unwrap our recognized wrappers; never bypass an unrelated guard.
+    def unwrap(method, captured):
+        if getattr(method, '__qualname__', '') not in (
+                'install.<locals>.save', 'install.<locals>.complete'):
+            return method
+        cells = dict(zip(method.__code__.co_freevars, method.__closure__ or ()))
+        if captured not in cells:
+            raise RuntimeError('기존 보존 wrapper 확인 실패: 재설치를 중단합니다')
+        return unwrap(cells[captured].cell_contents, captured)
+    original_save = unwrap(cls.save_epoch, 'original_save')
+    original_complete = (unwrap(cls.mark_complete, 'original_complete')
+                         if hasattr(cls, 'mark_complete') else None)
     run_root = Path(prepared['run_dir']).resolve()
     # Validate existing checkpoint payload identities before first cleanup.
     for path in (run_root/'progress'/'resume').glob('*_latest.pt'):
@@ -133,8 +144,7 @@ def install(screen, api, prepared):
             row = json.loads(row_path.read_text())
             complete = row.get('identity') == ident and row.get('epochs') == 300 and payload.get('epoch') == 300
         del payload
-        prune(api, path, keep_previous=0 if complete else 1)
-    original_save = cls.save_epoch
+        prune(api, path, keep_previous=1)
     def save(self, *args, **kwargs):
         if self.root.resolve() != run_root/'progress':
             raise RuntimeError('보존 정책과 다른 실행 경로')
@@ -146,14 +156,13 @@ def install(screen, api, prepared):
         return result
     cls.save_epoch = save
     # mark_complete is also called after final weight compaction, if supported.
-    if hasattr(cls, 'mark_complete'):
-        original_complete = cls.mark_complete
+    if original_complete is not None:
         def complete(self, *args, **kwargs):
             if self.root.resolve() != run_root/'progress':
                 raise RuntimeError('보존 정책과 다른 실행 경로')
             result = original_complete(self, *args, **kwargs)
             if self.latest_checkpoint.exists():
-                prune(api, self.latest_checkpoint, keep_previous=0)
+                prune(api, self.latest_checkpoint, keep_previous=1)
             return result
         cls.mark_complete = complete
     cls._retention_installed = True
