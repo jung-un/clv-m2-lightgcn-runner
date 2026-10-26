@@ -122,6 +122,29 @@ class PlatformChecks(unittest.TestCase):
         self.assertEqual(store.latest_checkpoint.read_bytes(), b'old state')
         self.assertEqual(store.latest_checkpoint.with_suffix('.previous.pt').read_bytes(), b'old state')
 
+    def test_backup_stream_hash_and_atomic_new_checkpoint(self):
+        class Store:
+            def __init__(inner): inner.latest_checkpoint = self.root/'latest.pt'
+            def save_epoch(inner, *args, **kwargs):
+                new = self.root/'new.tmp'
+                new.write_bytes(b'new checkpoint')
+                new.replace(inner.latest_checkpoint)
+        screen = SimpleNamespace(SafeProgressStore=Store)
+        s.install_storage(screen, 'hm-ngcf', self.root)
+        store = screen.SafeProgressStore()
+        store.latest_checkpoint.write_bytes(b'previous checkpoint')
+        with patch.object(s, 'guard_space'), patch.object(s, 'sha', wraps=s.sha) as hash_file:
+            store.save_epoch(SimpleNamespace(parameters=lambda: []), None, None)
+            self.assertEqual(hash_file.call_count, 1)
+            self.assertNotEqual(hash_file.call_args.args[0], store.latest_checkpoint)
+        self.assertEqual(store.latest_checkpoint.read_bytes(), b'new checkpoint')
+        self.assertEqual(store.latest_checkpoint.with_suffix('.previous.pt').read_bytes(), b'previous checkpoint')
+        with patch.object(s, 'guard_space'), patch.object(s, 'sha', return_value='corrupt'):
+            with self.assertRaises(RuntimeError):
+                store.save_epoch(SimpleNamespace(parameters=lambda: []), None, None)
+        self.assertEqual(store.latest_checkpoint.read_bytes(), b'new checkpoint')
+        self.assertEqual(store.latest_checkpoint.with_suffix('.previous.pt').read_bytes(), b'previous checkpoint')
+
     def test_low_storage_blocks(self):
         with patch.object(s.shutil, 'disk_usage', return_value=SimpleNamespace(free=1)):
             with self.assertRaises(RuntimeError): s.guard_space(self.root)

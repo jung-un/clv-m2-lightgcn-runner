@@ -198,11 +198,16 @@ def install_storage(screen, job, output):
             guard_space(output, estimate + prior_bytes + 512 * 1024**2)
             if self.latest_checkpoint.exists():
                 temp = previous.with_suffix(previous.suffix + '.tmp')
+                # Hash the source while copying: avoid a second full network read.
+                # Still reread and verify the destination before publishing it.
+                digest = hashlib.sha256()
                 with self.latest_checkpoint.open('rb') as src, temp.open('wb') as dst:
-                    shutil.copyfileobj(src, dst, 8 * 1024**2)
+                    for block in iter(lambda: src.read(8 * 1024**2), b''):
+                        digest.update(block)
+                        dst.write(block)
                     dst.flush()
                     os.fsync(dst.fileno())
-                if sha(temp) != sha(self.latest_checkpoint):
+                if sha(temp) != digest.hexdigest():
                     raise RuntimeError('직전 checkpoint 복사 검증 실패')
                 temp.replace(previous)
             return super().save_epoch(model, optimizer, rng, **state)
