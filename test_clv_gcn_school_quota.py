@@ -20,7 +20,8 @@ def check(api):
     n=json.loads(Path(__file__).with_name('clv_dh_gcn_final8_seed50_school_colab.ipynb').read_text())
     tree=ast.parse(''.join(n['cells'][3]['source']))
     fn=next(x for x in tree.body if isinstance(x,ast.FunctionDef) and x.name=='check_space')
-    env={'drive_api':api,'OTHER_RUN_RESERVE_GB':1.0}
+    import clv_drive_checkpoint_retention as retention
+    env={'drive_api':api,'OTHER_RUN_RESERVE_GB':1.0,'retention':retention}
     exec(compile(ast.Module(body=[fn],type_ignores=[]),'notebook_quota','exec'),env)
     return env['check_space'](750_000_000)
 
@@ -45,3 +46,12 @@ def test_incomplete_never_treated_as_zero(page):
 def test_wrong_account():
     api=Api();api.info['user']['emailAddress']='wrong@example.com'
     with pytest.raises(RuntimeError,match='학교 계정'):check(api)
+
+@pytest.mark.parametrize('seed', [50, 51])
+def test_restart_cleans_existing_copies_before_space_gate(seed):
+    n=json.loads(Path(__file__).with_name(f'clv_dh_gcn_final8_seed{seed}_school_colab.ipynb').read_text())
+    source=''.join(n['cells'][3]['source'])
+    assert source.index('retention.prune(drive_api') < source.index('(account, available) = check_space')
+    assert "keep_previous=1" in source
+    assert "_rep <= _epoch" in source
+    assert f"_identity.get('seed') == {seed}" in source
