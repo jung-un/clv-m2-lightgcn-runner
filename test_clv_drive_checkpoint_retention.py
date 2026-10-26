@@ -35,7 +35,9 @@ class Api:
         return Response(delete)
 
 @pytest.fixture
-def setup(tmp_path):
+def setup(tmp_path, monkeypatch):
+    import clv_drive_checkpoint_retention as mod
+    monkeypatch.setattr(mod, '_verified_info', lambda api, row, local=None: ({'run': 'same'}, 10))
     p=tmp_path/'run_m1_s50_latest.pt';p.write_bytes(b'known-good checkpoint')
     return p,Api(p)
 
@@ -107,3 +109,20 @@ def test_install_wraps_saving_without_changing_state_or_identity(tmp_path,monkey
     assert len(events)==4
     store.root=tmp_path/'other'
     with pytest.raises(RuntimeError):store.save_epoch(None,epoch=77)
+
+
+def test_newer_epoch_in_trash_blocks_all_deletion(setup,monkeypatch):
+    import clv_drive_checkpoint_retention as mod
+    p,a=setup
+    monkeypatch.setattr(mod,'_verified_info',lambda api,row,local=None: ({'run':'same'}, 11 if row['id']=='0' else 10))
+    with pytest.raises(RuntimeError,match='더 최신 epoch'): prune(a,p,retries=1)
+    assert not a.deleted
+
+
+def test_keeps_highest_epoch_not_latest_timestamp(setup,monkeypatch):
+    import clv_drive_checkpoint_retention as mod
+    p,a=setup
+    epochs={'live':20,'0':19,'1':18,'2':17}
+    monkeypatch.setattr(mod,'_verified_info',lambda api,row,local=None: ({'run':'same'},epochs[row['id']]))
+    prune(a,p,retries=1)
+    assert set(a.rows)=={'live','0'}

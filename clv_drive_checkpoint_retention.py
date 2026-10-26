@@ -50,6 +50,48 @@ def _list(api, query):
             return rows
 
 
+_PAYLOAD_CACHE = {}
+
+
+def _checkpoint_info(path):
+    import torch
+    payload = torch.load(path, map_location='cpu', weights_only=False)
+    identity, epoch = payload['identity'], payload['epoch']
+    if not isinstance(identity, dict) or not isinstance(epoch, int) or not 1 <= epoch <= 300:
+        raise RuntimeError('체크포인트 신원/epoch 불명: 삭제하지 않습니다')
+    history = payload.get('history', [])
+    if len(history) != epoch:
+        raise RuntimeError('체크포인트 학습 이력 불일치: 삭제하지 않습니다')
+    return identity, epoch
+
+
+def _verified_info(api, row, local=None):
+    key = (row.get('md5Checksum'), row.get('size'))
+    if not all(key):
+        raise RuntimeError('체크포인트 해시/크기 불명')
+    if key in _PAYLOAD_CACHE:
+        return _PAYLOAD_CACHE[key]
+    if local is not None:
+        info = _checkpoint_info(local)
+    else:
+        import tempfile
+        from googleapiclient.http import MediaIoBaseDownload
+        with tempfile.TemporaryFile() as f:
+            download = MediaIoBaseDownload(f, api.files().get_media(fileId=row['id']),
+                                          chunksize=16*1024**2)
+            done = False
+            while not done:
+                _, done = download.next_chunk(num_retries=3)
+            size = f.tell(); f.seek(0); digest = hashlib.md5()
+            for block in iter(lambda: f.read(8*1024**2), b''):
+                digest.update(block)
+            if size != int(row['size']) or digest.hexdigest() != row['md5Checksum']:
+                raise RuntimeError('이전 사본 다운로드 검증 실패: 삭제하지 않습니다')
+            f.seek(0); info = _checkpoint_info(f)
+    _PAYLOAD_CACHE[key] = info
+    return info
+
+
 def prune(api, checkpoint, *, keep_previous=1, retries=30, sleep=time.sleep):
     path = Path(checkpoint)
     if keep_previous not in (0, 1) or not path.name.endswith('_latest.pt'):
@@ -86,6 +128,18 @@ def prune(api, checkpoint, *, keep_previous=1, retries=30, sleep=time.sleep):
             and f.get('modifiedTime') and current.get('modifiedTime')
             and f['modifiedTime'] < current['modifiedTime'])
     old = sorted((f for f in old if eligible(f)), key=lambda f:f['modifiedTime'], reverse=True)
+    # Drive modifiedTime can advance when stale content is re-uploaded.
+    # Inspect payload epochs before deleting ANY candidate; never infer progress
+    # from timestamps. Cache verified immutable hashes to avoid repeat downloads.
+    if old:
+        identity, epoch = _verified_info(api, current, local=path)
+        epochs = {}
+        for candidate in old:
+            old_identity, old_epoch = _verified_info(api, candidate)
+            if old_identity != identity or old_epoch > epoch:
+                raise RuntimeError('휴지통에 다른 신원 또는 더 최신 epoch가 있습니다: 모든 사본 보존, 재개 전 복구 필요')
+            epochs[candidate['id']] = old_epoch
+        old.sort(key=lambda f: (epochs[f['id']], f['modifiedTime']), reverse=True)
     removed = 0
     for candidate in old[keep_previous:]:
         # Recheck both live identity and candidate immediately before permanent deletion.
@@ -95,7 +149,8 @@ def prune(api, checkpoint, *, keep_previous=1, retries=30, sleep=time.sleep):
                 or int(live.get('size', -1)) != size):
             raise RuntimeError('최신 체크포인트 동시변경: 추가 삭제를 중단합니다')
         fresh = _execute(api.files().get(fileId=candidate['id'], fields=FIELDS))
-        if not eligible(fresh):
+        if (not eligible(fresh) or any(fresh.get(k) != candidate.get(k)
+                for k in ('md5Checksum', 'size', 'modifiedTime'))):
             raise RuntimeError('이전 사본 상태 변경: 삭제를 중단합니다')
         api.files().delete(fileId=fresh['id']).execute()
         removed += 1
