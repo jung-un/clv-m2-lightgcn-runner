@@ -318,7 +318,19 @@ def export(screen, prepared, job, root=ROOT):
     return result
 
 
-def execute(job, seeds, mode, root=ROOT):
+def selected_models(job, models):
+    if models is None:
+        return ORDER
+    chosen = tuple(models)
+    if job != 'hm-ngcf' or not chosen or len(set(chosen)) != len(chosen):
+        raise ValueError('모형 부분 실행은 H&M NGCF의 중복 없는 목록만 허용합니다.')
+    if any(label not in ORDER for label in chosen):
+        raise ValueError('알 수 없는 모형')
+    return tuple(label for label in ORDER if label in chosen)
+
+
+def execute(job, seeds, mode, root=ROOT, models=None):
+    models = selected_models(job, models)
     import torch
     output = root/'results'/job
     with exclusive(root/'locks'/f'{job}.lock'):
@@ -347,10 +359,10 @@ def execute(job, seeds, mode, root=ROOT):
             export(screen, prepared, job, root)
             return
         atomic_json(output/('runpod_invocation_' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f') + '.json'), {
-            'seeds': list(seeds), 'models': list(ORDER), 'started_utc': datetime.now(timezone.utc).isoformat(),
+            'seeds': list(seeds), 'models': list(models), 'started_utc': datetime.now(timezone.utc).isoformat(),
             'note': 'execution subset only; original experiment panel and hyperparameters unchanged'})
         for seed in seeds:
-            for label in ORDER:
+            for label in models:
                 print(f'[실행] {job} seed{seed} {label}', flush=True)
                 with evaluation_once(screen, prepared, label, seed):
                     if job in ('dh-ngcf', 'dh-gat'):
@@ -366,6 +378,7 @@ def main():
     parser.add_argument('mode', choices=['setup', 'unpack', 'hm-raw', 'check', 'prepare', 'run', 'report'])
     parser.add_argument('--job', choices=JOBS)
     parser.add_argument('--seeds', nargs='+', type=int)
+    parser.add_argument('--models', nargs='+', choices=ORDER, help='H&M NGCF 실행할 모형만 지정; 연구 설정은 유지')
     parser.add_argument('--bundle', type=Path)
     parser.add_argument('--file', type=Path)
     parser.add_argument('--confirmed-unstarted', action='store_true',
@@ -392,7 +405,7 @@ def main():
     seeds = selected_seeds(args.job, args.seeds)
     if args.mode == 'run' and not args.confirmed_unstarted:
         parser.error('중복 실험 방지: 다른 서버에 같은 작업이 없는지 확인하고 --confirmed-unstarted를 지정하세요.')
-    execute(args.job, seeds, args.mode)
+    execute(args.job, seeds, args.mode, models=args.models)
 
 
 if __name__ == '__main__':

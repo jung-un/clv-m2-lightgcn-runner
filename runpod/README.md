@@ -105,3 +105,15 @@ python verify_pinned_sources.py hm-lightgcn --root /workspace/clv
 ```
 
 설치 버전 근거: [PyTorch 공식 이전버전 설치표](https://pytorch.org/get-started/previous-versions/)의2.8.0 CUDA12.8 wheel을 사용합니다. Colab의 과거 패키지 전체와 동일한 환경이라고 가정하지 않습니다.
+
+### H&M NGCF seed49: M1~M4만 먼저 실행
+
+기존 Colab/Runpod에서 같은 실험이 미실행임을 확인한 뒤:
+
+```bash
+/workspace/clv/venv/bin/python launch.py run --job hm-ngcf --seeds 49 --models M1 M2 M3 M4 --confirmed-unstarted
+```
+
+300epoch·평가·8모형 연구계획은 그대로이며 이번 호출만 M4에서 종료합니다.
+M5는 자동 시작하지 않습니다. 부분 결과 ZIP은 `_partial` 이름으로 저장됩니다.
+**학습 프로세스 종료가 GPU 과금 종료는 아닙니다. Pod 정지 여부를 별도로 확인해야 합니다.**
