@@ -18,6 +18,36 @@ class Request:
     def execute(self): return self.fn()
 
 
+@pytest.mark.parametrize('reason', ['rateLimitExceeded', 'userRateLimitExceeded'])
+def test_403_rate_limit_retries_without_training_rng(monkeypatch, reason):
+    import json
+    sleeps = []
+    monkeypatch.setattr(storage.time, 'sleep', sleeps.append)
+    class Limited(Exception):
+        resp = types.SimpleNamespace(status=403)
+        content = json.dumps({'error': {'errors': [{'reason': reason}]}}).encode()
+    attempts = []
+    def run():
+        attempts.append(1)
+        if len(attempts) < 4:
+            raise Limited()
+        return {'ok': True}
+    before = torch.get_rng_state().clone()
+    assert storage.execute(Request(run)) == {'ok': True}
+    assert sleeps == [15, 30, 60]
+    assert torch.equal(before, torch.get_rng_state())
+
+
+def test_permission_403_not_retried(monkeypatch):
+    class Forbidden(Exception):
+        resp = types.SimpleNamespace(status=403)
+        content = b'{"error":{"errors":[{"reason":"insufficientPermissions"}]}}'
+    def run(): raise Forbidden()
+    monkeypatch.setattr(storage.time, 'sleep', lambda _: pytest.fail('must not retry permissions'))
+    with pytest.raises(Forbidden):
+        storage.execute(Request(run))
+
+
 class API:
     def __init__(self):
         self.rows, self.deleted, self.counter = {}, [], 0

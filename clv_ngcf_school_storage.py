@@ -18,14 +18,25 @@ LOCAL_CACHE = Path('/content/ngcf_school_local')
 
 
 def execute(request):
-    for attempt in range(4):
+    # No training RNG is consumed by backoff. Mutating create/upload requests
+    # deliberately do not use this helper (ambiguous success must be reconciled).
+    for attempt in range(9):
         try:
             return request.execute()
         except Exception as exc:
             status = getattr(getattr(exc, 'resp', None), 'status', None)
-            if status not in (429, 500, 502, 503, 504) or attempt == 3:
+            try:
+                details = json.loads(getattr(exc, 'content', b'{}'))
+                reasons = {e.get('reason') for e in details.get('error', {}).get('errors', [])}
+            except (ValueError, TypeError, AttributeError):
+                reasons = set()
+            limited = status == 429 or (status == 403 and bool(
+                reasons & {'rateLimitExceeded', 'userRateLimitExceeded'}))
+            if not (limited or status in (500, 502, 503, 504)) or attempt == 8:
                 raise
-            time.sleep(2 ** attempt)
+            delay = min(60, (15 if limited else 2) * 2 ** attempt)
+            print(f'[Drive 재시도] HTTP {status}: {delay}초 대기 ({attempt + 1}/8). 저장 확인 전 학습 진행 안 함.', flush=True)
+            time.sleep(delay)
 
 
 def listing(api, query, fields=FIELDS):
@@ -185,7 +196,8 @@ def install(prepared, api):
             return super().restore_epoch(model, optimizer, rng)
 
         def save_epoch(self, model, optimizer, rng, **state):
-            check_space(api, sum(p.numel() * p.element_size() for p in model.parameters()) * 3 + 16 * 1024**2)
+            # Local serialization does not consume Drive space. publish() checks
+            # fresh account usage once, against the actual upload size.
             result = super().save_epoch(model, optimizer, rng, **state)
             current = publish(api, parent, self.latest_checkpoint, self.identity, int(state['epoch']))
             self._write_progress('running', {'epoch': state['epoch'], 'max_epoch': 300,
