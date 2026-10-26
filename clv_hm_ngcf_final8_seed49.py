@@ -85,6 +85,33 @@ def verify_input_files(expected_hash):
     return manifest
 
 
+def compare_m3_audit(expected, actual, cfg):
+    """Compare stable scalars; near-unit margin ranks retain original gates.
+
+    Alternating margin normalization leaves means equal to one up to rounding.
+    Ranking these residuals is platform sensitive, unlike the graph weights.
+    Record both values, never overwrite the measured audit with the reference.
+    """
+    ranks = {"customer_weight_vs_degree", "item_weight_vs_price",
+             "item_weight_vs_popularity"}
+    if set(actual) != set(expected):
+        raise RuntimeError("M3 고정 그래프 진단 항목 불일치")
+    for key in expected:
+        if not np.isfinite([expected[key], actual[key]]).all():
+            raise RuntimeError("M3 비유한 진단값: " + key)
+        if key not in ranks and not np.isclose(actual[key], expected[key], rtol=1e-8, atol=1e-10):
+            raise RuntimeError("M3 고정 그래프 진단 불일치: " + key)
+    # Rank differences are allowed only for converged, near-unit margins.
+    if any(actual[k] != expected[k] for k in ranks):
+        if max(actual['max_customer_mass_error'], expected['max_customer_mass_error']) > 1e-8:
+            raise RuntimeError("M3 순위 차이: near-unit 여백 조건 미충족")
+    base.fixed.graph.check_gates(actual, cfg, "M3")
+    return {"reference": dict(expected), "current": dict(actual),
+            "differences": {k: {"reference": expected[k], "current": actual[k]}
+                            for k in expected if expected[k] != actual[k]},
+            "rule": "stable scalars rtol1e-8/atol1e-10; finite near-unit margin ranks use unchanged original graph gates; no graph/training change"}
+
+
 def prepare(cfg):
     preparation_started = time.perf_counter()
     validate_config(cfg)
@@ -122,9 +149,7 @@ def prepare(cfg):
     gc = base.hm.configure(out_dir=str(Path(cfg.out_dir) / 'inputs'))
     graph = base.fixed.build_graph(prepared, gc)
     expected = p3['m3_audit']
-    if set(graph['audit']) != set(expected) or any(not np.isclose(graph['audit'][k], v,
-            rtol=1e-8, atol=1e-10) for k, v in expected.items()):
-        raise RuntimeError('M3 고정 그래프 진단 불일치')
+    graph_comparison = compare_m3_audit(expected, graph['audit'], gc)
     prepared["item_amount_percentile"] = amount
     prepared.update(observed_graph=graph, references=references)
     prepared["base_cfg"]["SEED_LIST"] = [49]
@@ -142,7 +167,7 @@ def prepare(cfg):
         "source_revision": prepared["revision"], "code_sha256": frozen,
         "input_hash": prepared["input_hash"], "data_stats": data["data_stats"],
         "split": old["split"], "feature_sha256": prepared["feature_sha256"],
-        "m3_audit": old["m3_audit"], "m4_weight_audit": old["m4_weight_audit"],
+        "m3_audit": old["m3_audit"], "m3_reference_comparison": graph_comparison, "m4_weight_audit": old["m4_weight_audit"],
         "reference_audit": prepared["references"]["audit"],
         "dataset_initialization": base.m2.dataset_parameter_initialization(prepared["features"]),
         "fixed_intervention_settings": old["fixed"],
