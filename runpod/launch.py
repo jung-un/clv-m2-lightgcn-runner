@@ -25,6 +25,8 @@ REMOTE = 'https://github.com/jung-un/clv-m2-lightgcn-runner.git'
 ORDER = ('M1', 'M2', 'M3', 'M4', 'M5_A', 'M5_B', 'M5_C', 'M5_D')
 NEW_SEEDS = (42, 43, 44, 45, 46, 47, 48, 50, 51)
 JOBS = {
+    'hm-gat': dict(module='clv_hm_gat_final8_seed49', dataset='hm',
+                   pin='289e6df371d545687ea72cb3937fe744df3f009a', seed=49),
     'dh-gat': dict(module='clv_dh_gat_remaining9', dataset='dunnhumby',
                    pin='5a475a2ed25ef0b40822de11c537fa7fc76e475a', seed=None),
     'dh-ngcf': dict(module='clv_dh_ngcf_remaining9', dataset='dunnhumby',
@@ -309,7 +311,7 @@ def export(screen, prepared, job, root=ROOT):
     result = screen.report(prepared)
     path = root/'exports'/f'{job}_results.zip'
     path.parent.mkdir(parents=True, exist_ok=True)
-    if job == 'hm-ngcf':
+    if job in ('hm-ngcf', 'hm-gat'):
         output = screen.export_zip(prepared, str(path))
     else:
         output = screen.export_zip(prepared, str(path), allow_partial=not result['complete'])
@@ -325,10 +327,10 @@ def export(screen, prepared, job, root=ROOT):
 
 def selected_models(job, models):
     if models is None:
-        return ORDER
+        return ORDER[:4] if job == 'hm-gat' else ORDER
     chosen = tuple(models)
-    if job != 'hm-ngcf' or not chosen or len(set(chosen)) != len(chosen):
-        raise ValueError('모형 부분 실행은 H&M NGCF의 중복 없는 목록만 허용합니다.')
+    if job not in ('hm-ngcf', 'hm-gat') or not chosen or len(set(chosen)) != len(chosen):
+        raise ValueError('모형 부분 실행은 H&M NGCF/GAT의 중복 없는 목록만 허용합니다.')
     if any(label not in ORDER for label in chosen):
         raise ValueError('알 수 없는 모형')
     return tuple(label for label in ORDER if label in chosen)
@@ -383,7 +385,7 @@ def main():
     parser.add_argument('mode', choices=['setup', 'unpack', 'hm-raw', 'check', 'prepare', 'run', 'report'])
     parser.add_argument('--job', choices=JOBS)
     parser.add_argument('--seeds', nargs='+', type=int)
-    parser.add_argument('--models', nargs='+', choices=ORDER, help='H&M NGCF 실행할 모형만 지정; 연구 설정은 유지')
+    parser.add_argument('--models', nargs='+', choices=ORDER, help='H&M NGCF/GAT 실행할 모형만 지정; 연구 설정은 유지')
     parser.add_argument('--bundle', type=Path)
     parser.add_argument('--file', type=Path)
     parser.add_argument('--confirmed-unstarted', action='store_true',

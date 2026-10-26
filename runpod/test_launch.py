@@ -33,6 +33,10 @@ class PlatformChecks(unittest.TestCase):
         self.assertEqual(s.selected_models('hm-ngcf', ['M1', 'M2', 'M3', 'M4']), s.ORDER[:4])
         self.assertEqual(s.selected_models('hm-ngcf', ['M5_D', 'M5_A']), ('M5_A', 'M5_D'))
         self.assertEqual(s.selected_models('dh-gat', None), s.ORDER)
+        self.assertEqual(s.selected_models('hm-gat', None), ('M1','M2','M3','M4'))
+        self.assertEqual(s.selected_seeds('hm-gat', None), (49,))
+        with self.assertRaises(ValueError): s.selected_seeds('hm-gat', [50])
+        self.assertEqual(s.selected_models('hm-gat', ['M5_D']), ('M5_D',))
         for job, models in [('dh-gat', ['M1']), ('hm-ngcf', []),
                             ('hm-ngcf', ['M1', 'M1']), ('hm-ngcf', ['unknown'])]:
             with self.assertRaises(ValueError): s.selected_models(job, models)
