@@ -198,6 +198,11 @@ def install(screen, api, prepared):
         if row_path is not None and row_path.exists():
             row = json.loads(row_path.read_text())
             complete = row.get('identity') == ident and row.get('epochs') == 300 and payload.get('epoch') == 300
+        # Explicit recovery copies must be reviewed before resuming a stale live file.
+        for recovery in path.parent.glob(path.name.replace('_latest.pt', '_recovered_ep*.pt')):
+            recovery_identity, recovery_epoch = _checkpoint_info(recovery)
+            if recovery_identity != ident or recovery_epoch > payload['epoch']:
+                raise RuntimeError('복구 사본이 현재 latest보다 최신입니다: 최신 학습 복구 후 재개하세요')
         del payload
         prune(api, path, keep_previous=1)
     def save(self, *args, **kwargs):
