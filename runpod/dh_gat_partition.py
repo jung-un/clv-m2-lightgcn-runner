@@ -213,6 +213,9 @@ def ada(mode, manifest_path):
 
     def load(job, root):
         screen, cfg = old_load(job, root)
+        if manifest.get('frozen_input_sha256'):
+            import dh_gat_input_snapshot
+            dh_gat_input_snapshot.install(screen, manifest, root)
         original_arm = screen.run_arm
 
         def guarded_arm(prepared, label, seed):
