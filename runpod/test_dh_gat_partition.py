@@ -1,7 +1,13 @@
 import json
 import unittest
+from unittest.mock import patch
+import gzip
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 
 import dh_gat_partition as p
+import dh_gat_input_snapshot as snapshot
 
 
 class PartitionTests(unittest.TestCase):
@@ -46,6 +52,24 @@ class PartitionTests(unittest.TestCase):
                 p.validate_checkpoint({**self.checkpoint(),key:value},progress,'verified')
         with self.assertRaises(RuntimeError):
             p.validate_checkpoint(self.checkpoint(),progress,'corrupt')
+
+    def test_snapshot_materializes_a_local_file_before_deserialization(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder)/'inputs.pt.gz'
+            with gzip.open(source,'wb') as output:
+                output.write(b'verified untrained input bytes')
+            calls = []
+            def load(path,**kwargs):
+                calls.append(path)
+                self.assertEqual(kwargs,dict(map_location='cpu',weights_only=False))
+                return Path(path).read_bytes()
+            with patch.dict('sys.modules',torch=SimpleNamespace(load=load)):
+                self.assertEqual(snapshot.read_snapshot(source,p.platform.sha(source)),
+                                 b'verified untrained input bytes')
+                with self.assertRaises(RuntimeError):
+                    snapshot.read_snapshot(source,'invalid hash')
+            self.assertEqual(len(calls),1)
+            self.assertFalse(calls[0].exists())
 
 
 if __name__ == '__main__':

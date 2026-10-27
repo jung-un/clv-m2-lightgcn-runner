@@ -8,9 +8,23 @@ import gzip
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
+import tempfile
 
 import launch as platform
+
+
+def read_snapshot(path, expected_sha256):
+    if platform.sha(path) != expected_sha256:
+        raise RuntimeError('L4 고정 입력 파일 해시 불일치')
+    import torch
+    # torch.load seeks repeatedly; decompress once onto the local container disk.
+    with tempfile.TemporaryDirectory(prefix='dh-gat-inputs-') as folder:
+        local = Path(folder)/'inputs.pt'
+        with gzip.open(path,'rb') as source, local.open('wb') as output:
+            shutil.copyfileobj(source,output,8*1024**2)
+        return torch.load(local,map_location='cpu',weights_only=False)
 
 
 def export():
@@ -49,13 +63,10 @@ def install(screen, manifest, root):
     if platform.sha(__file__) != manifest['input_loader_sha256']:
         raise RuntimeError('고정 입력 로더 변경 감지')
     path = partition.CONTROL/'verified_gat_inputs.pt.gz'
-    if platform.sha(path) != manifest['frozen_input_sha256']:
-        raise RuntimeError('L4 고정 입력 파일 해시 불일치')
 
     def prepare(cfg):
         screen.original.validate_config(cfg)
-        with gzip.open(path,'rb') as source:
-            shared = torch.load(source, map_location='cpu', weights_only=False)
+        shared = read_snapshot(path,manifest['frozen_input_sha256'])
         if partition.digest(shared['protocol']) != manifest['frozen_input_protocol_sha256']:
             raise RuntimeError('고정 입력 protocol 불일치')
         if screen.base.m2._feature_hash(shared['features']) != shared['feature_sha256']:
