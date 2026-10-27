@@ -17,6 +17,12 @@ FIELDS = 'id,name,size,md5Checksum,parents,ownedByMe,trashed,appProperties'
 LOCAL_CACHE = Path('/content/ngcf_school_local')
 
 
+class InsufficientStorage(RuntimeError):
+    def __init__(self, available, needed):
+        self.available, self.needed = available, needed
+        super().__init__(f'학교 Drive 여유 {available/1e9:.2f}GB < 필요 {needed/1e9:.2f}GB. 기존 파일을 보존하고 중단합니다.')
+
+
 def execute(request):
     # No training RNG is consumed by backoff. Mutating create/upload requests
     # deliberately do not use this helper (ambiguous success must be reconciled).
@@ -73,8 +79,24 @@ def check_space(api, required=0, initial=False):
         available = min(available, int(quota['limit']) - int(quota['usage']))
     needed = max(START_FREE if initial else MIN_FREE, MIN_FREE + int(required))
     if available < needed:
-        raise RuntimeError(f'학교 Drive 여유 {available/1e9:.2f}GB < 필요 {needed/1e9:.2f}GB. 기존 파일을 보존하고 중단합니다.')
+        raise InsufficientStorage(available, needed)
     return available
+
+
+def wait_for_space(api, required=0, initial=False, timeout=600, interval=30):
+    """Keep the reserve; wait for another experiment's temporary save to finish."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return check_space(api, required=required, initial=initial)
+        except InsufficientStorage as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            delay = min(interval, remaining)
+            print(f'[Drive 공간 대기] 여유 {exc.available/1e9:.2f}GB / 필요 {exc.needed/1e9:.2f}GB. '
+                  f'기준 유지·다음 학습/업로드 보류; {delay:.0f}초 후 실제 용량 재검사.', flush=True)
+            time.sleep(delay)
 
 
 def folder(api, run_hash):
@@ -126,7 +148,7 @@ def publish(api, parent, path, ident, epoch):
     if same:
         current = same[0]
     else:
-        check_space(api, size)
+        wait_for_space(api, size)
         request = api.files().create(body={'name': f'{ident.model_id}_s{ident.seed}_ep{epoch:03d}.pt',
             'parents': [parent], 'appProperties': props}, media_body=MediaFileUpload(
             str(path), mimetype='application/octet-stream', resumable=True), fields=FIELDS)
@@ -155,7 +177,7 @@ def install(prepared, api):
     import clv_dh_ngcf_remaining9 as s
     from googleapiclient.http import MediaIoBaseDownload
     import torch
-    check_space(api, initial=True)
+    wait_for_space(api, initial=True)
     parent = folder(api, prepared['config_hash'])
     original = getattr(s.original, '_school_original_store', s.original.SafeProgressStore)
     s.original._school_original_store = original

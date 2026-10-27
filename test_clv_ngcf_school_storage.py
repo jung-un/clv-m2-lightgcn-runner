@@ -119,6 +119,42 @@ def test_school_space_guard_and_account_fail_closed(api):
         storage.check_space(api)
 
 
+def test_transient_space_wait_keeps_reserve_and_training_rng(api, monkeypatch):
+    api.extra_usage = 9_950_000_000
+    sleeps = []
+    before = torch.get_rng_state().clone()
+    def finish_other_save(seconds):
+        sleeps.append(seconds)
+        api.extra_usage = 8_500_000_000
+    monkeypatch.setattr(storage.time, 'sleep', finish_other_save)
+    assert storage.wait_for_space(api, required=75_000_000) == 1_500_000_000
+    assert sleeps == [30]
+    assert storage.START_FREE == storage.MIN_FREE == 1_000_000_000
+    assert torch.equal(before, torch.get_rng_state())
+    assert not api.deleted and api.counter == 0
+
+
+def test_space_wait_is_bounded_and_does_not_delete_or_upload(api, monkeypatch):
+    api.extra_usage = 9_950_000_000
+    clock, sleeps = [0], []
+    monkeypatch.setattr(storage.time, 'monotonic', lambda: clock[0])
+    def sleep(seconds):
+        clock[0] += seconds
+        sleeps.append(seconds)
+    monkeypatch.setattr(storage.time, 'sleep', sleep)
+    with pytest.raises(storage.InsufficientStorage):
+        storage.wait_for_space(api, required=75_000_000, timeout=60)
+    assert sleeps == [30,30] and clock[0] == 60
+    assert not api.deleted and api.counter == 0
+
+
+def test_space_wait_does_not_retry_wrong_account(api, monkeypatch):
+    api.owner = 'not-school@example.org'
+    monkeypatch.setattr(storage.time, 'sleep', lambda _: pytest.fail('wrong account must stop'))
+    with pytest.raises(RuntimeError, match='학교 Drive 계정'):
+        storage.wait_for_space(api)
+
+
 def test_immutable_epoch_rotation_and_checksum_guard(api, prepared, tmp_path):
     ident = s.identity(prepared, 'M1', 50)
     parent = storage.folder(api, ident.config_hash)
