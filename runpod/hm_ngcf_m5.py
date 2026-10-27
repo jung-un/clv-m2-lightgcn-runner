@@ -63,7 +63,8 @@ def scientific_identity(protocol):
     values = {key: protocol[key] for key in SCIENCE_KEYS}
     values['config'] = {k: v for k, v in protocol['config'].items()
                         if k not in ('out_dir', 'm2_reference', 'm4_reference')}
-    return values
+    # Live dataclass tuples become lists in stored JSON; compare persisted values.
+    return json.loads(json.dumps(values, allow_nan=False))
 
 
 def check_science(protocol, baselines):

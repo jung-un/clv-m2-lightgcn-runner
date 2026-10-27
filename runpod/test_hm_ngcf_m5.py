@@ -78,6 +78,14 @@ class PartitionChecks(unittest.TestCase):
         s.check_environment(env, self.shared)
         with self.assertRaises(RuntimeError): s.check_environment(dict(env, gpu='different'), self.shared)
 
+    def test_live_tuple_seed_matches_saved_json_but_changed_seed_still_blocks(self):
+        live = json.loads(json.dumps(self.protocol))
+        live['config']['seeds'] = (49,)
+        saved = json.loads(json.dumps(live))
+        s.check_science(live, [saved])
+        live['config']['seeds'] = (50,)
+        with self.assertRaises(RuntimeError): s.check_science(live, [saved])
+
     def test_execute_prepares_once_runs_only_m5_and_never_writes_baseline(self):
         before = {p.relative_to(self.output): p.read_bytes() for p in self.output.rglob('*') if p.is_file()}
         calls, preparations = [], []
