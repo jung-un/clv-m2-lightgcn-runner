@@ -83,9 +83,9 @@ def check_science(current, baseline):
         raise RuntimeError('seed 외 학습조건 변경 또는 시드 신원 오류')
 
 
-def preflight(root=ROOT, shared=SHARED):
-    if os.environ.get('RUNPOD_POD_ID') != POD:
-        raise RuntimeError('승인된 NGCF M5 Pod에서만 실행합니다')
+def preflight(root=ROOT, shared=SHARED, *, pod=POD):
+    if os.environ.get('RUNPOD_POD_ID') != pod:
+        raise RuntimeError('승인된 Pod에서만 실행합니다')
     storage.link_shared_inputs(root, shared)
     platform.JOBS['hm-ngcf'] = dict(platform.JOBS['hm-ngcf'], pin=PIN, seed=50)
     platform.verify_files('hm-ngcf', root)
@@ -93,10 +93,15 @@ def preflight(root=ROOT, shared=SHARED):
     platform.guard_space(root)
 
 
-def run_seed50(root=ROOT, shared=SHARED):
-    preflight(root, shared)
-    with platform.exclusive(shared / 'locks/hm-ngcf-seed50-core.lock'):
-        baseline = completion_check()
+def run_seed50(root=ROOT, shared=SHARED, *, models=MODELS, pod=POD):
+    if (pod, tuple(models)) not in ((POD, MODELS), ('ppfvmn806t4wyf', PRIOR_MODELS)):
+        raise RuntimeError('승인된 seed50 Pod/모형 배정이 아닙니다')
+    part = 'core' if tuple(models) == MODELS else 'm5'
+    preflight(root, shared, pod=pod)
+    with platform.exclusive(shared / f'locks/hm-ngcf-seed50-{part}.lock'):
+        # Independent same-seed models need the verified design, not each other's learned results.
+        baseline = (completion_check() if part == 'core' else json.loads(
+            (PRIOR_ROOT/'results/hm-ngcf'/PRIOR_RUN/'protocol.json').read_text()))
         import torch
         platform.cuda_check(torch)
         screen, default = platform.load_runner('hm-ngcf', root)
@@ -116,17 +121,17 @@ def run_seed50(root=ROOT, shared=SHARED):
         if set(prepared['data']['splits']) != {'test'} or prepared['data'].get('loss_w') is not None:
             raise RuntimeError('고정 test/기본 BPR 조건 불일치')
         platform.atomic_json(output/'runpod_seed50_partition.json', {
-            'seed':50, 'models':list(MODELS), 'source_commit':PIN,
+            'seed':50, 'models':list(models), 'source_commit':PIN,
             'seed49_role':'input/design audit only; no scores or learned weights reused',
-            'other_models':'M5_A~D unassigned here', 'root':str(root)})
-        for label in MODELS:
+            'other_models':'separate fixed partition; never trained here', 'root':str(root)})
+        for label in models:
             print(f'[실행] H&M NGCF seed50 {label}', flush=True)
             with platform.evaluation_once(screen, prepared, label, 50):
                 screen.run_arm(prepared, label)
             platform.export(screen, prepared, 'hm-ngcf', root)
-        if any(screen.completed(prepared, label) is None for label in MODELS):
-            raise RuntimeError('seed50 M1~M4 완료 결과 누락')
-        print('SEED50_CORE_COMPLETE: M1~M4 완료; M5 학습 없음; Pod 과금은 계속됩니다.', flush=True)
+        if any(screen.completed(prepared, label) is None for label in models):
+            raise RuntimeError('seed50 담당 모형 완료 결과 누락')
+        print(f'SEED50_{part.upper()}_COMPLETE: {models} 완료; Pod 과금은 계속됩니다.', flush=True)
 
 
 def status(phase, **extra):
