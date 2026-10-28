@@ -1,4 +1,4 @@
-"""Eight fixed NGCF intervention arms, H&M last week, seed49 only.
+"""Eight fixed NGCF intervention arms, H&M last week, seed49 or seed50.
 
 Uses unchanged M2/M3/M4 input preparation and verifies against frozen LightGCN
 reference artifacts. Those reference metrics are NOT NGCF baseline results.
@@ -56,17 +56,21 @@ class Config:
     message_dropout: float = .1
 
 
-def configure(*, out_dir=None, m2_reference=None, m4_reference=None):
+def configure(*, out_dir=None, m2_reference=None, m4_reference=None, seed=49):
+    if seed not in (49, 50):
+        raise ValueError("허용된 H&M NGCF 시드는 49·50입니다")
     root = base.v3.default_out_dir("hm")
-    return Config(out_dir or root + "_ngcf_final8_seed49_v1",
+    return Config(out_dir or root + f"_ngcf_final8_seed{seed}_v1",
                   m2_reference or root + "_m2_adaptive_lastweek_final10_v1",
-                  m4_reference or root + "_m5c_lastweek_final10_v1")
+                  m4_reference or root + "_m5c_lastweek_final10_v1", seeds=(seed,))
 
 
 def validate_config(cfg):
+    if cfg.seeds not in ((49,), (50,)):
+        raise ValueError("한 실행에는 고정된 시드 하나만 허용합니다")
     if cfg != configure(out_dir=cfg.out_dir, m2_reference=cfg.m2_reference,
-                        m4_reference=cfg.m4_reference):
-        raise ValueError("NGCF 8모형/seed49/300epoch 및 사전 고정 설정만 허용합니다")
+                        m4_reference=cfg.m4_reference, seed=cfg.seeds[0]):
+        raise ValueError("NGCF 8모형/300epoch 및 사전 고정 설정만 허용합니다")
     for path in (cfg.m2_reference, cfg.m4_reference):
         if (Path(cfg.out_dir).resolve() == Path(path).resolve()
                 or Path(cfg.out_dir).resolve() in Path(path).resolve().parents
@@ -152,7 +156,7 @@ def prepare(cfg):
     graph_comparison = compare_m3_audit(expected, graph['audit'], gc)
     prepared["item_amount_percentile"] = amount
     prepared.update(observed_graph=graph, references=references)
-    prepared["base_cfg"]["SEED_LIST"] = [49]
+    prepared["base_cfg"]["SEED_LIST"] = list(cfg.seeds)
     old = {"split": p2["split"], "m3_audit": graph["audit"],
            "m4_weight_audit": prepared["observed_weight_audit"], "fixed": p3["fixed"]}
     prepared["observed_adj"] = base.v3.build_adj(
@@ -163,7 +167,7 @@ def prepare(cfg):
                      "clv_dataset_adaptive_orthogonal_nv_model.py",
                      "clv_reliability_orthogonal_nv_model.py", "clv_run_state.py",
                      "clv_ngcf_training_io.py", "clv_hm_graphsage_training_io.py")}
-    protocol = {"code_version": VERSION, "config": asdict(cfg),
+    protocol = {"code_version": VERSION.replace("seed49", f"seed{cfg.seeds[0]}"), "config": asdict(cfg),
         "source_revision": prepared["revision"], "code_sha256": frozen,
         "input_hash": prepared["input_hash"], "data_stats": data["data_stats"],
         "split": old["split"], "feature_sha256": prepared["feature_sha256"],
@@ -202,7 +206,7 @@ def prepare(cfg):
                           "includes": "reference validation, data/CLV/features/graphs/cache preparation; no training"}
     base.io._atomic_json(run_dir / "preparation_timing.json", preparation_timing)
     print(f"[준비 계측] 자료·CLV·그래프·참조 검증 {preparation_timing['input_preparation_seconds']:.1f}초", flush=True)
-    print("NGCF 입력 검증 완료: 8모형 순차 새 학습 / seed49 / 마지막 주 / 300epoch", flush=True)
+    print(f"NGCF 입력 검증 완료: 8모형 순차 새 학습 / seed{cfg.seeds[0]} / 마지막 주 / 300epoch", flush=True)
     for key in ("signals", "q_value", "q_activity", "observed_graph"):
         prepared.pop(key, None)
     report(prepared)
@@ -213,12 +217,14 @@ def prepare(cfg):
 def identity(prepared, label):
     if label not in ARMS:
         raise ValueError("허용하지 않은 모형")
-    return base.RunIdentity(VERSION, f"ngcf_{label.lower()}_lastweek", 49,
+    seed = prepared['cfg'].seeds[0]
+    return base.RunIdentity(VERSION.replace("seed49", f"seed{seed}"), f"ngcf_{label.lower()}_lastweek", seed,
                             prepared["config_hash"], prepared["revision"], prepared["input_hash"])
 
 
 def arm_path(prepared, label):
-    return prepared["run_dir"] / "arms" / f"{identity(prepared, label).model_id}_s49.json"
+    ident = identity(prepared, label)
+    return prepared["run_dir"] / "arms" / f"{ident.model_id}_s{ident.seed}.json"
 
 
 def completed(prepared, label):
@@ -227,7 +233,7 @@ def completed(prepared, label):
         return None
     row = json.loads(path.read_text())
     if (row.get("identity") != asdict(identity(prepared, label)) or row.get("epochs") != 300
-            or row.get("model") != label or row.get("seed") != 49
+            or row.get("model") != label or row.get("seed") != prepared['cfg'].seeds[0]
             or set(row.get("metrics", {})) != set(prepared["references"]["metrics"])
             or not np.isfinite(list(row["metrics"].values())).all()):
         raise RuntimeError(f"{label} 완료 결과 신원/300epoch/전체지표 불일치")
@@ -293,24 +299,25 @@ def sample_uniform_negative_matrix(users, positives, n_items, positive_keys, rng
 
 def run_arm(prepared, label):
     cfg = prepared["cfg"]
+    seed = cfg.seeds[0]
     validate_config(cfg)
     old = completed(prepared, label)
     if old is not None:
         execution.compact_completed_checkpoint(SafeProgressStore(
             prepared["run_dir"] / "progress", identity(prepared, label)))
-        print(f"[재사용] NGCF {label} seed49 — 재학습·재평가 없음", flush=True)
+        print(f"[재사용] NGCF {label} seed{seed} — 재학습·재평가 없음", flush=True)
         return old
     if base.m2._feature_hash(prepared["features"]) != prepared["feature_sha256"]:
         raise RuntimeError("준비 후 M2 특징 변경")
     ident = identity(prepared, label)
     store = SafeProgressStore(prepared["run_dir"] / "progress", ident)
-    base.v3.set_seed(49)
+    base.v3.set_seed(seed)
     model, weights = build_model(prepared, label)
     # All arms start from the same RNG state; no pretrained components.
-    base.v3.set_seed(49)
+    base.v3.set_seed(seed)
     started = time.monotonic()
     try:
-        history = execution.train(model, prepared, cfg, ident.model_id, 49, store,
+        history = execution.train(model, prepared, cfg, ident.model_id, seed, store,
                                   row_weights=weights, negative_sampler=sample_uniform_negative_matrix)
         if [r["epoch"] for r in history] != list(range(1, 301)):
             raise RuntimeError("300epoch 미완료: test 평가 금지")
@@ -319,7 +326,7 @@ def run_arm(prepared, label):
         if set(metrics) != set(prepared["references"]["metrics"]) or not np.isfinite(list(metrics.values())).all():
             raise RuntimeError("전체142지표 누락/비유한 값")
         row = {"identity": asdict(ident), "model": label, "model_id": ident.model_id,
-            "seed": 49, "epochs": 300, "metrics": metrics, "training_history": history,
+            "seed": seed, "epochs": 300, "metrics": metrics, "training_history": history,
             "this_session_seconds": time.monotonic() - started,
             "diagnostics": model.representation_diagnostics() | model.training_gradient_diagnostics() |
                 {"graph": "centered_nv" if ARMS[label][1] else "binary",
@@ -337,11 +344,12 @@ def run_arm(prepared, label):
 
 def report(prepared):
     """Read saved completed-arm results only; never trains or evaluates."""
+    seed = prepared['cfg'].seeds[0]
     rows = [r for label in ORDER if (r := completed(prepared, label)) is not None]
     metrics = prepared["references"]["metrics"]
-    absolute = pd.DataFrame([{"model": r["model"], "model_id": r["model_id"], "seed": 49,
+    absolute = pd.DataFrame([{"model": r["model"], "model_id": r["model_id"], "seed": seed,
                               **r["metrics"]} for r in rows], columns=["model", "model_id", "seed", *metrics])
-    diagnostics = pd.DataFrame([{"model": r["model"], "seed": 49, **r["diagnostics"]} for r in rows])
+    diagnostics = pd.DataFrame([{"model": r["model"], "seed": seed, **r["diagnostics"]} for r in rows])
     comparisons = []
     for candidate in rows:
         for reference in rows:
@@ -350,13 +358,13 @@ def report(prepared):
             for metric in metrics:
                 x, y = candidate["metrics"][metric], reference["metrics"][metric]
                 comparisons.append({"model": candidate["model"], "reference": reference["model"],
-                    "seed": 49, "metric": metric, "candidate_value": x, "reference_value": y,
+                    "seed": seed, "metric": metric, "candidate_value": x, "reference_value": y,
                     "delta": x-y, "relative_change_pct": 100*(x/y-1) if y != 0 else np.nan})
     comparison = pd.DataFrame(comparisons, columns=["model", "reference", "seed", "metric",
         "candidate_value", "reference_value", "delta", "relative_change_pct"])
     missing = [m for m in ORDER if m not in set(absolute.model)]
     reading = {"complete": not missing, "completed": len(rows), "planned": 8, "missing": missing,
-        "seed": 49, "backbone": "NGCF", "fixed_epoch": 300, "single_seed_only": True,
+        "seed": seed, "backbone": "NGCF", "fixed_epoch": 300, "single_seed_only": True,
         "std_ci_available": False, "significance_claim": False, "clv_attribution_claim": False,
         "unseen_confirmation_claim": False, "retuning_allowed": False}
     paths = {}
@@ -372,7 +380,7 @@ def report(prepared):
 
 def run(prepared):
     for i, label in enumerate(ORDER, 1):
-        print(f"[{i}/8] H&M NGCF {label} seed49", flush=True)
+        print(f"[{i}/8] H&M NGCF {label} seed{prepared['cfg'].seeds[0]}", flush=True)
         run_arm(prepared, label)
         result = report(prepared)
         print(f"[보고서 저장] {result['reading']['completed']}/8 완료", flush=True)

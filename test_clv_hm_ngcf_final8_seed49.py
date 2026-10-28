@@ -12,6 +12,31 @@ import clv_hm_graphsage_training_io as optimized_io
 from test_clv_m5_ab_adaptive_lastweek_seed49 import prepared as reference_fixture
 
 
+def test_seed50_changes_only_seed_and_keeps_separate_identity(prepared, monkeypatch):
+    old = prepared['cfg']
+    cfg = s.configure(out_dir=old.out_dir, m2_reference=old.m2_reference,
+                      m4_reference=old.m4_reference, seed=50)
+    s.validate_config(cfg)
+    assert replace(cfg, seeds=(49,)) == old
+    prepared['cfg'] = cfg
+    ident = s.identity(prepared, 'M1')
+    assert ident.seed == 50 and 'seed50' in ident.stage
+    assert s.arm_path(prepared, 'M1').name.endswith('_s50.json')
+    seen = []
+    def train(model, p, c, mid, seed, store, **kwargs):
+        seen.append(seed)
+        return [{'epoch': i} for i in range(1, 301)]
+    monkeypatch.setattr(s.execution, 'train', train)
+    monkeypatch.setattr(s.base.fixed, '_evaluate', lambda *a: dict.fromkeys(prepared['references']['metrics'], 1.))
+    monkeypatch.setattr(s.execution, 'compact_completed_checkpoint', lambda *a: None)
+    row = s.run_arm(prepared, 'M1')
+    assert seen == [50] and row['seed'] == row['identity']['seed'] == 50
+    assert s.completed(prepared, 'M1')['seed'] == 50
+    assert set(s.report(prepared)['absolute']['seed']) == {50}
+    prepared['cfg'] = old
+    assert s.completed(prepared, 'M1') is None
+
+
 def graphsage_train(*args, **kwargs):
     return s.execution.train(*args, negative_sampler=s.sample_uniform_negative_matrix, **kwargs)
 
@@ -126,7 +151,7 @@ def test_incomplete_epoch_and_changed_config_never_evaluate(prepared, monkeypatc
     monkeypatch.setattr(s.base.fixed, '_evaluate', lambda *a: pytest.fail('early test'))
     with pytest.raises(RuntimeError, match='300epoch'):
         s.run_arm(prepared, 'M1')
-    for kwargs in ({'epochs': 100}, {'seeds': (50,)}, {'input_days': 704}, {'lr': .01}):
+    for kwargs in ({'epochs': 100}, {'seeds': (51,)}, {'input_days': 704}, {'lr': .01}):
         with pytest.raises(ValueError):
             s.validate_config(replace(prepared['cfg'], **kwargs))
 
