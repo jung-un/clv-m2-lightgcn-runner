@@ -257,9 +257,12 @@ def test_hm_prepare_routes_inputs_and_graph_without_training(prepared, monkeypat
     p['data'].update(splits={'test':{}}, data_stats={'same':True}, train={})
     p['base_cfg'] = {}
     gc = s.base.hm.configure()
+    audit = dict(coefficient_of_variation=.2, customer_weight_vs_degree=0.,
+                 item_weight_vs_price=0., item_weight_vs_popularity=0.,
+                 max_customer_mass_error=0., weight_min=.8, weight_max=1.2)
     common = {'input_hash':p['input_hash'], 'data_stats':p['data']['data_stats'],
               'feature_sha256':p['feature_sha256'], 'split':'hm-lastweek',
-              'm4_c_weight_audit':{'sha256':'weight'}, 'm3_audit':{'cv':.2}, 'fixed':{},
+              'm4_c_weight_audit':{'sha256':'weight'}, 'm3_audit':audit, 'fixed':{},
               'config':{k:getattr(gc,k) for k in s.hm_schema.GRAPH_KEYS}}
     refs = {**p['references'], 'sources':{k:{'protocol':common} for k in ('m2','m4')},'audit':{}}
     monkeypatch.setattr(s.base,'load_references',lambda cfg:refs)
@@ -268,7 +271,7 @@ def test_hm_prepare_routes_inputs_and_graph_without_training(prepared, monkeypat
     monkeypatch.setattr(s.base.hm,'validate_split',lambda data:None)
     monkeypatch.setattr(s.base.hm.hm_graph,'_purchase_keyed',lambda data:None)
     monkeypatch.setattr(s.base.fixed.graph,'centered_edge_signals',lambda *a:p['signals'])
-    monkeypatch.setattr(s.base.fixed,'build_graph',lambda *a:{**p['observed_graph'],'audit':{'cv':.2}})
+    monkeypatch.setattr(s.base.fixed,'build_graph',lambda *a:{**p['observed_graph'],'audit':audit})
     monkeypatch.setattr(s.execution,'train',lambda *a,**kw:pytest.fail('prepare trained'))
     monkeypatch.setattr(s.base.fixed,'_evaluate',lambda *a:pytest.fail('prepare evaluated'))
     actual=s.prepare(p['cfg'])
