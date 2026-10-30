@@ -81,7 +81,8 @@ def install(screen, prepared):
         raise RuntimeError('another run already patched')
     if prepared['cfg'].epochs != 300 or prepared['cfg'].seeds != (50,):
         raise RuntimeError('this opt-in patch is for fixed seed50/300epoch')
-    if tuple(screen.ORDER) != ('M1', 'M2', 'M3', 'M4'):
+    if tuple(screen.ORDER) not in (('M1', 'M2', 'M3', 'M4'),
+                                  ('M5_A', 'M5_B', 'M5_C', 'M5_D')):
         raise RuntimeError('unexpected runner')
     original_build = screen.build_model
     def build(p, label):
@@ -96,7 +97,8 @@ def install(screen, prepared):
             if self.root.resolve() != root / 'progress':
                 raise RuntimeError('different checkpoint root')
             # Keep all old files on failure. No Drive API listing/deletion.
-            with tempfile.TemporaryDirectory(prefix='gat-previous-') as folder:
+            folder = tempfile.mkdtemp(prefix='gat-previous-')
+            try:
                 old = Path(folder) / 'previous.pt'
                 if self.latest_checkpoint.exists():
                     shutil.copyfile(self.latest_checkpoint, old)
@@ -119,9 +121,16 @@ def install(screen, prepared):
                     if verify.digest() != digest.digest():
                         raise IOError('previous copy mismatch; files preserved')
                     os.replace(temporary, previous)
-            return result
+            except BaseException:
+                # Even a metadata failure AFTER latest was published must not
+                # discard the only copy of its predecessor.
+                print(f'GAT save interrupted: recovery copy retained at {folder}', flush=True)
+                raise
+            else:
+                shutil.rmtree(folder)
+                return result
     # No original source/protocol/checkpoint identity is overwritten.
-    receipt = dict(version='gat-csr-execution-v1', run_dir=str(root),
+    receipt = dict(version='gat-csr-execution-v2', run_dir=str(root), models=list(screen.ORDER),
         module_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         changes=['CSR neighbor sum; exact analytic gradients',
                  'same uniform RNG draws; inspect only unresolved negatives',
