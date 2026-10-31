@@ -17,10 +17,10 @@ SHARED = Path('/workspace/clv')
 MODELS = ('M1','M2','M3','M4','M5_A','M5_B','M5_C','M5_D')
 JOBS = {
  'gat': dict(pod='xqsonboopgwkyo', prior='/workspace/clv_hm_graphsage_seed49_m5_d',
-             backbone='graphsage', labels=('M5_D',), process='hm_graphsage49_d_recovery',
+             run='results/817e8e85d9ec', backbone='graphsage', labels=('M5_D',), process='hm_graphsage49_d_recovery',
              root='/workspace/clv_hm_gat_seed51_all8'),
  'graphsage': dict(pod='rkdcwyt2m28a1b', prior='/workspace/clv_hm_gcn_seed49_all8',
-             backbone='gcn', labels=MODELS, process='gcn49_csr_resume.py',
+             run='results/hm-gcn/b4079e349e33', backbone='gcn', labels=MODELS, process='gcn49_csr_resume.py',
              root='/workspace/clv_hm_graphsage_seed51_all8')}
 
 def process_identity(pid, job):
@@ -36,10 +36,7 @@ def process_identity(pid, job):
 
 def completion_check(job):
     spec=JOBS[job]; root=Path(spec['prior'])
-    protocols=list((root/'results').rglob('protocol.json'))
-    if len(protocols)!=1:
-        raise RuntimeError('선행 실행 protocol이 유일하지 않습니다')
-    run=protocols[0].parent; p=json.loads(protocols[0].read_text())
+    run=root/spec['run']; p=json.loads((run/'protocol.json').read_text())
     assert p['config']['epochs']==300 and p['config']['seeds']==[49]
     assert not any(p.get(k,False) for k in ('validation','holdout','early_stopping'))
     for label in spec['labels']:
