@@ -25,6 +25,12 @@ NEW = dict(coefficient_of_variation=.20008521133516655, customer_weight_vs_degre
 CFG = SimpleNamespace(max_degree_correlation=.05, max_price_correlation=.2, max_popularity_correlation=.2)
 
 class Audit(unittest.TestCase):
+ def test_graphsage49_uses_checked_comparison(self):
+  tree=ast.parse((ROOT/'clv_hm_graphsage_final8_seed49.py').read_text())
+  prepare=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='prepare')
+  self.assertTrue(any(isinstance(n,ast.Call) and isinstance(n.func,ast.Name)
+    and n.func.id=='compare_m3_audit' for n in ast.walk(prepare)))
+  self.assertIn('m3_reference_comparison',ast.unparse(prepare))
  def test_graphsage_partition_uses_same_checked_comparison(self):
   tree=ast.parse((ROOT/'clv_hm_graphsage_m5_seed50.py').read_text())
   self.assertTrue(any(isinstance(n,ast.ImportFrom) and n.module=='clv_hm_ngcf_final8_seed49'

@@ -19,6 +19,7 @@ import clv_m5_ab_adaptive_lastweek_seed49 as base
 from clv_graphsage_adaptive_model import AdaptiveNVGraphSAGE
 import clv_hm_graphsage_training_io as execution
 import clv_hm_remaining5_lastweek_seed50 as hm_schema
+from clv_hm_ngcf_final8_seed49 import compare_m3_audit
 
 VERSION = "clv-hm-graphsage-final8-seed49-v2"
 # Bits: M2 representation, M3 graph, M4 loss. Order is fixed before test.
@@ -118,9 +119,7 @@ def prepare(cfg):
     gc = base.hm.configure(out_dir=str(Path(cfg.out_dir) / 'inputs'))
     graph = base.fixed.build_graph(prepared, gc)
     expected = p3['m3_audit']
-    if set(graph['audit']) != set(expected) or any(not np.isclose(graph['audit'][k], v,
-            rtol=1e-8, atol=1e-10) for k, v in expected.items()):
-        raise RuntimeError('M3 고정 그래프 진단 불일치')
+    graph_comparison = compare_m3_audit(expected, graph['audit'], gc)
     prepared["item_amount_percentile"] = amount
     prepared.update(observed_graph=graph, references=references)
     prepared["base_cfg"]["SEED_LIST"] = [49]
@@ -138,6 +137,7 @@ def prepare(cfg):
         "input_hash": prepared["input_hash"], "data_stats": data["data_stats"],
         "split": old["split"], "feature_sha256": prepared["feature_sha256"],
         "m3_audit": old["m3_audit"], "m4_weight_audit": old["m4_weight_audit"],
+        "m3_reference_comparison": graph_comparison,
         "reference_audit": prepared["references"]["audit"],
         "dataset_initialization": base.m2.dataset_parameter_initialization(prepared["features"]),
         "fixed_intervention_settings": old["fixed"],
