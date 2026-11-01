@@ -36,11 +36,11 @@ class PartitionTests(unittest.TestCase):
     def test_capacity_fails_without_reserve(self):
         api=types.SimpleNamespace(about=lambda:types.SimpleNamespace(get=lambda **k:None))
         io=types.SimpleNamespace(execute=lambda r:{'user':{'emailAddress':single.ACCOUNT},
-            'storageQuota':{'usage':'4740000000','limit':'10000000000'}},listing=lambda *a:[])
+            'storageQuota':{'usage':'29672885323211','limit':'50000000000000'}},
+            listing=lambda *a:[],check_space=lambda *a,**k:5260000000)
         with TemporaryDirectory() as d, patch.dict('sys.modules',{'clv_ngcf_school_storage':io}):
             with self.assertRaises(RuntimeError): single.capacity_check(None,api,d)
-            io.execute=lambda r:{'user':{'emailAddress':single.ACCOUNT},
-                'storageQuota':{'usage':'1000000000','limit':'10000000000'}}
+            io.check_space=lambda *a,**k:9000000000
             self.assertEqual(single.capacity_check(None,api,d),9000000000)
 
 

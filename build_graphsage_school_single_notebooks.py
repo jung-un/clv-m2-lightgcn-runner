@@ -42,25 +42,27 @@ credentials,_=google.auth.default()
 drive_api=build('drive','v3',credentials=credentials,cache_discovery=False)
 info=drive_api.about().get(fields='user(emailAddress),storageQuota').execute()
 assert info['user']['emailAddress']=='jungunb@u.sogang.ac.kr', '학교 계정으로 인증해야 합니다'
-quota=info['storageQuota']
-assert 'usage' in quota, '사용량 확인 실패'
-available=min(10_000_000_000,int(quota.get('limit',10_000_000_000)))-int(quota['usage'])
-print('학교 Drive 여유 GB:', available/1e9,flush=True)
+print('학교 계정 확인 완료. 개인 소유 파일 기준으로 용량을 계산합니다.',flush=True)
 # Two arms retain two full checkpoints each; a third upload can overlap.
 # Conservatively reserve both jobs' worst-case peak before either starts.
 REPO=Path('/content/graphsage_school_'+LABEL.lower()+'_s50')
 HELPER_PATH=Path('/content/{HELPER}')
 if not REPO.exists():
     subprocess.run(['git','clone','--branch','feat/m2-joint-nv-lightgcn','https://github.com/jung-un/clv-m2-lightgcn-runner.git',str(REPO)],check=True)
-    helper=(REPO/{HELPER!r}).read_bytes()
-    assert hashlib.sha256(helper).hexdigest()=={helper_sha!r}, '실행 도우미 버전 불일치'
-    HELPER_PATH.write_bytes(helper)
     subprocess.run(['git','-C',str(REPO),'checkout',SOURCE_COMMIT],check=True)
 assert subprocess.check_output(['git','-C',str(REPO),'rev-parse','HEAD'],text=True).strip()==SOURCE_COMMIT
+if not HELPER_PATH.exists() or hashlib.sha256(HELPER_PATH.read_bytes()).hexdigest()!={helper_sha!r}:
+    from urllib.request import urlopen
+    with urlopen('https://raw.githubusercontent.com/jung-un/clv-m2-lightgcn-runner/feat/m2-joint-nv-lightgcn/{HELPER}',timeout=30) as response:
+        helper=response.read()
+    assert hashlib.sha256(helper).hexdigest()=={helper_sha!r}, '실행 도우미 버전 불일치: 파일은 교체하지 않았습니다'
+    HELPER_PATH.write_bytes(helper)
 assert hashlib.sha256(HELPER_PATH.read_bytes()).hexdigest()=={helper_sha!r}
 sys.path.insert(0,str(REPO)); sys.path.insert(0,'/content')
 import clv_hm_graphsage_core4_seed50 as screen
 import clv_hm_graphsage_school_single as single
+import importlib
+single=importlib.reload(single)
 assert Path(screen.__file__).resolve().parent==REPO.resolve()
 DATA=Path('/content/drive/MyDrive/논문/data')
 single.capacity_check(screen,drive_api,DATA)

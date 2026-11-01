@@ -23,10 +23,9 @@ def capacity_check(screen, api, data):
     info = io.execute(api.about().get(fields='user(emailAddress),storageQuota'))
     if info['user']['emailAddress'] != ACCOUNT:
         raise RuntimeError('학교 계정 인증 필요')
-    quota = info.get('storageQuota', {})
-    if 'usage' not in quota:
-        raise RuntimeError('학교 Drive 사용량 확인 실패')
-    free = min(10_000_000_000, int(quota.get('limit', 10_000_000_000))) - int(quota['usage'])
+    # Workspace about.usage can describe pooled organisation storage. Never
+    # subtract that value from this user's 10GB allocation.
+    free = io.check_space(api, required=0, initial=False)
     allocated = 0
     seen = set()
     for label in ('M3', 'M4'):
@@ -69,15 +68,10 @@ def install(screen, api, prepared, label):
             info = impl.execute(api.about().get(fields='user(emailAddress),storageQuota'))
             if info['user']['emailAddress'] != ACCOUNT:
                 raise RuntimeError('학교 계정 jungunb@u.sogang.ac.kr으로 인증하세요')
-            quota = info.get('storageQuota', {})
-            if 'usage' not in quota:
-                raise RuntimeError('학교 Drive 사용량 확인 실패: 저장 전 중단')
-            limit = min(10_000_000_000, int(quota.get('limit', 10_000_000_000)))
-            available = limit - int(quota['usage'])
-            needed = RESERVE + int(required)
-            if available < needed:
-                raise impl.InsufficientStorage(available, needed)
-            return available
+            # Count owned files (including Trash/revisions) using quotaBytesUsed;
+            # the shared-pool limit, when present, is checked separately.
+            import clv_ngcf_school_storage as school_io
+            return school_io.check_space(api, required=required, initial=initial)
         impl.check_space = check_space
         return impl
     storage.backend = backend
