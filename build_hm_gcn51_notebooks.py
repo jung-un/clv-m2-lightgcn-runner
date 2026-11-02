@@ -6,6 +6,8 @@ import sys
 PARTS = {'a': ('M1','M2','M3'), 'b': ('M4','M5_A','M5_B'), 'c': ('M5_C','M5_D')}
 
 def build(revision):
+    import subprocess
+    revision = subprocess.check_output(['git','rev-parse',revision],text=True).strip()
     original = json.loads(Path('clv_hm_graphsage_core4_seed50_personal_colab.ipynb').read_text())
     for part, labels in PARTS.items():
         n = json.loads(json.dumps(original))
@@ -16,6 +18,8 @@ def build(revision):
             s = s.replace('clv_personal_graphsage_checkpoint','clv_personal_gcn51_checkpoint')
             s = s.replace('hm_graphsage_core4_seed51',f'hm_gcn_seed51_part_{part}')
             s = s.replace('graphsage-core4-s51',f'gcn-part-{part}-s51')
+            s = s.replace('hm_graphsage_seed51_inputs','hm_gcn_seed51_inputs')
+            s = s.replace('| seed51 M1~M4 | 출력:', '| GCN seed51 | 출력:')
             s = s.replace('17aff7a9b3a6b12448fa4fbca5fedd4e6977b30b',revision)
             s = s.replace("assert 'L4' in torch.cuda.get_device_name(0), '기존 실험과 동일한 L4로 실행하세요.'", "# GPU hardware is recorded; mathematical settings are fixed.\ntorch.backends.cuda.matmul.allow_tf32 = False\ntorch.backends.cudnn.allow_tf32 = False\ntorch.set_float32_matmul_precision('highest')")
             s = s.replace("cfg.seeds==(50,)","cfg.seeds==(51,)")
@@ -52,7 +56,7 @@ finally:
     assert sha256(output)==sha256(backup)
     print('현재까지 결과 ZIP:', backup)
 '''.splitlines(keepends=True)
-        n['cells'][7]['source']=["result=screen.report(prepared)\n", "display(result['absolute'])\n", "print('이 GPU 담당:', LABELS, '| 전체8개는 A/B/C 결과를 합쳐 확인합니다.')\n"]
+        n['cells'][7]['source']=["from IPython.display import display\n", "result=screen.report(prepared)\n", "display(result['absolute'])\n", "print('이 GPU 담당:', LABELS, '| 전체8개는 A/B/C 결과를 합쳐 확인합니다.')\n"]
         n['cells'][6]['source']=["## 3. 담당 모델 저장 결과 — 추가 학습·평가 없음\n"]
         for c in n['cells']:
             if c['cell_type']=='code': compile(''.join(c['source']), '<cell>', 'exec')
