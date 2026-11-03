@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from clv_m2_protocol_roundoff import differences, guard
+from clv_m2_protocol_roundoff import differences, guard, compare_gcn_protocol
 
 
 class RoundoffTests(unittest.TestCase):
@@ -33,6 +33,34 @@ class RoundoffTests(unittest.TestCase):
                           ('config',{'seed':51,'epochs':300}), ('dataset_initialization',{'rho':.11})]:
             x=copy.deepcopy(self.new); x[key]=value
             with self.assertRaises(RuntimeError): differences(self.old,x)
+
+    def test_gcn_diagnostics_use_original_graph_gate(self):
+        calls=[]
+        def graph_gate(expected,actual,cfg):
+            calls.append((expected,actual,cfg))
+            if abs(expected['weight']-actual['weight'])>1e-10:
+                raise RuntimeError('original graph gate rejected')
+            return {'reference':expected,'current':actual,'rule':'unchanged',
+                    'differences':{k:{'reference':expected[k],'current':actual[k]}
+                                   for k in expected if expected[k]!=actual[k]}}
+        old={'config':{'seeds':[51],'epochs':300},'feature_sha256':'f',
+             'input_hash':'i','code_sha256':{'encoder':'c'},
+             'm3_audit':{'weight':1.,'rank':.0069},
+             'm4_weight_audit':{'train_mean_weight':.999999999999999,'sha256':'w'}}
+        old['m3_reference_comparison']=graph_gate(old['m3_audit'],old['m3_audit'],None)
+        new=copy.deepcopy(old)
+        new['m3_audit']={'weight':1.+2e-16,'rank':.0011}
+        new['m3_reference_comparison']=graph_gate(old['m3_audit'],new['m3_audit'],None)
+        new['m4_weight_audit']['train_mean_weight']=1.
+        calls.clear()
+        compare_gcn_protocol(old,new,graph_gate,None)
+        self.assertEqual(len(calls),3)
+        for target,key,val in [('config','epochs',299),('m4_weight_audit','sha256','changed'),
+                               ('m3_audit','weight',2.)]:
+            bad=copy.deepcopy(new);bad[target][key]=val
+            with self.assertRaises(RuntimeError):compare_gcn_protocol(old,bad,graph_gate,None)
+        bad=copy.deepcopy(new);bad['input_hash']='changed'
+        with self.assertRaises(RuntimeError):compare_gcn_protocol(old,bad,graph_gate,None)
         for key,value in [('rows',101), ('user_n_reliability_mean', .54),
                           ('item_v_std',float('nan'))]:
             x=copy.deepcopy(self.new); x['feature_diagnostics'][key]=value

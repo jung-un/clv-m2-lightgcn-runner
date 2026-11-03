@@ -94,3 +94,54 @@ def recover_frame(module, frame):
     recovered = scope['_recovered']
     assert recovered['data'] is values['data']
     return recovered, asdict(values['cfg'])
+
+
+def compare_gcn_protocol(saved, current, compare_graph, graph_cfg):
+    """Ignore diagnostics only after the runner's original graph gates pass."""
+    old, new = json.loads(json.dumps(saved)), json.loads(json.dumps(current))
+    old_graph, new_graph = old.pop('m3_audit'), new.pop('m3_audit')
+    old_cmp, new_cmp = old.pop('m3_reference_comparison'), new.pop('m3_reference_comparison')
+    for record, graph in ((old_cmp, old_graph), (new_cmp, new_graph)):
+        expected = compare_graph(record['reference'], graph, graph_cfg)
+        if record != json.loads(json.dumps(expected)):
+            raise RuntimeError('M3 진단/참조 비교 기록의 내부 불일치')
+    if old_cmp['reference'] != new_cmp['reference'] or old_cmp['rule'] != new_cmp['rule']:
+        raise RuntimeError('M3 고정 참조/검증 규칙 변경')
+    comparison = compare_graph(old_graph, new_graph, graph_cfg)
+    x = old['m4_weight_audit'].pop('train_mean_weight')
+    y = new['m4_weight_audit'].pop('train_mean_weight')
+    if not all(math.isfinite(v) for v in (x,y)) or abs(x-y) > 1e-12:
+        raise RuntimeError('M4 가중치 평균 차이 허용 범위 초과')
+    # This includes the exact M4 weight SHA256, source file hashes and all settings.
+    if old != new:
+        raise RuntimeError('GCN 실제 입력·설정·특징·가중치·소스가 달라 재개하지 않습니다')
+    return {'m3_comparison': comparison, 'm4_train_mean': [x,y]}
+
+
+def bind_existing_gcn_run(screen, prepared, expected_run_hash):
+    path = Path(prepared['cfg'].out_dir) / expected_run_hash / 'protocol.json'
+    original = path.read_bytes()
+    saved = json.loads(original)
+    assert hashlib.sha256(json.dumps(saved, sort_keys=True).encode()).hexdigest()[:12] == expected_run_hash
+    graph_cfg = screen.base.hm.configure(out_dir=str(Path(prepared['cfg'].out_dir)/'inputs'))
+    audit = compare_gcn_protocol(saved, prepared['protocol'], screen.compare_m3_audit, graph_cfg)
+    current = prepared['protocol']
+    digest = hashlib.sha256(json.dumps(current, sort_keys=True).encode()).hexdigest()
+    screen.base.io._atomic_json(path.with_name('resume_diagnostics_'+digest[:16]+'.json'),
+        {'saved_protocol_sha256': hashlib.sha256(original).hexdigest(),
+         'current_protocol': current, 'compatibility': audit,
+         'rule': 'reuse original graph gates; exact non-diagnostic fields and weight hashes'})
+    assert path.read_bytes() == original
+    prepared.update(protocol=saved, config_hash=expected_run_hash, run_dir=path.parent)
+    print('[기존 실행 연결] 입력·특징·가중치·설정·소스 동일; 원래 protocol/체크포인트 경로 보존:', expected_run_hash, flush=True)
+    return prepared
+
+
+def install_gcn(screen, expected_run_hash):
+    if getattr(screen.prepare, '_protocol_resume_hash', None) == expected_run_hash:
+        return
+    original = screen.prepare
+    def prepare(cfg):
+        return bind_existing_gcn_run(screen, original(cfg), expected_run_hash)
+    prepare._protocol_resume_hash = expected_run_hash
+    screen.prepare = prepare
