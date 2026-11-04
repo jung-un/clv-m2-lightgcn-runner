@@ -61,13 +61,4 @@ def optimized_train(module):
 
 
 def install(screen):
-    if screen.VERSION != 'clv-hm-gcn-final8-seed51-v1':
-        raise RuntimeError('Only H&M GCN seed51 is supported')
-    module = screen.execution
-    if getattr(module, '_gcn51_prefetch_installed', False):
-        return
-    train, digest = optimized_train(module)
-    module._before_gcn51_prefetch = module.train
-    module.train = train
-    module._gcn51_prefetch_installed = True
-    print('[GCN 최적화] CPU 음성표본 1배치 선준비; epoch 끝 worker 종료 후 RNG 저장. 원본함수 SHA256:', digest, flush=True)
+    raise RuntimeError('L4 probe showed no speed gain and failed exact-state equivalence; production use disabled')
